@@ -1,0 +1,150 @@
+import math
+import pathlib
+from string import Template
+
+import numpy as np
+import pytest
+
+from lite3_kitchen_explorer import frontier_core as fc
+from lite3_kitchen_explorer import tiles as T
+from lite3_kitchen_explorer.frontier_choice import build_prompt
+from lite3_kitchen_explorer.map_render import render_initial_tile_panels, render_map
+from lite3_kitchen_explorer.perception_client import read_prompt
+
+RES = 0.05
+INFO = fc.GridInfo(200, 200, RES, -5.0, -5.0)
+ANGLE = math.radians(12)
+OFFSET = (0.3, 0.6)           # maze grid lines at u = 0.3 + k, v = 0.6 + k (rotated frame)
+
+
+def maze():
+    """Rotated maze, walls on a 1 m grid; robot starts in a cell with walls N and E."""
+    g = np.full((200, 200), -1, np.int16)
+    cols, rows = np.meshgrid(np.arange(200), np.arange(200))
+    x = INFO.origin_x + (cols + 0.5) * RES
+    y = INFO.origin_y + (rows + 0.5) * RES
+    c, s = math.cos(ANGLE), math.sin(ANGLE)
+    u, v = c * x + s * y - OFFSET[0], -s * x + c * y - OFFSET[1]
+    g[(u > -2) & (u < 3) & (v > -1) & (v < 3) & (u ** 2 + v ** 2 < 9)] = 0
+
+    def wall(m):
+        g[m & (g == 0)] = 100
+    t = 0.04
+    wall((abs(u + 2) < t) & (v > -1) & (v < 3)); wall((abs(u - 3) < t) & (v > -1) & (v < 3))
+    wall((abs(v + 1) < t) & (u > -2) & (u < 3)); wall((abs(v - 3) < t) & (u > -2) & (u < 1))
+    wall((abs(u - 1) < t) & (v > -1) & (v < 2)); wall((abs(v - 1) < t) & (u > -1) & (u < 1))
+    wall((abs(u + 1) < t) & (v > 0) & (v < 3))
+    rx = c * (0.45 + OFFSET[0]) - s * (0.4 + OFFSET[1])
+    ry = s * (0.45 + OFFSET[0]) + c * (0.4 + OFFSET[1])
+    return g, (rx, ry, ANGLE + 0.3)
+
+
+def test_grid_round_trip_and_geometry():
+    tg = T.TileGrid(1.0, 2.0, math.radians(30))
+    x, y = tg.center((2, -1))
+    assert tg.tile_of(x, y) == (2, -1)
+    u, v = tg.to_local(*tg.to_world(0.25, 0.75))
+    assert abs(u - 0.25) < 1e-9 and abs(v - 0.75) < 1e-9
+    sw, se, ne, nw = tg.corners((0, 0))
+    assert abs(math.dist(sw, se) - 1.0) < 1e-9 and tg.edge((0, 0), 'N') == (nw, ne)
+
+
+def test_initial_candidate_snaps_to_walls_and_reads_sides():
+    g, robot = maze()
+    cands = T.initial_candidates(g, INFO, robot)
+    a = cands[0]
+    assert a['id'] == 'A' and 'walls' in a['kind']
+    assert abs(math.degrees(a['grid'].yaw) - 12) < 1.01
+    c, s = math.cos(ANGLE), math.sin(ANGLE)
+    expect = (c * OFFSET[0] - s * OFFSET[1], s * OFFSET[0] + c * OFFSET[1])
+    assert math.dist((a['grid'].origin_x, a['grid'].origin_y), expect) < 0.08
+    assert a['grid'].tile_of(*robot[:2]) == (0, 0)
+    assert a['sides'] == {'N': 'wall', 'E': 'wall', 'S': 'open', 'W': 'open'}
+    assert all(cd['grid'].tile_of(*robot[:2]) == (0, 0) for cd in cands)     # robot inside every option
+    assert len({cd['id'] for cd in cands}) == len(cands) >= 2
+
+
+def test_classification_and_trail_status():
+    g, robot = maze()
+    tg = T.initial_candidates(g, INFO, robot)[0]['grid']
+    tiles = T.classify_tiles(g, INFO, tg, [(0, 0), (0, -1)])
+    assert tiles[(0, 0)]['status'] == 'visited' and tiles[(0, -1)]['status'] == 'visited'
+    assert tiles[(1, 0)]['status'] == 'to_visit'
+    counts = T.tile_counts(tiles)
+    assert counts['visited'] == 2 and counts['to_visit'] > 5
+    far = T.classify_tiles(g, INFO, tg, [])
+    assert all(t['status'] != 'visited' for t in far.values())
+
+
+@pytest.mark.parametrize('desc, evidence, choice, sides', [
+    ('tile A: grid follows the walls', ['sides: N=wall, E=wall, S=open, W=frontier'], 'A',
+     {'N': 'wall', 'E': 'wall', 'S': 'open', 'W': 'frontier'}),
+    ('Tile b - centred', ['N: open, E: wall'], 'B', {'N': 'open', 'E': 'wall'}),
+    ('tile D: not offered', [], None, {}),
+    ('A', [], 'A', {}),
+])
+def test_parse_tile_choice(desc, evidence, choice, sides):
+    assert T.parse_tile_choice(desc, evidence, {'A', 'B', 'C'}) == (choice, sides)
+
+
+def test_prompts_fill_and_images_render():
+    root = pathlib.Path(__file__).parents[1] / 'prompts'
+    tile_prompt = Template(read_prompt(str(root / 'tile_init.txt'))).safe_substitute(
+        candidates='A | snapped | N=wall', ids='A, B', size='1')
+    assert '$' not in tile_prompt and '"sides: N=' in tile_prompt
+    cand = [{'id': 1, 'goal_xy': [1.0, 1.0], 'distance_m': 1.0, 'size_m': 1.0, 'clearance_m': 0.5,
+             'tile': '1,0', 'tile_status': 'to_visit'}]
+    fp = build_prompt(read_prompt(str(root / 'frontier_choice.txt')), cand, 'corridor', 0.35, 2,
+                      'current tile 0,0; 1 tiles visited')
+    assert '$' not in fp and '| 1,0 | to visit' in fp and 'current tile 0,0' in fp
+    g, robot = maze()
+    cands = T.initial_candidates(g, INFO, robot)
+    sheet = render_initial_tile_panels(g, INFO, robot, cands)
+    assert sheet.shape[1] > 400 * len(cands)
+    tg = cands[0]['grid']
+    tiles = T.classify_tiles(g, INFO, tg, [(0, 0)])
+    img = render_map(g, INFO, robot, [], tile_grid=tg, tiles=tiles, trail=[(0, 0)])
+    assert (img == 0).all(axis=2).any()            # walls still black under the tile tint
+
+
+def _classified():
+    g, robot = maze()
+    tg = T.initial_candidates(g, INFO, robot)[0]['grid']
+    tiles = T.classify_tiles(g, INFO, tg, [(0, 0)])
+    for t, d in tiles.items():
+        if d['status'] != 'unknown':
+            d['sides'] = T.tile_sides(g, INFO, tg, t)
+    return g, robot, tg, tiles
+
+
+def test_connected_steps_respect_walls():
+    g, robot, tg, tiles = _classified()
+    reach = T.connected_steps(tiles, (0, 0))
+    assert reach[(0, -1)][0] == 1 and reach[(-1, 0)][0] == 1
+    assert (1, 0) not in reach or reach[(1, 0)][0] > 1          # wall on the east side of the start tile
+    assert reach[(-2, 0)][1] == [(0, 0), (0, -1), (-1, -1), (-2, -1), (-2, 0)]   # around the wall, not through
+
+
+def test_nearest_connected_targets():
+    g, robot, tg, tiles = _classified()
+    targets = T.nearest_connected_targets(g, INFO, tg, tiles, (0, 0), robot[:2], limit=6)
+    assert [t['id'] for t in targets] == list(range(1, len(targets) + 1))
+    assert [t['steps'] for t in targets] == sorted(t['steps'] for t in targets)
+    assert targets[0]['steps'] == 1 and all(t['clearance_m'] >= 0.30 for t in targets)
+    for t in targets:                                   # goal point lies inside its tile
+        assert T.tile_label(tg.tile_of(*t['goal_xy'])) == t['tile']
+    assert '0,0' not in [t['tile'] for t in targets]    # visited tiles are not targets
+
+
+def test_tile_prompt_and_target_parsing():
+    from lite3_kitchen_explorer.frontier_choice import build_tile_prompt, parse_choice
+    root = pathlib.Path(__file__).parents[1] / 'prompts'
+    targets = [{'id': 1, 'tile': '0,-1', 'steps': 1, 'distance_m': 0.9, 'clearance_m': 0.46, 'has_frontier': True},
+               {'id': 2, 'tile': '-1,0', 'steps': 1, 'distance_m': 1.0, 'clearance_m': 0.47, 'has_frontier': False}]
+    p = build_tile_prompt(read_prompt(str(root / 'tile_choice.txt')), targets, 'flat corridor', 0.30, 2,
+                          'current tile 0,0')
+    flat = ' '.join(p.split())
+    assert '$' not in p and '1 | 0,-1 | 1 | 0.9 | 0.46 | yes' in p
+    assert 'nearest connected tile' in flat and 'Valid choices: 1, 2, or none' in flat
+    assert parse_choice('target 2: open corridor', [], [1, 2]) == 2
+    assert parse_choice('none: all blocked', [], [1, 2]) is None

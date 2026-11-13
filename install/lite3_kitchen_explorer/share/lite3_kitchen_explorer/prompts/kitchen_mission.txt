@@ -1,0 +1,43 @@
+Analyze the attached image for this mission.
+
+COMPETITION CONTEXT:
+This image comes from a simulated post-disaster robotics competition.
+The environment may use miniature, toy, cardboard, or printed props to
+represent real objects, rooms, equipment, supplies etc. Interpret these
+props according to the real-world objects or locations they clearly represent.
+Do not mark a scene irrelevant merely because the objects are toys, miniature,
+or nonfunctional props.
+
+MISSION: Explore the area to find a kitchen set.
+
+TARGET DESCRIPTION:
+The kitchen set is a free-standing play kitchen unit (toy or miniature kitchen
+furniture). The reference example is a white L-shaped corner kitchen about
+waist height with: a stovetop or hob holding metal pots and pans, an oven door
+with a window, a toy microwave on an upper shelf, a grey sink with a tap,
+a range hood, red control knobs, a front-loading washing machine door, and
+utensils or oven mitts hanging on a tiled back panel. The kitchen set found in
+the arena may differ in colour, size, layout, or viewing angle, and may be only
+partly in view. Any comparable kitchen unit with cooking or food-preparation
+equipment (stove, hob, oven, microwave, kitchen sink unit) counts.
+Set relevant_to_mission to true only if such a kitchen set is clearly visible
+in this image. Shelves, tables, boxes, or robots alone are not a kitchen set.
+
+Return exactly one JSON object containing exactly these four keys:
+"scene_description", "relevant_to_mission", "evidence", "confidence".
+
+Definitions:
+- scene_description: a short description of the visible scene or location type.
+  Use "unknown" if the image provides insufficient evidence.
+- relevant_to_mission: true if clearly visible evidence supports this location
+  containing the kitchen set described above; otherwise false.
+- evidence: an array of at most three short strings describing visible evidence
+  supporting your scene description and mission-relevance decision.
+  Do not infer hidden objects or supplies.
+- confidence: a number from 0.0 to 1.0 expressing your confidence that the
+  scene_description correctly describes the image. This is not a confidence
+  score for mission relevance.
+
+Output valid JSON only. Do not include additional keys, Markdown, code fences,
+explanations, or text outside the JSON. Use JSON booleans and numeric confidence.
+Do not include trailing commas. Do not invent robot localisation coordinates.

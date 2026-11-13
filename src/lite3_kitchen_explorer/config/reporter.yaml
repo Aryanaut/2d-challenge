@@ -1,0 +1,45 @@
+environment_reporter:
+  ros__parameters:
+    # ---- AI perception server (same request as client.py) ----
+    server_url: "http://192.168.1.100:8000"   # CHANGE: LAN address of the GPT server
+    group_id: "CHANGE_ME"                       # CHANGE: your --group value
+    prompt_file: ""                             # empty = share/lite3_kitchen_explorer/prompts/environment_report.txt
+    read_timeout_s: 75.0
+    connect_timeout_s: 5.0
+    # ---- camera ----
+    image_topic: /camera/color/image_raw/compressed   # Orbbec front colour camera (JPEG)
+    image_compressed: true                            # set false for /camera/color/image_raw
+    max_image_age_s: 1.5
+    max_image_width: 1024
+    jpeg_quality: 85
+    # ---- 1 m tile system (set up before exploring starts) ----
+    tiles_enabled: true           # build the tile grid + trail; exploration starts after the first tile
+    tile_size_m: 1.0
+    tile_ai_choice: true          # ask the AI to pick the initial tile placement (false = snap to walls)
+    tile_prompt_file: ""          # empty = share/lite3_kitchen_explorer/prompts/tile_init.txt
+    tile_wait_s: 30.0             # max wait for the map around the start before placing the tile
+    tile_targets_first: true      # at each stop go to the nearest connected unvisited tile
+                                  # (frontiers are only used when no unvisited tile is connected)
+    tile_target_ai_choice: true   # AI confirms the nearest tile (false = always take the nearest)
+    tile_target_limit: 6          # nearest connected tiles offered to the AI
+    target_min_clearance_m: 0.30  # skip tiles with no point this far from walls
+    tile_target_prompt_file: ""   # empty = share/lite3_kitchen_explorer/prompts/tile_choice.txt
+    # ---- what happens at each stop ----
+    report_at_start: true         # report the starting position before exploring
+    start_wait_s: 60.0            # max wait for SLAM / Nav2 / explorer before the first report
+    scan_steps: 4                 # views per stop (4 = every 90 deg, via Nav2 Spin)
+    spin_time_allowance_s: 20.0
+    settle_s: 1.0                 # pause after each turn so the image isn't blurred
+    query_retries: 1              # retries per view if the server fails
+    error_backoff_s: 5.0          # wait before a retry (Retry-After header wins if longer)
+    # ---- AI chooses the next frontier from a map image (avoiding walls) ----
+    ai_frontier_choice: true      # false = explorer picks by distance/size cost only
+    frontier_prompt_file: ""      # empty = share/lite3_kitchen_explorer/prompts/frontier_choice.txt
+    min_wall_clearance_m: 0.35    # told to the AI and drawn as the red band next to walls
+    choice_min_candidates: 2      # don't ask the AI when there is only one option
+    candidates_max_age_s: 3.0
+    # ---- frames / wiring ----
+    global_frame: map
+    robot_frame: base_link
+    explorer_service: /frontier_explorer/set_active
+    output_dir: "~/lite3_survey_runs"

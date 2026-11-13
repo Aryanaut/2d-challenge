@@ -1,0 +1,1 @@
+/home/user/2d/build/lite3_kitchen_explorer/prompts/environment_report.txt

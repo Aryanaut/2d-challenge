@@ -1,0 +1,37 @@
+frontier_explorer:
+  ros__parameters:
+    global_frame: map
+    robot_frame: base_link
+    map_topic: /map
+    start_active: true
+    # OccupancyGrid thresholds (0-100, -1 unknown)
+    free_threshold: 25
+    occupied_threshold: 65
+    # Clusters smaller than this (cells, 0.05 m each) are treated as noise
+    min_cluster_cells: 8
+    # Goal = frontier cell nearest the cluster centroid that is this far from obstacles
+    goal_clearance_m: 0.35
+    # cost = distance_weight * distance - size_weight * cluster_length  (lowest wins)
+    distance_weight: 1.0
+    size_weight: 0.5
+    min_goal_distance_m: 0.6
+    blacklist_radius_m: 0.6
+    # Abort a goal after this long, or when the robot gets no closer for progress_timeout_s
+    goal_timeout_s: 90.0
+    progress_timeout_s: 25.0
+    progress_min_m: 0.25
+    # Cancel and replan when the goal's frontier was mapped on the way
+    replan_when_goal_explored: true
+    goal_frontier_radius_m: 0.5
+    face_frontier: true
+    # Wait after each reached frontier so the environment reporter can look around
+    hold_after_reach: true
+    hold_timeout_s: 120.0
+    empty_plans_before_complete: 5
+    plan_period_s: 1.0
+    # AI frontier choice (from environment_reporter): accepted only if still a frontier
+    # within preferred_match_radius_m and at least preferred_min_clearance_m from walls
+    candidate_limit: 8
+    preferred_timeout_s: 60.0
+    preferred_match_radius_m: 0.6
+    preferred_min_clearance_m: 0.30
