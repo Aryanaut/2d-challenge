@@ -3,10 +3,10 @@ import pathlib
 import numpy as np
 import pytest
 
-from lite3_kitchen_explorer import frontier_core as fc
-from lite3_kitchen_explorer.frontier_choice import build_prompt, parse_choice
-from lite3_kitchen_explorer.map_render import render_map
-from lite3_kitchen_explorer.perception_client import extract_mission_result, read_prompt
+from lite3_llm_tools import gridmap as fc
+from lite3_llm_tools.prompts import build_prompt, parse_choice
+from lite3_llm_tools.map_render import render_map
+from lite3_llm_tools.perception_client import extract_mission_result, read_prompt
 
 CANDS = [{'id': 1, 'goal_xy': [1.0, 2.5], 'centroid_xy': [1.0, 2.6], 'distance_m': 1.6, 'size_m': 1.2,
           'clearance_m': 0.25, 'cost': 1.0},

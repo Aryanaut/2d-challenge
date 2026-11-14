@@ -1,15 +1,9 @@
 import math
-import pathlib
-from string import Template
 
 import numpy as np
-import pytest
 
 from lite3_kitchen_explorer import frontier_core as fc
 from lite3_kitchen_explorer import tiles as T
-from lite3_kitchen_explorer.frontier_choice import build_prompt
-from lite3_kitchen_explorer.map_render import render_initial_tile_panels, render_map
-from lite3_kitchen_explorer.perception_client import read_prompt
 
 RES = 0.05
 INFO = fc.GridInfo(200, 200, RES, -5.0, -5.0)
@@ -76,37 +70,6 @@ def test_classification_and_trail_status():
     assert all(t['status'] != 'visited' for t in far.values())
 
 
-@pytest.mark.parametrize('desc, evidence, choice, sides', [
-    ('tile A: grid follows the walls', ['sides: N=wall, E=wall, S=open, W=frontier'], 'A',
-     {'N': 'wall', 'E': 'wall', 'S': 'open', 'W': 'frontier'}),
-    ('Tile b - centred', ['N: open, E: wall'], 'B', {'N': 'open', 'E': 'wall'}),
-    ('tile D: not offered', [], None, {}),
-    ('A', [], 'A', {}),
-])
-def test_parse_tile_choice(desc, evidence, choice, sides):
-    assert T.parse_tile_choice(desc, evidence, {'A', 'B', 'C'}) == (choice, sides)
-
-
-def test_prompts_fill_and_images_render():
-    root = pathlib.Path(__file__).parents[1] / 'prompts'
-    tile_prompt = Template(read_prompt(str(root / 'tile_init.txt'))).safe_substitute(
-        candidates='A | snapped | N=wall', ids='A, B', size='1')
-    assert '$' not in tile_prompt and '"sides: N=' in tile_prompt
-    cand = [{'id': 1, 'goal_xy': [1.0, 1.0], 'distance_m': 1.0, 'size_m': 1.0, 'clearance_m': 0.5,
-             'tile': '1,0', 'tile_status': 'to_visit'}]
-    fp = build_prompt(read_prompt(str(root / 'frontier_choice.txt')), cand, 'corridor', 0.35, 2,
-                      'current tile 0,0; 1 tiles visited')
-    assert '$' not in fp and '| 1,0 | to visit' in fp and 'current tile 0,0' in fp
-    g, robot = maze()
-    cands = T.initial_candidates(g, INFO, robot)
-    sheet = render_initial_tile_panels(g, INFO, robot, cands)
-    assert sheet.shape[1] > 400 * len(cands)
-    tg = cands[0]['grid']
-    tiles = T.classify_tiles(g, INFO, tg, [(0, 0)])
-    img = render_map(g, INFO, robot, [], tile_grid=tg, tiles=tiles, trail=[(0, 0)])
-    assert (img == 0).all(axis=2).any()            # walls still black under the tile tint
-
-
 def _classified():
     g, robot = maze()
     tg = T.initial_candidates(g, INFO, robot)[0]['grid']
@@ -134,17 +97,3 @@ def test_nearest_connected_targets():
     for t in targets:                                   # goal point lies inside its tile
         assert T.tile_label(tg.tile_of(*t['goal_xy'])) == t['tile']
     assert '0,0' not in [t['tile'] for t in targets]    # visited tiles are not targets
-
-
-def test_tile_prompt_and_target_parsing():
-    from lite3_kitchen_explorer.frontier_choice import build_tile_prompt, parse_choice
-    root = pathlib.Path(__file__).parents[1] / 'prompts'
-    targets = [{'id': 1, 'tile': '0,-1', 'steps': 1, 'distance_m': 0.9, 'clearance_m': 0.46, 'has_frontier': True},
-               {'id': 2, 'tile': '-1,0', 'steps': 1, 'distance_m': 1.0, 'clearance_m': 0.47, 'has_frontier': False}]
-    p = build_tile_prompt(read_prompt(str(root / 'tile_choice.txt')), targets, 'flat corridor', 0.30, 2,
-                          'current tile 0,0')
-    flat = ' '.join(p.split())
-    assert '$' not in p and '1 | 0,-1 | 1 | 0.9 | 0.46 | yes' in p
-    assert 'nearest connected tile' in flat and 'Valid choices: 1, 2, or none' in flat
-    assert parse_choice('target 2: open corridor', [], [1, 2]) == 2
-    assert parse_choice('none: all blocked', [], [1, 2]) is None

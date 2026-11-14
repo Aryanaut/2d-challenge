@@ -1,14 +1,14 @@
-"""Full stack: leg-odom TF, cloud->scan, slam_toolbox, Nav2, frontier explorer, AI environment reporter.
+"""Full stack: leg-odom TF, cloud->scan, slam_toolbox, Nav2, frontier explorer, tile reporter and (lite3_llm_tools) the AI client.
 
 Example:
   ros2 launch lite3_kitchen_explorer kitchen_exploration.launch.py \
-      server_url:=http://192.168.1.100:8000 group_id:=team7
+      server_url:=http://192.168.10.141:8000 group_id:=team7
 """
 import os
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -17,16 +17,30 @@ from launch_ros.actions import Node
 PKG = 'lite3_kitchen_explorer'
 
 
+LLM_ARGS = ('server_url', 'group_id', 'image_topic', 'prompt_file')
+
+
+def _llm_client(context):
+    """The AI client node (lite3_llm_tools). Skipped when use_ai is false or the package is not installed."""
+    if LaunchConfiguration('use_reporter').perform(context).lower() != 'true' \
+            or LaunchConfiguration('use_ai').perform(context).lower() == 'false':
+        return []
+    try:
+        share = get_package_share_directory('lite3_llm_tools')
+    except PackageNotFoundError:
+        return [LogInfo(msg='lite3_llm_tools is not installed: running without the AI (use_ai is ignored).')]
+    args = {k: LaunchConfiguration(k).perform(context) for k in LLM_ARGS + ('image_compressed',)}
+    return [IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'llm_client.launch.py')),
+        launch_arguments={k: v for k, v in args.items() if v}.items())]
+
+
 def _explorer_and_reporter(context):
     use_reporter = LaunchConfiguration('use_reporter').perform(context).lower() == 'true'
     overrides = {}
-    for key in ('server_url', 'group_id', 'image_topic', 'prompt_file'):
-        value = LaunchConfiguration(key).perform(context)
-        if value:
-            overrides[key] = value
-    compressed = LaunchConfiguration('image_compressed').perform(context)
-    if compressed:
-        overrides['image_compressed'] = compressed.lower() == 'true'
+    use_ai = LaunchConfiguration('use_ai').perform(context)
+    if use_ai:
+        overrides['use_ai'] = use_ai.lower() == 'true'
     reporter_params = [LaunchConfiguration('reporter_params').perform(context)]
     if overrides:
         reporter_params.append(overrides)
@@ -83,11 +97,12 @@ def generate_launch_description():
         DeclareLaunchArgument('nav2_params', default_value=cfg('nav2_params.yaml')),
         DeclareLaunchArgument('explorer_params', default_value=cfg('explorer.yaml')),
         DeclareLaunchArgument('reporter_params', default_value=cfg('reporter.yaml')),
-        DeclareLaunchArgument('server_url', default_value='', description='Overrides reporter.yaml'),
-        DeclareLaunchArgument('group_id', default_value='', description='Overrides reporter.yaml'),
-        DeclareLaunchArgument('image_topic', default_value='', description='Overrides reporter.yaml'),
-        DeclareLaunchArgument('image_compressed', default_value='', description='true/false, overrides reporter.yaml'),
-        DeclareLaunchArgument('prompt_file', default_value='', description='Overrides reporter.yaml'),
+        DeclareLaunchArgument('use_ai', default_value='', description='true/false: use the AI (also starts / skips the llm_client node); empty = reporter.yaml'),
+        DeclareLaunchArgument('server_url', default_value='', description='Overrides llm_client.yaml (lite3_llm_tools)'),
+        DeclareLaunchArgument('group_id', default_value='', description='Overrides llm_client.yaml (lite3_llm_tools)'),
+        DeclareLaunchArgument('image_topic', default_value='', description='Overrides llm_client.yaml (lite3_llm_tools)'),
+        DeclareLaunchArgument('image_compressed', default_value='', description='true/false, overrides llm_client.yaml'),
+        DeclareLaunchArgument('prompt_file', default_value='', description='Overrides llm_client.yaml (lite3_llm_tools)'),
     ]
 
     nodes = [
@@ -142,6 +157,7 @@ def generate_launch_description():
         Node(package=PKG, executable='gait_switcher', name='gait_switcher', output='screen',
              parameters=[{'flat_gait': 'flat_medium', 'rugged_gait': 'rug_general'}],
              condition=IfCondition(lc('use_gait'))),
+        OpaqueFunction(function=_llm_client),
         OpaqueFunction(function=_explorer_and_reporter),
     ]
     return LaunchDescription(args + nodes)

@@ -1,0 +1,92 @@
+Analyze the attached image for this mission.
+
+COMPETITION CONTEXT:
+A legged robot dog (about 0.6 m long and 0.4 m wide) is exploring an unknown
+maze in an indoor robotics competition. The maze is made of chipboard wall
+panels forming corridors, with terrain sections on the corridor floors (block
+fields, ramps, raised beams or slats, a staircase) that the robot walks across;
+they are part of the route, not obstacles. The robot explores the maze tile by
+tile on a grid of 1 m x 1 m tiles. The attached image is NOT a camera photo: it
+is a top-down map the robot built with its lidar.
+
+HOW TO READ THE MAP:
+- black = maze wall panels; light red = floor too close to a wall
+- white = explored, open floor; grey = unexplored
+- thin grey grid = the 1 m tiles. Blue-tinted tiles are already visited,
+  numbered in visit order and joined by the dark-blue trail line. Tiles with a
+  green inner box have open floor but have NOT been visited yet
+- blue dot with arrow = the robot and the direction it faces
+- magenta numbered circles = the target point in each candidate tile
+- orange dots = places where the robot already stopped
+- red bar in the corner = 1 metre; up in the image is the map's +y direction
+The robot's current surroundings were described as: $environment
+Stops made so far: $stops
+Tiles: $tiles
+
+CANDIDATE TILES (unvisited tiles that Nav2 has confirmed a valid path to from the
+robot's current position; shortest path first):
+$targets
+Only the tiles in this list are reachable. Never choose a tile that is not listed.
+
+MISSION: Visit every unexplored, accessible tile of the maze, one after another,
+so that no tile marked "to visit" is left behind. Every candidate tile below is open floor
+that still has to be explored, so always pick one of them; do not skip a tile
+because it is far or because the choice looks unimportant. Choose the candidate
+with the fewest steps along its Nav2 path (the first rows of the table).
+Only choose a farther candidate if the map shows the nearer one is unsafe: a
+wall cuts through it or blocks the way to it, its target point is in or next to
+the light red band, or it is less than $min_clearance m from a wall. Never pick
+a tile that is unsafe or unreachable as a shortcut; if the nearest one is unsafe,
+the next safe one is still a valid choice.
+When candidates are equally near, prefer, in this order:
+1. a tile that contains an edge of unexplored space (it reveals more of the maze),
+2. a tile straight ahead in the direction the robot faces or along the current
+   corridor,
+3. a tile that does not lead back along the blue trail.
+Valid choices: $ids. Always choose one of these ids; do not answer none.
+
+ROUTE TO THE CHOSEN TILE:
+The robot does not stop on the way; it drives through the waypoints one after
+another without pausing and only stops at the target point. For the tile you
+choose, also give the waypoints between the robot and the target point (as many as
+the Nav2 path points listed below for that tile: 2 or 3, no more), in order,
+each with the yaw (heading) the robot should have when it passes it, and the
+yaw it should have on arriving at the target point. Use the map frame:
+map coordinates in metres, yaw in degrees, 0 = map +x (right in the image),
+90 = map +y (up in the image), counter-clockwise positive, range -180..180.
+Rules for the route:
+- Waypoints must lie on or very near the Nav2 path points listed below, in the
+  order the robot passes them, in the middle of the corridor (never in the
+  light red band or next to a wall).
+- Each waypoint's yaw points along the direction of travel to the next one, but
+  turn it earlier to line the robot up with the corridor before a corner, a
+  doorway or a narrow gap, so it enters straight and does not clip a wall.
+- The yaw at the target point points the way the robot should face on arrival:
+  along the corridor or toward the open side or unexplored space of the tile,
+  so the camera sees what is ahead; keep it parallel to the tile edges
+  (multiples of 90 degrees from the grid) unless the walls clearly say otherwise.
+Nav2 path points for each candidate (robot, 2-3 evenly spaced points, goal):
+$paths
+
+Return exactly one JSON object containing exactly these six keys:
+"scene_description", "relevant_to_mission", "evidence", "confidence",
+"target_yaw_deg", "waypoints".
+
+Definitions:
+- scene_description: the choice, written as "target <id>: <short reason>",
+  for example "target 1: nearest tile with a Nav2 path, open corridor ahead".
+- relevant_to_mission: true (a target is always chosen from the candidates).
+- evidence: an array of at most three short strings describing what in the map
+  supports the choice, especially the walls between the robot and the tile.
+- confidence: a number from 0.0 to 1.0 expressing your confidence that the
+  chosen tile is the nearest safe tile with a Nav2 path.
+
+- target_yaw_deg: number, the yaw in degrees at the target point of the chosen tile.
+- waypoints: an array of 2 or 3 objects (the same count as the intermediate points
+  listed for the chosen tile) {"x": number, "y": number,
+  "yaw_deg": number}, ordered from the robot to the target point, for the
+  chosen tile only. Example: [{"x": 0.35, "y": 0.02, "yaw_deg": 5.0}, ...].
+
+Output valid JSON only. Do not include additional keys, Markdown, code fences,
+explanations, or text outside the JSON. Use JSON booleans and numeric confidence.
+Do not include trailing commas. Do not invent robot localisation coordinates.

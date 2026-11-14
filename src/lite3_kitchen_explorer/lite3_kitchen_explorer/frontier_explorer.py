@@ -19,11 +19,18 @@ Interfaces
                                     or a tile to visit (any free point). Used for the next goal if
                                     it has enough wall clearance, otherwise the cost ranking decides
   srv  ~/set_active                 std_srvs/SetBool  (False cancels the current goal)
+  sub  ~/preferred_route            geometry_msgs/PoseArray  waypoints (with yaw) ending at the preferred goal; sent
+                                    just before ~/preferred_goal. When the goal chosen matches its last pose, the
+                                    explorer drives the whole route with FollowWaypoints, never pausing at the
+                                    intermediate waypoints (keep nav2 waypoint_follower's wait plugin disabled)
   act  navigate_to_pose             nav2_msgs/NavigateToPose (client)
+  act  follow_waypoints             nav2_msgs/FollowWaypoints (client)
 
 With hold_after_reach=true the node waits after each reached frontier until
-~/set_active(True) is called (the environment reporter uses that pause to look
-around with the camera) or hold_timeout_s expires.
+~/set_active(True) is called (the environment reporter uses that pause to turn and
+choose the next tile) or hold_timeout_s expires. The same happens when a TILE goal
+(a preferred goal with a route) fails: the node publishes ~/goal_failed and holds, so
+the reporter can pick another tile instead of the explorer falling back to a frontier.
 """
 import json
 import math
@@ -38,7 +45,7 @@ from rclpy.time import Time
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PointStamped, Pose, PoseArray, PoseStamped
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import FollowWaypoints, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool
@@ -89,6 +96,8 @@ class FrontierExplorer(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.nav_client = ActionClient(self, NavigateToPose, self.nav_action)
+        self.waypoints_client = ActionClient(self, FollowWaypoints, p('follow_waypoints_action', 'follow_waypoints').value)
+        self.route_match_m = p('route_match_m', 0.10).value
 
         map_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -101,7 +110,13 @@ class FrontierExplorer(Node):
         self.status_pub = self.create_publisher(String, '~/status', 10)
         self.candidates_pub = self.create_publisher(String, '/frontier_candidates', latched)
         self.goal_pub = self.create_publisher(PoseStamped, '~/current_goal', latched)
+        self.goal_info_pub = self.create_publisher(String, '~/goal_info', latched)
+        self.goal_failed_pub = self.create_publisher(String, '~/goal_failed', 10)
         self.create_subscription(PointStamped, '~/preferred_goal', self._on_preferred, 10)
+        self.create_subscription(PoseArray, '~/preferred_route', self._on_route, 10)
+        self.route = None            # [(x, y, yaw)] received with the AI choice
+        self.goal_is_route = False
+        self.goal_route_len = 0
         self.preferred = None        # (x, y, received monotonic time)
         self.create_service(SetBool, '~/set_active', self._on_set_active)
 
@@ -131,7 +146,22 @@ class FrontierExplorer(Node):
 
     def _on_preferred(self, msg: PointStamped):
         self.preferred = (msg.point.x, msg.point.y, time.monotonic())
-        self.get_logger().info(f'AI prefers frontier at ({msg.point.x:.2f}, {msg.point.y:.2f}).')
+        self.get_logger().info(f'Preferred goal received at ({msg.point.x:.2f}, {msg.point.y:.2f}).')
+
+    def _on_route(self, msg: PoseArray):
+        self.route = [(p.position.x, p.position.y,
+                       2.0 * math.atan2(p.orientation.z, p.orientation.w)) for p in msg.poses]
+
+    def _route_ends_at(self, px, py):
+        """True if the pending route ends at (px, py): the preferred goal is then a tile target, not a frontier."""
+        return bool(self.route) and math.hypot(self.route[-1][0] - px, self.route[-1][1] - py) <= self.route_match_m
+
+    def _take_route(self, px, py):
+        """The pending route if it ends at (px, py); it is always consumed so a stale one is never reused."""
+        route, self.route = self.route, None
+        if route and math.hypot(route[-1][0] - px, route[-1][1] - py) <= self.route_match_m:
+            return route
+        return None
 
     def _on_set_active(self, request, response):
         if request.data:
@@ -198,21 +228,28 @@ class FrontierExplorer(Node):
 
     def _apply_preference(self, clusters, best):
         if self.preferred is None:
+            self.route = None
             return best
         px, py, received = self.preferred
         self.preferred = None
         if time.monotonic() - received > self.preferred_timeout_s:
-            self.get_logger().warn('AI frontier choice is stale; using cost ranking.')
+            self.get_logger().warn('Preferred goal is stale; using cost ranking.')
             return best
+        if self._route_ends_at(px, py):
+            # The reporter sends a route only for a tile target. A tile centre sits next to unexplored space by design,
+            # so there is nearly always a frontier within preferred_match_radius_m of it; matching it to that frontier
+            # (and judging the frontier's wall clearance, not the tile's) sent the robot to a different goal.
+            return self._direct_goal(px, py, best)
         usable = [c for c in clusters if c.extra.get('usable')]
         match = min(usable, key=lambda c: math.hypot(c.goal_xy[0] - px, c.goal_xy[1] - py), default=None)
         if match is None or math.hypot(match.goal_xy[0] - px, match.goal_xy[1] - py) > self.preferred_match_radius_m:
             return self._direct_goal(px, py, best)
         if match.extra.get('clearance_m', 0.0) < self.preferred_min_clearance_m:
-            self.get_logger().warn(f'AI-chosen frontier is only {match.extra["clearance_m"]:.2f} m from a wall '
+            self.get_logger().warn(f'Preferred frontier is only {match.extra["clearance_m"]:.2f} m from a wall '
                                    f'(< {self.preferred_min_clearance_m:.2f} m); using cost ranking.')
             return best
         self.get_logger().info('Following the AI-chosen frontier.')
+        match.extra['source'] = 'FRONTIER (AI-chosen)'
         return match
 
     def _direct_goal(self, px, py, best):
@@ -220,22 +257,24 @@ class FrontierExplorer(Node):
         r, c = self.info.world_to_cell(px, py)
         inside = 0 <= r < self.info.height and 0 <= c < self.info.width
         if not inside or not (0 <= self.grid[r, c] <= self.free_threshold):
-            self.get_logger().warn('AI-chosen goal is not on mapped free floor; using cost ranking.')
+            self.get_logger().warn('Preferred goal is not on mapped free floor; using cost ranking.')
             return best
         clearance = fc.wall_clearance_m(self.grid, self.info, (px, py), self.occupied_threshold)
         if clearance < self.preferred_min_clearance_m:
-            self.get_logger().warn(f'AI-chosen goal is only {clearance:.2f} m from a wall '
+            self.get_logger().warn(f'Preferred goal is only {clearance:.2f} m from a wall '
                                    f'(< {self.preferred_min_clearance_m:.2f} m); using cost ranking.')
             return best
         robot = self._robot_pose()
         dist = math.hypot(px - robot[0], py - robot[1]) if robot else 0.0
         if fc.is_blacklisted((px, py), self.blacklist, self.blacklist_radius_m):
-            self.get_logger().warn('AI-chosen goal failed before; using cost ranking.')
+            self.get_logger().warn('Preferred goal failed before; using cost ranking.')
             return best
-        self.get_logger().info(f'Following the AI-chosen tile goal ({px:.2f}, {py:.2f}), '
+        self.get_logger().info(f'Following the preferred tile goal ({px:.2f}, {py:.2f}), '
                                f'{clearance:.2f} m from walls.')
+        route = self._take_route(px, py)
         return fc.FrontierCluster(cells=[], centroid_xy=(px, py), goal_xy=(px, py), size_m=0.0,
-                                  distance_m=dist, extra={'direct': True, 'clearance_m': clearance})
+                                  distance_m=dist, extra={'direct': True, 'clearance_m': clearance, 'route': route,
+                                         'source': 'TILE GOAL (tile target, not a frontier)'})
 
     def _plan(self, robot_xy):
         clusters, best = self._score(robot_xy)
@@ -253,9 +292,16 @@ class FrontierExplorer(Node):
         self._send_goal(best, robot_xy)
 
     def _send_goal(self, cluster, robot_xy):
-        if not self.nav_client.wait_for_server(timeout_sec=0.5):
-            self._status('waiting for Nav2 navigate_to_pose server')
-            return
+        route = cluster.extra.get('route')
+        client = self.waypoints_client if route else self.nav_client
+        if not client.wait_for_server(timeout_sec=0.5):
+            if route:
+                self.get_logger().warn('Nav2 follow_waypoints server not available; going straight to the goal.')
+                route = None
+                client = self.nav_client
+            if not client.wait_for_server(timeout_sec=0.5):
+                self._status('waiting for Nav2 navigate_to_pose server')
+                return
         gx, gy = cluster.goal_xy
         if self.face_frontier:
             yaw = math.atan2(cluster.centroid_xy[1] - robot_xy[1], cluster.centroid_xy[0] - robot_xy[0])
@@ -266,11 +312,27 @@ class FrontierExplorer(Node):
         goal.pose.header.frame_id = self.global_frame
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x, goal.pose.pose.position.y = gx, gy
-        q = yaw_to_quaternion(yaw)
+        q = yaw_to_quaternion(route[-1][2] if route else yaw)
         o = goal.pose.pose.orientation
         o.x, o.y, o.z, o.w = q
+        send = goal
+        if route:
+            send = FollowWaypoints.Goal()
+            for x, y, wyaw in route[:-1] + [(gx, gy, route[-1][2])]:
+                ps = PoseStamped()
+                ps.header = goal.pose.header
+                ps.pose.position.x, ps.pose.position.y = x, y
+                ps.pose.orientation.x, ps.pose.orientation.y, ps.pose.orientation.z, ps.pose.orientation.w = \
+                    yaw_to_quaternion(wyaw)
+                send.poses.append(ps)
+        self.goal_is_route = bool(route)
+        self.goal_route_len = len(route) if route else 0
 
         self.goal_pub.publish(goal.pose)
+        source = cluster.extra.get('source', 'FRONTIER (cost-ranked)')
+        self.goal_info_pub.publish(String(data=(
+            f'#{self.goal_seq + 1} {source} -> ({gx:.2f}, {gy:.2f}) '
+            f'{cluster.distance_m:.1f} m away, robot at ({robot_xy[0]:.2f}, {robot_xy[1]:.2f})')))
         self.goal_direct = bool(cluster.extra.get('direct'))
         self.goal_seq += 1
         seq = self.goal_seq
@@ -280,7 +342,10 @@ class FrontierExplorer(Node):
         self._set_state(self.NAVIGATING)
         self.get_logger().info(f'Goal #{seq}: ({gx:.2f}, {gy:.2f}) dist={cluster.distance_m:.2f} m '
                                f'size={cluster.size_m:.2f} m cost={cluster.cost:.2f}')
-        future = self.nav_client.send_goal_async(goal)
+        if route:
+            self.get_logger().info('Route: ' + ' > '.join(f'({x:.2f},{y:.2f},{math.degrees(w):+.0f}deg)'
+                                                          for x, y, w in route) + ' (no waiting at waypoints)')
+        future = client.send_goal_async(send)
         future.add_done_callback(lambda f: self._on_goal_response(f, seq))
 
     def _on_goal_response(self, future, seq):
@@ -292,7 +357,7 @@ class FrontierExplorer(Node):
             return
         if handle is None or not handle.accepted:
             self.get_logger().warn('Nav2 rejected the frontier goal; blacklisting it.')
-            self._fail_goal()
+            self._fail_goal('was rejected by Nav2')
             return
         self.goal_handle = handle
         handle.get_result_async().add_done_callback(lambda f: self._on_result(f, seq))
@@ -300,8 +365,13 @@ class FrontierExplorer(Node):
     def _on_result(self, future, seq):
         if seq != self.goal_seq or self.state != self.NAVIGATING:
             return  # stale goal, or cancelled on purpose (pause / replan)
-        status = future.result().status
+        wrapped = future.result()
+        status = wrapped.status
         self.goal_handle = None
+        if status == GoalStatus.STATUS_SUCCEEDED and self.goal_is_route \
+                and (self.goal_route_len - 1) in list(wrapped.result.missed_waypoints):
+            self.get_logger().warn('The final waypoint of the route was missed.')
+            status = GoalStatus.STATUS_ABORTED
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info(f'Frontier #{seq} reached.')
             self.reached_pub.publish(Bool(data=True))
@@ -312,7 +382,7 @@ class FrontierExplorer(Node):
                 self._set_state(self.IDLE)
         else:
             self.get_logger().warn(f'Frontier #{seq} failed (status {status}); blacklisting.')
-            self._fail_goal()
+            self._fail_goal(f'failed (Nav2 status {status})')
 
     def _monitor_goal(self, robot_xy, now):
         if self.goal_xy is None:
@@ -324,24 +394,34 @@ class FrontierExplorer(Node):
         if now - self.goal_sent_at > self.goal_timeout_s:
             self.get_logger().warn('Frontier goal timed out.')
             self._cancel_goal()
-            self._fail_goal()
+            self._fail_goal('timed out')
         elif now - self.last_progress_at > self.progress_timeout_s:
             self.get_logger().warn('No progress toward frontier (stuck?).')
             self._cancel_goal()
-            self._fail_goal()
+            self._fail_goal('made no progress (stuck)')
         elif self.replan_when_goal_explored and not self.goal_direct and not fc.frontier_near(
                 self.grid, self.info, self.goal_xy, self.goal_frontier_radius_m, self.free_threshold):
             self.get_logger().info('Goal area already explored; replanning.')
             self._cancel_goal()
             self._set_state(self.IDLE)
 
-    def _fail_goal(self):
-        if self.goal_xy is not None:
-            self.blacklist.append(self.goal_xy)
+    def _fail_goal(self, reason='failed'):
+        failed, direct = self.goal_xy, self.goal_direct
+        if failed is not None:
+            self.blacklist.append(failed)
         self.goal_xy = None
         self.goal_handle = None
         if self.state == self.NAVIGATING:
-            self._set_state(self.IDLE)
+            if failed is not None and direct and self.hold_after_reach:
+                # A tile goal failed: hand the decision back to the reporter (which picks another tile) instead of
+                # replanning to the nearest frontier here. It resumes us with set_active(true); hold_timeout_s is the fallback.
+                self.goal_failed_pub.publish(String(data=json.dumps(
+                    {'goal': [round(failed[0], 3), round(failed[1], 3)], 'reason': reason})))
+                self.get_logger().warn(f'Tile goal ({failed[0]:.2f}, {failed[1]:.2f}) {reason}; waiting for the reporter to choose another.')
+                self.hold_since = time.monotonic()
+                self._set_state(self.HOLD)
+            else:
+                self._set_state(self.IDLE)
 
     def _cancel_goal(self):
         self.goal_seq += 1  # invalidates callbacks of the old goal
@@ -353,6 +433,8 @@ class FrontierExplorer(Node):
     def _set_state(self, state):
         if state != self.state:
             self.get_logger().info(f'{self.state} -> {state}')
+            if self.state == self.NAVIGATING and state != self.NAVIGATING:
+                self.goal_info_pub.publish(String(data=f'(no goal: {state})'))
         self.state = state
         self._status('')
 

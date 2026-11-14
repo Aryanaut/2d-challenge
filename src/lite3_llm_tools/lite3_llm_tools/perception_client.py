@@ -21,6 +21,9 @@ _WRAPPER_KEYS = ('result', 'response', 'output', 'answer', 'content', 'text', 'm
                  'data', 'analysis', 'json', 'choices', 'output_text')
 
 
+_RETRY_STATUS = (429, 502, 503, 504)
+
+
 class PerceptionError(Exception):
     """Request failed or the reply did not contain a usable mission JSON."""
 
@@ -134,7 +137,8 @@ def extract_mission_result(payload: Any, _depth: int = 0) -> MissionResult:
 
 class PerceptionClient:
     def __init__(self, server: str, group_id: str, prompt: str,
-                 read_timeout_s: float = 75.0, connect_timeout_s: float = 5.0):
+                 read_timeout_s: float = 75.0, connect_timeout_s: float = 5.0,
+                 connect_retries: int = 3, connect_backoff_s: float = 2.0):
         if not group_id:
             raise ValueError('group_id must be set')
         if not prompt.strip():
@@ -146,33 +150,57 @@ class PerceptionClient:
         self.prompt = prompt
         self.read_timeout_s = read_timeout_s
         self.connect_timeout_s = connect_timeout_s
+        self.connect_retries = max(0, int(connect_retries))
+        self.connect_backoff_s = connect_backoff_s
+        self._sleep = time.sleep          # replaced in tests
+
+    @staticmethod
+    def _http_error(response) -> PerceptionError:
+        retry_after = None
+        if 'retry-after' in response.headers:
+            try:
+                retry_after = float(response.headers['retry-after'])
+            except ValueError:
+                retry_after = None
+        return PerceptionError(f'HTTP {response.status_code} {response.reason_phrase}: {response.text[:300]}',
+                               retry_after_s=retry_after)
 
     def analyze(self, image_bytes: bytes, filename: str = 'frame.jpg',
                 mime: str = 'image/jpeg', prompt: Optional[str] = None) -> MissionResult:
         import httpx  # imported lazily so the parser can be used/tested without it
 
         started = time.monotonic()
-        try:
-            response = httpx.post(
-                self.url,
-                data={'group_id': self.group_id, 'prompt': prompt or self.prompt},
-                files={'image': (filename, image_bytes, mime)},
-                timeout=httpx.Timeout(self.read_timeout_s, connect=self.connect_timeout_s),
-            )
-        except httpx.HTTPError as error:
-            raise PerceptionError(f'{type(error).__name__}: {error}') from error
+        attempt = 0
+        while True:
+            retry_note = None
+            try:
+                response = httpx.post(
+                    self.url,
+                    data={'group_id': self.group_id, 'prompt': prompt or self.prompt},
+                    files={'image': (filename, image_bytes, mime)},
+                    timeout=httpx.Timeout(self.read_timeout_s, connect=self.connect_timeout_s),
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                # "No route to host", refused, connect timeout: the request never reached the server, so
+                # it is safe (and cheap) to repeat. Read timeouts are not retried: the server is busy.
+                retry_note = PerceptionError(f'{type(error).__name__}: {error}')
+                retry_note.__cause__ = error
+            except httpx.HTTPError as error:
+                raise PerceptionError(f'{type(error).__name__}: {error}') from error
+            else:
+                if response.status_code in _RETRY_STATUS:
+                    retry_note = self._http_error(response)
+            if retry_note is None:
+                break
+            if attempt >= self.connect_retries:
+                raise retry_note
+            wait = max(self.connect_backoff_s * (2 ** attempt), retry_note.retry_after_s or 0.0)
+            attempt += 1
+            self._sleep(wait)
         elapsed = time.monotonic() - started
 
         if response.is_error:
-            retry_after = None
-            if 'retry-after' in response.headers:
-                try:
-                    retry_after = float(response.headers['retry-after'])
-                except ValueError:
-                    retry_after = None
-            raise PerceptionError(
-                f'HTTP {response.status_code} {response.reason_phrase}: {response.text[:300]}',
-                retry_after_s=retry_after)
+            raise self._http_error(response)
         try:
             payload = response.json()
         except ValueError:

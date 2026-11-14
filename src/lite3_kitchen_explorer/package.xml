@@ -3,7 +3,7 @@
 <package format="3">
   <name>lite3_kitchen_explorer</name>
   <version>0.1.0</version>
-  <description>Frontier exploration for the DEEP Robotics Lite3 that reports the kind of environment at every stop using a LAN AI perception server.</description>
+  <description>Tile-by-tile frontier exploration for the DEEP Robotics Lite3. The optional AI (environment reports, tile and waypoint choice) is provided by lite3_llm_tools.</description>
   <maintainer email="todo@example.com">TODO</maintainer>
   <license>Apache-2.0</license>
 
@@ -13,6 +13,7 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
@@ -26,6 +27,7 @@
   <exec_depend>pointcloud_to_laserscan</exec_depend>
   <exec_depend>lite3_terrain_classifier</exec_depend>
   <exec_depend>transfer_interfaces</exec_depend>
+  <exec_depend>lite3_llm_tools</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
 

@@ -6,7 +6,7 @@ Runs next to terrain_classifier and reuses its work:
   /imu/data (wobble, tipping), /leg_odom2 (slip: commanded vs measured speed).
 
 Outputs:
-  /terrain_severity              std_msgs/String (latched)  smooth|mild|moderate|severe|extreme
+  /terrain_severity              std_msgs/String (latched)  smooth|rough|extreme
   /terrain_severity/speed_factor std_msgs/Float32            0.0 .. 1.0
   /terrain_severity/state        std_msgs/String             RUNNING|CREEP|PAUSED|BLOCKED
   /terrain_severity/blocked      std_msgs/Bool (latched)     true => explorer should pick another goal
@@ -222,9 +222,12 @@ class TerrainSeverity(Node):
         self.state_pub.publish(String(data=state))
         if (label, state) != (self.last_label, self.last_state):
             log = self.get_logger().warn if state in (sc.PAUSED, sc.BLOCKED) else self.get_logger().info
-            why = {k: v for k, v in geo_metrics.items() if k in ('levels', 'reason', 'hazard_dist')}
-            log(f'severity {label.upper()} -> {state} x{factor:.2f}  terrain={self.terrain_type} '
-                f'geo={why} proprio={pro_metrics["levels"]}{" TILT ALARM" if alarm else ""}')
+            why = geo_metrics.get('why') or geo_metrics.get('reason', '')
+            walls = geo_metrics.get('wall_cells')
+            log(f'severity {label.upper()} -> {state} x{factor:.2f} | terrain={self.terrain_type} | '
+                f'lidar: {why}' + (f' (ignored {walls} wall cells)' if walls else '') +
+                f' | robot: {pro_metrics["level"]} wobble={pro_metrics["imu_std"]} deg'
+                f'{" | TILT ALARM" if alarm else ""}')
             self.last_label, self.last_state = label, state
 
         self.details_pub.publish(String(data=json.dumps({

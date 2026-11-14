@@ -28,10 +28,17 @@ def image_msg_to_bgr(msg):
     return cv2.cvtColor(img, conversions[enc]) if enc in conversions else img.copy()
 
 
-def encode_jpeg(bgr, max_width, quality):
-    if max_width > 0 and bgr.shape[1] > max_width:
-        scale = max_width / bgr.shape[1]
-        bgr = cv2.resize(bgr, (max_width, int(round(bgr.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+def fit_within(bgr, max_width, max_height=0):
+    """Shrink (never enlarge) so the image fits max_width x max_height, keeping the aspect ratio. 0 = no limit."""
+    h, w = bgr.shape[:2]
+    scale = min(max_width / w if max_width > 0 else 1.0, max_height / h if max_height > 0 else 1.0, 1.0)
+    if scale >= 1.0:
+        return bgr
+    return cv2.resize(bgr, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+
+
+def encode_jpeg(bgr, max_width, quality, max_height=0):
+    bgr = fit_within(bgr, max_width, max_height)
     ok, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     if not ok:
         raise ValueError('JPEG encoding failed')

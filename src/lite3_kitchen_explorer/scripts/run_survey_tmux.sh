@@ -12,8 +12,8 @@
 #   ./run_survey_tmux.sh stop            Ctrl-C the launch, then close the session
 #
 # Settings (environment variables):
-#   SERVER_URL   AI server, e.g. http://192.168.1.100:8000  (empty = use config/reporter.yaml)
-#   GROUP_ID     your group id                              (empty = use config/reporter.yaml)
+#   SERVER_URL   AI server, e.g. http://192.168.10.141:8000  (empty = use lite3_llm_tools config/llm_client.yaml)
+#   GROUP_ID     your group id                              (empty = use lite3_llm_tools config/llm_client.yaml)
 #   LAUNCH_ARGS  extra launch arguments, e.g. "publish_lidar_tf:=true lidar_x:=0.15 lidar_z:=0.12"
 #   WS           ROS 2 workspace          (default ~/ros2_ws)
 #   ROS_DISTRO   ROS 2 distribution       (default humble)
@@ -22,7 +22,7 @@
 #   ATTACH       0 = start detached       (default 1)
 #
 # Example:
-#   SERVER_URL=http://192.168.1.100:8000 GROUP_ID=team7 ./run_survey_tmux.sh
+#   SERVER_URL=http://192.168.10.141:8000 GROUP_ID=team7 ./run_survey_tmux.sh
 set -euo pipefail
 
 SESSION="${SESSION:-survey}"
@@ -97,10 +97,10 @@ run "$SESSION:status.0" "REPORTER STATE" \
     "ros2 topic echo /environment_reporter/state std_msgs/msg/String --field data $LATCHED"
 run "$SESSION:status.1" "EXPLORER STATUS" \
     "ros2 topic echo /frontier_explorer/status std_msgs/msg/String --field data"
-run "$SESSION:status.2" "ENVIRONMENT REPORTS (one per stop)" \
+run "$SESSION:status.2" "TILE REPORTS (what each tile looks like)" \
     "ros2 run lite3_kitchen_explorer survey_monitor"
-run "$SESSION:status.3" "LAST AI ANSWER (each view)" \
-    "ros2 topic echo /environment_reporter/last_result std_msgs/msg/String --field data"
+run "$SESSION:status.3" "LAST AI ANSWER" \
+    "ros2 topic echo /llm/last_result std_msgs/msg/String --field data"
 run "$SESSION:status.4" "VELOCITY TO DOG (/cmd_vel)" \
     "ros2 topic echo /cmd_vel geometry_msgs/msg/Twist"
 
@@ -114,7 +114,7 @@ run "$SESSION:health.0" "/scan rate (lidar -> 2D)" "sleep 5; ros2 topic hz /scan
 run "$SESSION:health.1" "/map rate (slam_toolbox)" "sleep 5; ros2 topic hz /map"
 run "$SESSION:health.2" "odom -> base_link TF" "sleep 5; ros2 run tf2_ros tf2_echo odom base_link"
 run "$SESSION:health.3" "SHELL" \
-    "echo 'Pause:  ros2 service call /frontier_explorer/set_active std_srvs/srv/SetBool \"{data: false}\"'; echo 'Resume: ros2 service call /frontier_explorer/set_active std_srvs/srv/SetBool \"{data: true}\"'; echo 'Report here now: ros2 service call /environment_reporter/report_now std_srvs/srv/Trigger'; echo 'Reports + images: ~/lite3_survey_runs/<run>/environment_report.md'"
+    "echo 'Pause:  ros2 service call /frontier_explorer/set_active std_srvs/srv/SetBool \"{data: false}\"'; echo 'Resume: ros2 service call /frontier_explorer/set_active std_srvs/srv/SetBool \"{data: true}\"'; echo 'Describe this tile now: ros2 service call /environment_reporter/report_now std_srvs/srv/Trigger'; echo 'Tile report: ~/2d/reports/tile_report_<run>.md   images: ~/lite3_survey_runs/<run>/'"
 
 tmux select-window -t "$SESSION:status"
 if [[ "$ATTACH" == 1 ]]; then

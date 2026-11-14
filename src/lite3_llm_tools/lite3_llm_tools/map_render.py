@@ -17,7 +17,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from lite3_kitchen_explorer.frontier_core import GridInfo, dilate
+from lite3_llm_tools.gridmap import GridInfo, dilate
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 ROBOT = (255, 80, 0)
@@ -68,8 +68,19 @@ def _scale_bar(img, info, scale):
 
 
 def _legend(img, text):
-    strip = np.full((28, img.shape[1], 3), 255, np.uint8)
-    cv2.putText(strip, text, (6, 19), FONT, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+    """A white strip above the image with the legend, wrapped onto as many lines as the image width needs."""
+    items, lines, line = [t for t in text.split('  ') if t], [], ''
+    for item in items:
+        trial = f'{line}  {item}' if line else item
+        if line and cv2.getTextSize(trial, FONT, 0.45, 1)[0][0] > img.shape[1] - 12:
+            lines.append(line)
+            line = item
+        else:
+            line = trial
+    lines.append(line)
+    strip = np.full((8 + 20 * len(lines), img.shape[1], 3), 255, np.uint8)
+    for n, ln in enumerate(lines):
+        cv2.putText(strip, ln, (6, 19 + 20 * n), FONT, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
     return np.vstack([strip, img])
 
 
@@ -106,11 +117,26 @@ def draw_tiles(img, to_px, tile_grid, tiles: Dict, trail: Sequence, label_tiles:
             cv2.putText(img, str(n), (cx - 14, cy - 8), FONT, 0.45, TRAIL, 1, cv2.LINE_AA)
 
 
+WAYPOINT = (0, 170, 0)
+
+
+def draw_route(img, to_px, route: Sequence[Sequence[float]], arrow_m: float = 0.3):
+    """Numbered waypoint dots, each with an arrow along its yaw; the last pose is the tile target."""
+    for i, (x, y, yaw) in enumerate(route, 1):
+        start = to_px(x, y)
+        tip = to_px(x + arrow_m * math.cos(yaw), y + arrow_m * math.sin(yaw))
+        cv2.arrowedLine(img, start, tip, WAYPOINT, 3, cv2.LINE_AA, tipLength=0.45)
+        cv2.circle(img, start, 6, WAYPOINT, -1, cv2.LINE_AA)
+        cv2.circle(img, start, 6, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, str(i), (start[0] + 7, start[1] - 7), FONT, 0.5, (0, 100, 0), 2, cv2.LINE_AA)
+
+
 def render_map(grid: np.ndarray, info: GridInfo, robot_pose: Optional[Sequence[float]],
                candidates: List[dict], visited: Sequence[Sequence[float]] = (), *,
                tile_grid=None, tiles: Optional[Dict] = None, trail: Sequence = (),
                free_threshold: int = 25, occupied_threshold: int = 65, wall_band_m: float = 0.35,
-               margin_m: float = 1.0, target_px: int = 900, max_px_per_cell: int = 12) -> np.ndarray:
+               route: Sequence[Sequence[float]] = (), margin_m: float = 1.0, target_px: int = 900,
+               max_px_per_cell: int = 12) -> np.ndarray:
     """Whole explored map: walls, tiles + trail, past stops, robot, numbered candidate frontiers."""
     known = grid >= 0
     if not known.any():
@@ -133,6 +159,8 @@ def render_map(grid: np.ndarray, info: GridInfo, robot_pose: Optional[Sequence[f
         label = str(cand['id'])
         (tw, th), _ = cv2.getTextSize(label, FONT, 0.6, 2)
         cv2.putText(img, label, (px[0] - tw // 2, px[1] + th // 2), FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    if len(route):
+        draw_route(img, to_px, route)
     if robot_pose is not None:
         _draw_robot(img, to_px, robot_pose)
     _scale_bar(img, info, scale)
@@ -140,6 +168,8 @@ def render_map(grid: np.ndarray, info: GridInfo, robot_pose: Optional[Sequence[f
               'orange=past stop')
     if tile_grid is not None:
         legend += '  blue tiles=visited (order)  green box=tile to visit'
+    if len(route):
+        legend += '  green dot+arrow=waypoint (yaw)'
     return _legend(img, legend)
 
 

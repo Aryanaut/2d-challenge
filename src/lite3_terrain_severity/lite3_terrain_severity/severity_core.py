@@ -1,9 +1,16 @@
 """How rough is the ground ahead, and how fast may the Lite3 go over it? (no ROS here)
 
-Input points are N x 4: x, y, z in base_link and h = height above the fitted ground plane
-(exactly what terrain_classifier publishes on ~/lidar_points as intensity).
+Input points are N x 4: x, y, z in base_link and h = height above the ground plane fitted by
+terrain_classifier (its ~/lidar_points debug cloud, intensity channel).
 
-Levels: 0 smooth, 1 mild, 2 moderate, 3 severe, 4 extreme (pause).
+Three levels:
+  0 smooth   -> normal speed
+  1 rough    -> slow down
+  2 extreme  -> pause, then creep (a step / drop the Lite3 cannot handle, or the robot tipping)
+
+Maze-safe: anything taller than wall_min_h_m (the 50 cm OSB walls) is treated as a wall, not as
+terrain, and is removed together with a margin around its base before anything is measured.
+The ground level is then re-fitted locally, so a ground plane tilted by walls doesn't look like a bump.
 """
 from collections import deque
 from dataclasses import dataclass, field
@@ -11,8 +18,8 @@ import math
 
 import numpy as np
 
-LEVELS = ('smooth', 'mild', 'moderate', 'severe', 'extreme')
-SMOOTH, MILD, MODERATE, SEVERE, EXTREME = range(5)
+LEVELS = ('smooth', 'rough', 'extreme')
+SMOOTH, ROUGH, EXTREME = range(3)
 
 RUNNING, CREEP, PAUSED, BLOCKED = 'RUNNING', 'CREEP', 'PAUSED', 'BLOCKED'
 
@@ -22,34 +29,40 @@ class SeverityParams:
     # ---- where to look (base_link, metres) ----
     cell_m: float = 0.05
     x_start_m: float = 0.30          # front of the body footprint
-    lookahead_m: float = 1.2
-    half_width_m: float = 0.28       # Lite3 is ~0.4 m wide, plus margin
-    turn_radius_m: float = 0.70      # region checked when turning on the spot
-    min_cells: int = 12              # fewer observed cells => "not enough data"
-    # ---- thresholds for levels mild, moderate, severe, extreme ----
-    edge_m: list = field(default_factory=lambda: [0.03, 0.06, 0.10, 0.15])   # step between cells
-    bump_m: list = field(default_factory=lambda: [0.04, 0.08, 0.12, 0.18])   # highest point
-    hole_m: list = field(default_factory=lambda: [0.04, 0.07, 0.11, 0.16])   # deepest dip
-    roughness_m: list = field(default_factory=lambda: [0.012, 0.025, 0.045, 0.07])  # height std
-    rough_area: list = field(default_factory=lambda: [0.05, 0.15, 0.30, 0.50])  # share of cells off-ground
-    rough_area_h_m: float = 0.04     # what counts as "off-ground" for rough_area
-    extreme_within_m: float = 0.70   # geometry only says EXTREME once the hazard is this close
-    # ---- proprioception (the robot is actually struggling) ----
-    imu_std_deg: list = field(default_factory=lambda: [1.5, 3.0, 5.0, 8.0])  # roll/pitch wobble over window
-    slip_mps: list = field(default_factory=lambda: [0.10, 0.20, 0.30, 0.45])  # |cmd vx - odom vx|
+    lookahead_m: float = 1.0         # how far ahead to grade
+    half_width_m: float = 0.25       # Lite3 is ~0.4 m wide; corridor is 1 m
+    turn_radius_m: float = 0.55      # region checked when turning on the spot
+    min_cells: int = 12              # fewer usable cells => "not enough data"
+    # ---- walls (not terrain) ----
+    wall_min_h_m: float = 0.30       # taller than this = wall / obstacle, ignored here
+    wall_margin_cells: int = 2       # also ignore this many cells around a wall's base
+    # ---- ROUGH if any of these is reached ----
+    rough_edge_m: float = 0.06       # step between neighbouring 5 cm cells
+    rough_bump_m: float = 0.08       # highest point above the local ground
+    rough_hole_m: float = 0.08       # deepest dip below the local ground
+    rough_std_m: float = 0.03        # spread of heights (bumpy surface)
+    rough_area: float = 0.20         # share of cells more than rough_area_h_m off the ground
+    rough_area_h_m: float = 0.05
+    # ---- EXTREME (pause) ----
+    extreme_edge_m: float = 0.20     # a single step/drop bigger than the Lite3 can take (~15-18 cm)
+    extreme_within_m: float = 0.60   # ... only when it is this close; farther away => ROUGH
+    # ---- proprioception (the robot itself is struggling) ----
+    rough_imu_std_deg: float = 3.0   # roll/pitch wobble over the window
+    extreme_imu_std_deg: float = 8.0
+    rough_slip_mps: float = 0.25     # |commanded vx - measured vx|
     roll_alarm_deg: float = 18.0     # body roll beyond this => pause immediately
-    pitch_alarm_deg: float = 30.0    # pitch alarm is high because ramps are legal terrain
-    # ---- what the other classifier's label does ----
-    non_rugged_cap: int = MILD       # classifier says non_rugged and robot is steady => at most this
-    unknown_level: int = MODERATE    # no usable data => at least this
+    pitch_alarm_deg: float = 30.0    # high, because ramps are legal terrain
+    # ---- how the other classifier's label is used ----
+    non_rugged_cap: int = SMOOTH     # classifier says non_rugged and robot is steady => at most this
+    unknown_level: int = ROUGH       # no usable data => at least this
 
 
 @dataclass
 class GovernorParams:
-    speed_factor: list = field(default_factory=lambda: [1.0, 0.7, 0.45, 0.25, 0.0])  # per level
+    speed_factor: list = field(default_factory=lambda: [1.0, 0.4, 0.0])  # smooth, rough, extreme
     creep_factor: float = 0.15       # speed while edging forward after a pause
     turn_exponent: float = 0.5       # angular factor = linear factor ** this (turns slow down less)
-    min_turn_factor: float = 0.3     # turning never drops below this factor; also the BLOCKED turn speed
+    min_turn_factor: float = 0.3     # turning never drops below this; also the BLOCKED turn speed
     down_hold_s: float = 1.0         # a lower level must last this long before speeding up
     factor_rise_per_s: float = 0.5   # speed back up gently, slow down instantly
     pause_s: float = 1.5             # stand still, let the gait settle and the sensors re-scan
@@ -57,28 +70,34 @@ class GovernorParams:
     max_pauses: int = 3              # still extreme after this many pauses => BLOCKED
 
 
-def level_of(value, thresholds):
-    if value is None or not np.isfinite(value):
-        return SMOOTH
-    return int(sum(value >= t for t in thresholds))
-
-
 def _region(pts, direction, P):
     x, y = pts[:, 0], pts[:, 1]
     if direction == 'backward':
         m = (x <= -P.x_start_m) & (x >= -P.x_start_m - P.lookahead_m) & (np.abs(y) <= P.half_width_m)
-        xs = -x
+        dist = -x
     elif direction == 'turn':
-        m = np.hypot(x, y) <= P.turn_radius_m
-        xs = np.hypot(x, y)
+        dist = np.hypot(x, y)
+        m = dist <= P.turn_radius_m
     else:
         m = (x >= P.x_start_m) & (x <= P.x_start_m + P.lookahead_m) & (np.abs(y) <= P.half_width_m)
-        xs = x
-    return pts[m], xs[m]
+        dist = x
+    return pts[m], dist[m]
+
+
+def _dilate(mask, n):
+    out = mask.copy()
+    for _ in range(n):
+        m = out.copy()
+        m[1:, :] |= out[:-1, :]
+        m[:-1, :] |= out[1:, :]
+        m[:, 1:] |= out[:, :-1]
+        m[:, :-1] |= out[:, 1:]
+        out = m
+    return out
 
 
 def assess_geometry(pts, direction='forward', P=None):
-    """pts: N x 4 (x, y, z, h). Returns (level, metrics dict)."""
+    """pts: N x 4 (x, y, z, h). Returns (level or None, metrics dict)."""
     P = P or SeverityParams()
     if pts is None or len(pts) == 0:
         return None, {'reason': 'no points'}
@@ -86,71 +105,113 @@ def assess_geometry(pts, direction='forward', P=None):
     if len(sel) == 0:
         return None, {'reason': f'no points in {direction} region'}
 
-    # grid in the region's own (x, y); for 'turn' this is just a square around the robot
-    gx = np.floor(sel[:, 0] / P.cell_m).astype(int)
-    gy = np.floor(sel[:, 1] / P.cell_m).astype(int)
-    gx -= gx.min()
-    gy -= gy.min()
+    # ---- height grid: highest point per 5 cm cell (= where a foot lands) ----
+    x0, y0 = sel[:, 0].min(), sel[:, 1].min()
+    gx = np.floor((sel[:, 0] - x0) / P.cell_m).astype(int)
+    gy = np.floor((sel[:, 1] - y0) / P.cell_m).astype(int)
     nx, ny = gx.max() + 1, gy.max() + 1
     flat = gx * ny + gy
-    h = sel[:, 3]
     hmax = np.full(nx * ny, -np.inf)
-    hmin = np.full(nx * ny, np.inf)
-    np.maximum.at(hmax, flat, h)
-    np.minimum.at(hmin, flat, h)
     near = np.full(nx * ny, np.inf)
+    np.maximum.at(hmax, flat, sel[:, 3])
     np.minimum.at(near, flat, dist)
-    seen = np.isfinite(hmax)
-    n_cells = int(seen.sum())
+    seen = np.isfinite(hmax).reshape(nx, ny)
+    hmax = hmax.reshape(nx, ny)
+    near = near.reshape(nx, ny)
+
+    # ---- remove walls (and the band at their base) ----
+    wall = seen & (hmax >= P.wall_min_h_m)
+    wall_zone = _dilate(wall, P.wall_margin_cells)
+    use = seen & ~wall_zone
+    n_cells = int(use.sum())
+    base = dict(direction=direction, cells=n_cells, wall_cells=int(wall.sum()))
     if n_cells < P.min_cells:
-        return None, {'reason': f'only {n_cells} cells observed', 'cells': n_cells}
+        return None, {**base, 'reason': f'only {n_cells} ground cells visible (rest is wall or unseen)'}
 
-    top = hmax[seen]
-    bot = hmin[seen]
-    srt_top, srt_bot = np.sort(top), np.sort(bot)
-    bump = float(srt_top[-2]) if top.size > 1 else float(top[0])     # 2nd highest: ignore one stray point
-    hole = float(-srt_bot[1]) if bot.size > 1 else float(-bot[0])
-    hole = max(hole, 0.0)
-    roughness = float(np.std(top))
-    off = (top > P.rough_area_h_m) | (bot < -P.rough_area_h_m)
-    rough_area = float(off.mean())
+    # ---- re-fit the ground locally (robust: fit, drop outliers, fit again) ----
+    cx = (np.arange(nx) + 0.5) * P.cell_m + x0
+    cy = (np.arange(ny) + 0.5) * P.cell_m + y0
+    X, Y = np.meshgrid(cx, cy, indexing='ij')
+    A = np.column_stack([X[use], Y[use], np.ones(n_cells)])
+    z = hmax[use]
+    keep = np.ones(n_cells, bool)
+    for _ in range(2):
+        coef, *_ = np.linalg.lstsq(A[keep], z[keep], rcond=None)
+        r = z - A @ coef
+        keep = np.abs(r - np.median(r)) < max(0.03, 2.5 * np.std(r[keep]))
+        if keep.sum() < 6:
+            keep[:] = True
+            break
+    resid = z - A @ coef
+    tilt_deg = math.degrees(math.atan(math.hypot(coef[0], coef[1])))
+    if tilt_deg > 20.0:          # fit went wrong (e.g. mostly a staircase): fall back to a flat offset
+        resid = z - np.median(z)
+        tilt_deg = 0.0
+    hloc = np.full((nx, ny), np.nan)
+    hloc[use] = resid
 
-    grid = np.where(seen, hmax, np.nan).reshape(nx, ny)
-    diffs = np.concatenate([np.abs(np.diff(grid, axis=0)).ravel(), np.abs(np.diff(grid, axis=1)).ravel()])
-    diffs = np.sort(diffs[np.isfinite(diffs)])
-    edge = float(diffs[-3]) if diffs.size >= 3 else 0.0             # 3rd largest: ignore noise
+    s_top, s_bot = np.sort(resid), np.sort(resid)
+    bump = float(s_top[-2]) if n_cells > 1 else float(s_top[-1])     # 2nd highest: ignore 1 stray point
+    hole = max(0.0, float(-s_bot[1]) if n_cells > 1 else float(-s_bot[0]))
+    spread = float(np.std(resid))
+    area = float(np.mean(np.abs(resid) > P.rough_area_h_m))
 
-    levels = {
-        'edge': level_of(edge, P.edge_m), 'bump': level_of(bump, P.bump_m),
-        'hole': level_of(hole, P.hole_m), 'roughness': level_of(roughness, P.roughness_m),
-        'rough_area': level_of(rough_area, P.rough_area),
-    }
-    level = max(levels.values())
+    # ---- step edges between neighbouring ground cells ----
+    raw = np.where(use, hmax, np.nan)
+    ex = np.abs(np.diff(raw, axis=0))
+    ey = np.abs(np.diff(raw, axis=1))
+    all_e = np.concatenate([ex[np.isfinite(ex)], ey[np.isfinite(ey)]])
+    all_e.sort()
+    edge = float(all_e[-3]) if all_e.size >= 3 else (float(all_e[-1]) if all_e.size else 0.0)
 
-    # how far away is the worst stuff? far-away extremes only mean "severe, slow down"
-    # EXTREME (=> pause) needs a real tall bump or deep hole close ahead. Lots of medium
-    # blocks or a far-away hazard only mean SEVERE: slow right down and keep going.
-    tall = min(P.bump_m[3], P.edge_m[3])
-    hazard = (hmax >= tall) | (hmin <= -P.hole_m[3])
-    hazard_cells = seen & hazard
-    hazard_dist = float(near[hazard_cells].min()) if hazard_cells.any() else None
-    if level == EXTREME and (hazard_dist is None or hazard_dist > P.extreme_within_m):
-        level = SEVERE
+    # distance to the closest "too big" edge
+    big = np.zeros((nx, ny), bool)
+    with np.errstate(invalid='ignore'):
+        bx = ex >= P.extreme_edge_m
+        by = ey >= P.extreme_edge_m
+    big[:-1, :] |= bx
+    big[1:, :] |= bx
+    big[:, :-1] |= by
+    big[:, 1:] |= by
+    big &= use
+    # require at least 2 such cells so one noisy cell can't stop the robot
+    big_dist = float(np.sort(near[big])[1]) if big.sum() >= 2 else None
 
-    metrics = dict(direction=direction, cells=n_cells, edge=round(edge, 3), bump=round(bump, 3),
-                   hole=round(hole, 3), roughness=round(roughness, 3), rough_area=round(rough_area, 3),
-                   hazard_dist=None if hazard_dist is None else round(hazard_dist, 2), levels=levels)
-    return level, metrics
+    reasons = []
+    if edge >= P.rough_edge_m:
+        reasons.append(f'edge {edge:.2f}')
+    if bump >= P.rough_bump_m:
+        reasons.append(f'bump {bump:.2f}')
+    if hole >= P.rough_hole_m:
+        reasons.append(f'hole {hole:.2f}')
+    if spread >= P.rough_std_m:
+        reasons.append(f'spread {spread:.3f}')
+    if area >= P.rough_area:
+        reasons.append(f'area {area:.2f}')
+    level = ROUGH if reasons else SMOOTH
+    if big_dist is not None and big_dist <= P.extreme_within_m:
+        level = EXTREME
+        reasons.insert(0, f'step >= {P.extreme_edge_m:.2f} m at {big_dist:.2f} m')
+
+    return level, {**base, 'edge': round(edge, 3), 'bump': round(bump, 3), 'hole': round(hole, 3),
+                   'spread': round(spread, 3), 'area': round(area, 3), 'ground_tilt_deg': round(tilt_deg, 1),
+                   'big_step_dist': None if big_dist is None else round(big_dist, 2),
+                   'why': ', '.join(reasons) or 'flat'}
 
 
 def assess_proprio(roll_deg, pitch_deg, imu_std_deg, slip, P=None):
     """Returns (level, alarm, metrics). alarm=True => pause right now (tipping)."""
     P = P or SeverityParams()
-    levels = {'imu_std': level_of(imu_std_deg, P.imu_std_deg), 'slip': level_of(slip, P.slip_mps)}
+    roll_deg, pitch_deg, imu_std_deg, slip = (float(v) for v in (roll_deg, pitch_deg, imu_std_deg, slip))
+    level = SMOOTH
+    if imu_std_deg >= P.rough_imu_std_deg or slip >= P.rough_slip_mps:
+        level = ROUGH
+    if imu_std_deg >= P.extreme_imu_std_deg:
+        level = EXTREME
     alarm = bool(abs(roll_deg) >= P.roll_alarm_deg or abs(pitch_deg) >= P.pitch_alarm_deg)
-    return max(levels.values()), alarm, dict(roll=round(float(roll_deg), 1), pitch=round(float(pitch_deg), 1),
-                                              imu_std=round(float(imu_std_deg), 2), slip=round(float(slip), 3),
-                                              levels=levels, tilt_alarm=alarm)
+    return level, alarm, dict(roll=round(roll_deg, 1), pitch=round(pitch_deg, 1),
+                              imu_std=round(imu_std_deg, 2), slip=round(slip, 3),
+                              level=LEVELS[level], tilt_alarm=alarm)
 
 
 def combine(geo_level, proprio_level, terrain_type, P=None):
@@ -158,7 +219,7 @@ def combine(geo_level, proprio_level, terrain_type, P=None):
     P = P or SeverityParams()
     if geo_level is None:                       # can't see the ground: be careful
         geo_level = P.unknown_level
-    if terrain_type == 'non_rugged' and proprio_level <= SMOOTH:
+    if terrain_type == 'non_rugged' and proprio_level == SMOOTH and geo_level < EXTREME:
         geo_level = min(geo_level, P.non_rugged_cap)
     if terrain_type == 'unknown':
         geo_level = max(geo_level, P.unknown_level)
@@ -173,9 +234,10 @@ class Governor:
         self.state = RUNNING
         self.level = SMOOTH            # debounced level
         self.factor = 1.0
-        self._higher_seen_t = -1e9     # last time raw level was >= current debounced level
+        self._higher_seen_t = -1e9
         self._state_until = 0.0
         self._creep_until = 0.0
+        self._last_t = None
         self.pauses = 0
 
     def _debounce(self, raw, now):
@@ -210,16 +272,13 @@ class Governor:
             self.state, self.pauses = RUNNING, 0
 
         target = {RUNNING: G.speed_factor[lvl], CREEP: G.creep_factor, PAUSED: 0.0, BLOCKED: 0.0}[self.state]
+        dt = 0.0 if self._last_t is None else max(0.0, min(0.5, now - self._last_t))
+        self._last_t = now
         if target < self.factor:
             self.factor = target                                 # slow down at once
         else:
-            self.factor = min(target, self.factor + G.factor_rise_per_s * self._dt(now))
-        self._last_t = now
+            self.factor = min(target, self.factor + G.factor_rise_per_s * dt)
         return self.state, self.factor
-
-    def _dt(self, now):
-        last = getattr(self, '_last_t', now)
-        return max(0.0, min(0.5, now - last))
 
     def scale(self, vx, vy, wz):
         """Apply the current factor. BLOCKED still lets the robot back up and turn away."""

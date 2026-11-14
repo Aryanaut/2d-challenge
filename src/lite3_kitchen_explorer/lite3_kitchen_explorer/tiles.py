@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -169,8 +168,12 @@ def tile_sides(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, *, fr
 
 
 def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, free_threshold: int = 25,
-                   occupied_threshold: int = 65, min_free: float = 0.15, min_known: float = 0.10) -> Dict[Tile, dict]:
-    """Status and coverage for every tile that has any mapped cell (plus every visited tile)."""
+                   occupied_threshold: int = 65, min_free: float = 0.15, min_known: float = 0.70) -> Dict[Tile, dict]:
+    """Status and coverage for every tile that has any mapped cell (plus every visited tile).
+
+    A tile is defined (to_visit / blocked) only once at least min_known of its area has been
+    scanned by the lidar; before that it is 'unknown' and is not offered as a target. Visited
+    tiles (including the initial tile the robot stands in) are always defined."""
     h, w = grid.shape
     cols, rows = np.meshgrid(np.arange(w), np.arange(h))
     xs = info.origin_x + (cols + 0.5) * info.resolution
@@ -231,32 +234,6 @@ def tile_label(tile: Tile) -> str:
     return f'{tile[0]},{tile[1]}'
 
 
-# ------------------------------------------------------------ AI answer
-_TILE = re.compile(r'\btile\s*([A-D])\b', re.IGNORECASE)
-_SIDE = re.compile(r'\b([NESW])\s*[=:]\s*(wall|open|frontier|unknown)', re.IGNORECASE)
-
-
-def parse_tile_choice(scene_description: str, evidence: Sequence[str], valid_ids) -> Tuple[Optional[str], Dict[str, str]]:
-    """('A'..'D' or None, {side: wall/open/frontier/unknown}) from the AI's four-key answer."""
-    choice = None
-    texts = [str(scene_description)] + [str(e) for e in evidence]
-    for text in texts:
-        m = _TILE.search(text)
-        if m and m.group(1).upper() in valid_ids:
-            choice = m.group(1).upper()
-            break
-    if choice is None:
-        first = str(scene_description).strip()[:1].upper()
-        if first in valid_ids and (len(str(scene_description).strip()) == 1
-                                   or not str(scene_description).strip()[1:2].isalpha()):
-            choice = first
-    sides = {}
-    for text in texts:
-        for side, state in _SIDE.findall(text):
-            sides.setdefault(side.upper(), state.lower())
-    return choice, sides
-
-
 # ------------------------------------------------------- connected tiles
 _STEPS = {'E': (1, 0, 'W'), 'W': (-1, 0, 'E'), 'N': (0, 1, 'S'), 'S': (0, -1, 'N')}
 
@@ -294,15 +271,21 @@ def connected_steps(tiles: Dict[Tile, dict], start: Tile) -> Dict[Tile, Tuple[in
 def nearest_connected_targets(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles: Dict[Tile, dict],
                               current: Tile, robot_xy: Sequence[float], *, limit: int = 6,
                               min_clearance_m: float = 0.30, occupied_threshold: int = 65,
-                              free_threshold: int = 25) -> List[dict]:
+                              free_threshold: int = 25, grid_connected: bool = True) -> List[dict]:
     """Not-yet-visited tiles reachable through connected tiles, nearest (fewest steps) first.
+
+    With grid_connected=False every unvisited tile is a candidate (the caller checks that
+    the robot can actually reach it, e.g. with a Nav2 path), ordered by distance from the robot.
 
     Each target gets a goal point inside the tile: the free cell nearest the tile centre
     that keeps min_clearance_m from walls (else the free cell with the most clearance).
     Tiles whose best point is closer than min_clearance_m to a wall are left out.
     """
     import cv2
-    reach = connected_steps(tiles, current)
+    if grid_connected:
+        reach = connected_steps(tiles, current)
+    else:
+        reach = {t: (0, []) for t, v in tiles.items() if v['status'] == 'to_visit'}
     if not reach:
         return []
     not_wall = (grid < occupied_threshold).astype(np.uint8)
