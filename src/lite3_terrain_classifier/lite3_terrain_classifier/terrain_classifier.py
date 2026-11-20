@@ -29,7 +29,7 @@ from rclpy.time import Time
 
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import Header, String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from lite3_terrain_classifier import terrain_core as tc
@@ -58,6 +58,11 @@ class TerrainClassifier(Node):
         self.publish_debug_clouds = p('publish_debug_clouds', True)
         self.enabled = p('start_enabled', True)
         self.debounce = tc.Debouncer(p('confirm_frames', 3))
+        # trigger_mode: classify only when ~/classify is called (e.g. by the mission manager on entering a
+        # new tile), for trigger_duration_s, then hold the last label. One run also happens at startup.
+        self.trigger_mode = p('trigger_mode', False)
+        self.trigger_duration_s = p('trigger_duration_s', 1.5)
+        self.active_until_s = None      # trigger_mode: classify until this time (None = idle)
 
         # ---- lidar ----
         self.cloud_topic = p('lidar.topic', '/livox/points')
@@ -107,10 +112,14 @@ class TerrainClassifier(Node):
             self.create_subscription(Image, self.depth_topic, self._on_depth, qos_profile_sensor_data)
             self.create_subscription(CameraInfo, self.info_topic, self._on_info, qos_profile_sensor_data)
         self.create_service(SetBool, '~/set_enabled', self._on_set_enabled)
+        self.create_service(Trigger, '~/classify', self._on_classify)
         self.create_timer(1.0 / max(rate_hz, 0.1), self._tick)
 
         self._publish_label(tc.UNKNOWN)
+        if self.trigger_mode:
+            self.active_until_s = self._now_s() + self.trigger_duration_s
         self.get_logger().info(
+            f'{"TRIGGERED (service ~/classify)" if self.trigger_mode else "continuous"}: '
             f'Lidar {self.cloud_topic} (primary), depth {self.depth_topic if self.use_depth else "off"} '
             f'(verify), fusion={self.fusion_mode} -> {self.terrain_topic}')
 
@@ -149,10 +158,21 @@ class TerrainClassifier(Node):
         self.enabled = bool(request.data)
         self.debounce.reset()
         self.clouds.clear()
+        if self.trigger_mode:
+            self.active_until_s = None
         self._publish_label(tc.UNKNOWN)
         response.success = True
         response.message = 'terrain classifier ' + ('enabled' if self.enabled else 'paused')
         self.get_logger().info(response.message)
+        return response
+
+    def _on_classify(self, request, response):
+        if self.trigger_mode:
+            self.active_until_s = self._now_s() + self.trigger_duration_s
+            response.message = f'classifying for {self.trigger_duration_s:g} s'
+        else:
+            response.message = 'continuous mode: already classifying'
+        response.success = True
         return response
 
     def _on_info(self, msg):
@@ -165,6 +185,8 @@ class TerrainClassifier(Node):
     def _on_cloud(self, msg):
         if not self.enabled:
             return
+        if self.trigger_mode and (self.active_until_s is None or self._now_s() > self.active_until_s + 0.5):
+            return                       # idle: do not even convert the cloud
         recv_s = self._now_s()
         try:
             xyz = cloud_to_xyz(msg)
@@ -268,6 +290,8 @@ class TerrainClassifier(Node):
         if not self.enabled:
             return
         now_s = self._now_s()
+        if self.trigger_mode and (self.active_until_s is None or now_s > self.active_until_s):
+            return                       # idle: the last label stays latched on the terrain topic
         lidar, lidar_dbg = self._assess_lidar(now_s)
         depth, depth_dbg = self._assess_depth(now_s)
         fused = tc.fuse(lidar, depth, self.fusion_mode, self.depth_fallback)

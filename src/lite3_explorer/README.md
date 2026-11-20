@@ -1,0 +1,250 @@
+# lite3_explorer — tile exploration with a mission manager
+
+ROS 2 (Humble) package for the DEEP Robotics **Lite3**, derived from `lite3_kitchen_explorer`. The SLAM map is cut
+into 1 m × 1 m tiles and the dog visits **every identified tile**. One node, `mission_manager`, runs the whole
+mission as a set of switchable **modes**. Inside a mode, **where** to go next comes from *exploration profiles*
+(tiles by default; frontiers optional) and **how** to drive there from *traversal profiles*.
+
+What changed from `lite3_kitchen_explorer`:
+
+| `lite3_kitchen_explorer` | `lite3_explorer` |
+|---|---|
+| `frontier_explorer` + `environment_reporter`, two nodes coordinating over topics and `set_active` | one `mission_manager` node with a mode state machine (`mission/`) |
+| frontiers chosen when no tile was reachable; done when no frontier left | tiles by default, frontiers an optional fallback profile; done when the **configurable end condition** is met (default: all identified tiles explored) |
+| next tile = nearest tile Nav2 can reach | next tile must **share a side with an explored tile**; tiles Nav2 repeatedly can't plan to are **eliminated** |
+| stuck → blacklist the goal, try another | stuck → **recovery mode**: drive to the nearest tile centre, then rescan |
+| traversal hard-coded (FollowWaypoints) | named **traversal profiles** per mode, and per tile |
+| AI could place the first tile / pick targets (off by default) | not ported: tiles snap to the walls, target = the profile's top-ranked candidate (`choose_target()` hook left for an AI picker) |
+
+The AI tile report is unchanged: when a new tile is reached, `lite3_llm_tools`'s `llm_client` is asked in the
+background what it looks like, and the answers are compiled into `~/2d-challenge/reports/tile_report_<run>.md`.
+
+## Modes
+
+```
+ idle ──auto start / set_active(true)──► scanning ──scan finished──► exploring ──end condition met──► complete
+  ▲                                       ▲     ▲                      │    │
+  └── set_active(false) (from any mode)   │     └────tile reached──────┘    │ stuck (no motion / in the costmap)
+                                          │                                 │ or no Nav2 path to any unexplored tile
+                                          └──recovered / gave up── recovery ◄┘   (drive to the nearest tile centre)
+```
+
+| Mode | What it does | Phases |
+|---|---|---|
+| `idle` | Nothing moves. With `auto_start` it leaves once TF, `/map`, Nav2 (spin, planner) and the AI client are up, or after `start_wait_s`. After a pause it only leaves on a command. | `waiting_start`, `paused` |
+| `scanning` | First time: waits for the map around the robot, **places the tile grid** (snapped to nearby walls) and does the opening sweep −90…+90° in the flat gait. Later: one in-place turn (360°) in the crawl gait, skipped where the body has no room. Then re-classifies the tiles. | `wait_map`, `settle`, `turning`, `done` |
+| `exploring` | **Checkpoint**: checks the end condition. Asks its exploration profiles in order (default `[tiles]`) for candidates, has Nav2 check a path to each, and drives to the best reachable one with a traversal profile. If a profile has nothing reachable, the next one is asked. Reached → `scanning`. Failed → the profile records it (tile failure / frontier blacklist) and it re-decides. | `decide`, `checking_paths`, `driving`, `wait_planner`, `wait_traversal` |
+| `quickscan` | Optional (`quickscan_on_edge`). Entered from `exploring` when the robot is within `quickscan_edge_margin_m` (0.15 m) of a tile boundary, once per tile. Cancels the Nav2 goal, waits `settle_s`, plays the `quickscan` robot animation and waits for it to end, then returns to `exploring`, which re-decides (the cancelled goal is normally re-chosen; it does not count as a failure). Skipped if `animation_player` doesn't start it within `start_timeout_s`; cancelled after `timeout_s`. | `settle`, `playing` |
+| `recovery` | Clears the costmaps, then drives to the **nearest tile centre** (visited or to-visit tiles, excluding the tile it got stuck on and the centre it already stands on), trying up to `candidates` of them. Then `scanning`. After `give_up_after` recoveries in a row without reaching a new tile, the failing tiles are marked unreachable. | `clearing`, `driving`, `wait_traversal`, `give_up` |
+| `complete` | The end condition is met. Publishes `/exploration_complete`, writes `tiles.json` and the final tile report. `set_active(true)` starts again. | `done` |
+
+**The stuck supervisor** watches the modes in `stuck.watch_modes` (default `exploring`). If unexplored tiles remain
+and either trigger fires, it switches to `recovery` (if none remain, it checks the end condition instead):
+
+- `no_motion`: the robot has been driving for `window_s` (20 s) and moved less than `min_motion_m` (0.15 m).
+- `costmap`: the robot's centre has been on a global-costmap cell of cost ≥ `costmap_cost` (99 = inscribed) for
+  `costmap_hold_s` (3 s). From there Nav2's planner can't plan out.
+
+`exploring` also goes to `recovery` when **no candidate of any profile has a Nav2 path** (`on_no_reachable_tile`).
+
+**Tile states:** `visited` (explored), `to_visit`, `blocked`, `unknown` (not identified yet: doesn't count), and
+`unreachable`: a `to_visit` tile that was **eliminated**: no Nav2 path `eliminate_after` decisions in a row, no point
+clear of the walls, `tiles.max_failures` failed attempts (Nav2 abort, stuck, timeout), or repeated recoveries.
+Reaching an eliminated tile by any route clears that status.
+
+## Robot animations
+
+Timed sequences of `/simple_cmd` (`MotionSimpleCMD`) commands, defined in `animations.py` and played by the `animation_player` node.
+Two categories:
+
+- **movement** (`MovementAnimation`): moves the robot around; none defined yet.
+- **pose** (`PoseAnimation`): enters **pose mode** (`0x21010D05`) when it starts and **move mode** (`0x21010D06`) when it ends (also if cancelled).
+  The robot only holds a pose while the pose commands keep being published, so the player republishes them at `publish_rate_hz` (20) for the whole animation.
+  Keyframes ramp linearly between poses (`move_s` per move) and a pause is a keyframe that repeats the previous pose.
+
+| Animation | Category | Sequence |
+|---|---|---|
+| `quickscan` | pose | pose mode → lean forward → pause → look left (still leaning) → look right → pause → level and centred → move mode |
+
+Pose commands: lean `0x21010130` (±20000, positive = forward), yaw `0x21010135` (values within ±9553 are a dead zone and ignored, so use more, default 20000; positive = right, so left is negative).
+
+`animation_player` parameters: `quickscan.pause_s` (0.5, the pause at the forward lean and at the right extreme), `quickscan.move_s` (1.0),
+`quickscan.lean` (20000), `quickscan.yaw` (20000), `mode_settle_s` (1.0, wait after pose mode), `mode_repeats` (3, mode commands are sent several times
+in case one is lost), `publish_rate_hz`. Topics: `/play_animation` (`std_msgs/String`: an animation name, or `stop`), `/animation_active` (`Bool`).
+`gait_switcher` sends no gait commands while `/animation_active` is true and restores the terrain gait afterwards.
+
+```bash
+ros2 run lite3_explorer animation_player
+ros2 topic pub --once /play_animation std_msgs/msg/String "{data: quickscan}"
+```
+
+**Test an animation** (starts the player, plays it once, exits when it ends; exit code 1 if it never started or timed out):
+```bash
+ros2 launch lite3_explorer test_animation.launch.py                                   # quickscan
+ros2 launch lite3_explorer test_animation.launch.py animation:=quickscan pause_s:=1.0 lean:=15000 yaw:=4000
+```
+Arguments: `animation` and the optional overrides `pause_s`, `move_s`, `lean`, `yaw`.
+
+**Quickscan on tile edges:** `./scripts/explorer.sh --quickscan`, or `quickscan_on_edge:=true` on `exploration.launch.py`
+(also starts `animation_player`), or `modes.exploring.quickscan_on_edge: true` in `mission.yaml`.
+
+**Add an animation:** subclass `PoseAnimation`, return the keyframes `[(seconds, {cmd_code: size}), ...]`, and add the class to `ANIMATIONS`.
+
+## Exploration profiles (where to go)
+
+`modes.exploring.exploration` lists the profiles to ask, in order; later ones are fallbacks. Profiles live under
+`explorations.<name>`, exactly like traversal profiles.
+
+**`tiles`** (default). At each decision:
+1. Take the unexplored tiles with a goal point clear of walls (tiles with none are eliminated).
+2. **Adjacency**: keep the tiles that share a side with an explored (visited) tile. Each gets a level:
+   `0` open side with the current tile, `1` open side with any visited tile, `2` touches a visited tile only across a
+   wall, `3` touches none. Kept: level ≤ `max_adjacency` (default 2). If none qualifies, the rest are offered
+   (`fallback_any`), so the mission can't stall behind an eliminated tile.
+3. **Reachability**: Nav2 plans a path to each. Tiles without a path are dropped and get a strike; after
+   `eliminate_after` (2) strikes in a row a tile is eliminated. Strikes are only given when some other tile did get a
+   path, so a planner failing from where the robot stands (stuck in an inflated wall) eliminates nothing — that goes
+   to recovery instead.
+4. **Ranking**: adjacency level first (`prefer_current: false` treats levels 0 and 1 alike), then Nav2 path length.
+
+**`frontier`** (optional, off by default). Frontier clusters (free cells next to unknown space), goal point clear of
+walls, ranked by `distance_weight × path length − size_weight × size`. Failed goals are blacklisted; a goal is dropped
+once its frontier gets mapped on the way. Use it as a fallback to open up parts of the arena the lidar hasn't
+mapped well enough for tiles to be identified:
+
+```yaml
+modes:
+  exploring: {exploration: [tiles, frontier], kind_traversals: ['frontier:direct']}
+end_condition:                        # don't stop while frontiers remain
+  combine: all
+  conditions: [all_tiles_explored, no_frontiers_left]
+```
+
+If Nav2's action servers are not up, the modes **wait** (`wait_traversal`) rather than failing tiles.
+
+## End conditions
+
+Configured under `end_condition`. `conditions` lists them, `combine` is `any` (stop when one is met) or `all`.
+
+| Name | Checked | Met when | Settings |
+|---|---|---|---|
+| `all_tiles_explored` | at checkpoints (each `exploring` decision, after a scan) | no `to_visit` tile left and at least `min_visited` visited | `min_visited` (1), `ignore_unreachable` (true) |
+| `no_frontiers_left` | at checkpoints | no frontier cluster with a clear goal point left | `min_cluster_cells` (8), `min_clearance_m` (0.30) |
+| `time_limit` | every tick | mission running ≥ `seconds` | `seconds` (0 = off) |
+| `max_tiles_visited` | every tick | ≥ `count` tiles visited | `count` (0 = off) |
+
+E.g. finish when all tiles are done **or** after 10 minutes:
+```yaml
+end_condition:
+  combine: any
+  conditions: [all_tiles_explored, time_limit]
+  time_limit: {seconds: 600.0}
+```
+
+## Running
+
+```bash
+cd ~/2d-challenge && colcon build --packages-select lite3_explorer && source install/setup.bash
+ros2 run lite3_explorer preflight                      # topics, frames, TF, clocks, /cmd_vel consumer
+ros2 launch lite3_explorer exploration.launch.py server_url:=http://192.168.10.141:8000 group_id:=team7
+# or everything in tmux with status panes:
+SERVER_URL=http://192.168.10.141:8000 GROUP_ID=team7 src/lite3_explorer/scripts/run_explorer_tmux.sh
+```
+
+Launch arguments are the same as before (`use_slam`, `use_nav2`, `use_terrain`, `use_gait`, lidar TF, `use_ai`,
+`server_url`, ...), plus `mission_params:=<yaml>`, `auto_start:=true|false`, `use_mission:=false` and
+`quickscan_on_edge:=true` (see [Robot animations](#robot-animations)).
+`mission_only.launch.py` skips odom TF, cloud→scan, SLAM and Nav2 for robots that already run them.
+
+Commands while it runs:
+```bash
+ros2 service call /mission_manager/set_active std_srvs/srv/SetBool "{data: false}"    # pause (idle)
+ros2 service call /mission_manager/set_active std_srvs/srv/SetBool "{data: true}"     # start / resume
+ros2 topic pub --once /mission_manager/mode_cmd std_msgs/msg/String "{data: recovery}" # force a mode
+ros2 service call /mission_manager/report_now std_srvs/srv/Trigger                     # describe this tile now
+ros2 topic echo /mission_manager/status --field data                                   # mode, target, tiles, end condition
+```
+
+Topics: `~/mode` (`mode:phase`, latched), `~/status` (JSON, 1 Hz), `~/events` (every decision as JSON, also
+`run_dir/events.jsonl`), `~/current_goal`, `~/next_target`, `/tile_map`, `/tile_report`, `~/tile_markers`
+(visited blue, to-visit green, blocked red, unreachable purple; target orange, recovery target magenta), `~/markers`
+(tile descriptions), `/exploration_complete`.
+
+## Configuration: `config/mission.yaml`
+
+Every setting is in `config/mission.yaml` with a comment; defaults live in `lite3_explorer/mission/config.py`. The
+node accepts **any** parameter key (`automatically_declare_parameters_from_overrides`), so new modes, profiles and
+end-condition settings need no code change. ROS 2 can't type an empty list: write `['']` for "none".
+
+### Traversal profiles
+
+A mode drives through a named profile, never Nav2 directly:
+
+```yaml
+traversals:
+  route:                                # FollowWaypoints: 3 waypoints along the Nav2 path, then the tile centre
+    type: nav2_route
+    waypoints: 3                        # evenly spaced along the path (after skip_start_m), driven through
+    skip_start_m: 0.20
+    drop_backward_waypoints: false      # true: drop waypoints facing away from the goal (then fewer than 3)
+  direct: {type: nav2_pose}             # NavigateToPose straight to the goal (behavior_tree: optional BT XML)
+modes:
+  exploring: {traversal: route, tile_traversals: ['3,1:direct'], kind_traversals: ['frontier:direct']}
+  recovery:  {traversal: direct}
+```
+
+For a tile, the goal is the **exact tile centre** when it is at least `min_clearance_m` from the walls, otherwise
+the clear point nearest the centre. With the `route` profile Nav2 gets 3 intermediate waypoints spaced evenly
+along its own planned path (so they follow the corridor round walls), each facing the next, then the centre facing
+along the tile grid. E.g. a 1 m hop: waypoints at 0.4, 0.6 and 0.8 m, goal at 1.0 m.
+
+### Several instances of one mode type
+
+```yaml
+mission:
+  modes: [idle, scanning, exploring, explore_careful, recovery, complete]
+modes:
+  explore_careful: {type: exploring, traversal: direct, scan_after_reach: false}
+```
+Switch to it with `mode_cmd`, or point another mode's `next_mode` / `scan_mode` at it. Every mode a mode can
+switch to must exist in `mission.modes`; the node checks this at start-up.
+
+## Extending
+
+All mission logic in `lite3_explorer/mission/` is ROS-free and unit tested (`test/test_mission.py` runs whole
+missions in simulated corridors and rooms, including a fake lidar that reveals the map as the robot scans).
+
+- **A new traversal** (e.g. stair climbing): subclass `mission.traversal.Traversal` (`available`, `start`, `poll`,
+  `cancel`), decorate it with `@register_traversal('stairs')`, import its module in `mission_manager.py`, add
+  `traversals.stairs: {type: stairs}` and select it per mode or per tile. `ExploringMode.traversal_for()` is the
+  hook for choosing it automatically (e.g. from terrain severity).
+- **A new mode**: subclass `mission.core.Mode` (`enter`, `tick` → `Transition` or None, `exit`, `targets`), decorate it
+  with `@register_mode('name')` in `mission/modes.py`, and list an instance in `mission.modes`.
+- **A new end condition**: subclass `mission.end_conditions.EndCondition` (`evaluate(snapshot) -> (met, why)`,
+  `continuous = True` to check it every tick), decorate it with `@register('name')`, and list it in
+  `end_condition.conditions`.
+- **A new exploration strategy**: subclass `mission.exploration.Exploration` (`candidates`, `select`, optionally
+  `still_valid`, `on_reached`, `on_failed`), decorate it with `@register_exploration('name')`, add
+  `explorations.<x>: {type: name}` and list it in `modes.exploring.exploration`.
+- **A different final pick** (e.g. the AI): override `ExploringMode.choose_target(reachable)`. Tile targets keep the
+  `lite3_llm_tools` `choose_target` wire format.
+
+## Files
+
+| File | Role |
+|---|---|
+| `mission_manager.py` | The ROS node: TF, maps, costmaps, Nav2 spin / planner clients, tile reports, RViz, services. It is the `ctx` the modes use. |
+| `nav2_traversal.py` | `nav2_pose` and `nav2_route` traversal types. |
+| `mission/core.py` | `Mode`, `Transition`, `ModeMachine` (switching, stuck supervisor, end-condition checks). |
+| `mission/modes.py` | `idle`, `scanning`, `exploring`, `quickscan`, `recovery`, `complete`. |
+| `animations.py`, `animation_player.py`, `animation_test.py` | Robot animations (movement / pose), the node that plays them, and the one-shot test node (`launch/test_animation.launch.py`). |
+| `mission/exploration.py` | Exploration strategies (`tiles`, `frontier`) and their registry. |
+| `mission/stuck.py`, `mission/end_conditions.py`, `mission/traversal.py`, `mission/config.py` | Stuck detector, end conditions, traversal interface, config defaults. |
+| `frontiers.py` | Frontier clustering (only used by the optional `frontier` profile and `no_frontiers_left`). |
+| `tile_tracker.py` | Tile grid, classification, trail, failures, unreachable tiles. |
+| `tiles.py` (incl. adjacency levels), `map_grid.py`, `approach.py`, `turn_check.py`, `tile_reports.py`, `llm_link.py` | Tile geometry, map helpers, waypoint routes, turn-room check, tile report, AI link (from the kitchen explorer). |
+| `gait_switcher.py` | Terrain gait switching; pauses while an animation runs. |
+| `terrain_gait.py`, `odom_tf_bridge.py`, `preflight.py`, `survey_monitor.py` | Unchanged helpers. |
+
+Run files: `~/lite3_survey_runs/run_<time>/events.jsonl` (every mode switch, target, failure, stuck event,
+recovery), `tiles.json`, and the AI client's images and answers.

@@ -1,0 +1,205 @@
+"""Mission configuration: defaults and merging of the flat ROS parameters (no ROS).
+
+ROS 2 YAML nests parameters with dots (``modes.exploring.traversal``). The mission manager is created with
+``automatically_declare_parameters_from_overrides=True``, so ANY key in the YAML reaches it, and this module
+merges those flat keys over DEFAULTS. That is what makes modes, traversals and end conditions pluggable from
+config alone: a new mode ``modes.exploring_careful: {type: exploring, traversal: careful}`` or a new
+traversal profile ``traversals.careful: {type: nav2_pose, ...}`` needs no new declare_parameter calls.
+
+ROS parameters cannot be empty lists of unknown type; use [''] for "none" (empty strings are dropped).
+"""
+from __future__ import annotations
+
+import copy
+from typing import Any, Dict
+
+DEFAULTS: Dict[str, Any] = {
+    'global_frame': 'map',
+    'robot_frame': 'base_link',
+    'map_topic': '/map',
+    'global_costmap_topic': '/global_costmap/costmap',
+    'local_costmap_topic': '/local_costmap/costmap',
+    'tick_period_s': 0.2,
+    'output_dir': '~/lite3_survey_runs',
+    'reports_dir': '~/2d-challenge/reports',
+    'use_ai': True,                       # AI tile descriptions via lite3_llm_tools/llm_client
+    'terrain_classify_service': '/terrain_classifier/classify',   # called on entering a new tile ('' = never)
+    'llm_report_timeout_s': 180.0,
+    'llm_report_retries': 5,
+    'robot_length_m': 0.61,               # turn-room check (match the local costmap footprint)
+    'robot_width_m': 0.37,
+    'turn_room_margin_m': 0.0,
+
+    'tiles': {
+        'size_m': 1.0,
+        'reach_radius_m': 0.30,           # a tile is reached (explored) this close to its centre
+        'max_failures': 2,                # failed attempts before a tile is given up on (unreachable); 0 = never
+    },
+
+    'mission': {
+        # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
+        # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
+        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'recovery', 'complete'],
+        'initial_mode': 'idle',
+        'start_mode': 'scanning',         # where set_active(true) / auto start goes
+        'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
+        'complete_mode': 'complete',
+    },
+
+    'stuck': {
+        'enabled': True,
+        'watch_modes': ['exploring'],     # modes the stuck supervisor watches
+        'triggers': ['no_motion', 'costmap'],
+        'window_s': 60.0,                 # no_motion: driving this long ...
+        'min_motion_m': 0.15,             # ... without moving this far = stuck
+        'costmap_cost': 99,               # costmap: robot centre on a cell this costly (99 inscribed, 100 lethal) ...
+        'costmap_hold_s': 20.0,           # ... for this long = stuck in the global costmap
+        'cooldown_s': 5.0,                # ignore triggers this long after (re-)entering a watched mode
+    },
+
+    'end_condition': {
+        'combine': 'any',                 # any | all
+        'conditions': ['all_tiles_explored'],
+        'all_tiles_explored': {
+            'min_visited': 1,             # never finish before this many tiles were reached
+            'ignore_unreachable': True,   # tiles given up on count as done
+        },
+        'time_limit': {'seconds': 0.0},   # 0 = off
+        'max_tiles_visited': {'count': 0},
+        'no_frontiers_left': {'min_cluster_cells': 8, 'goal_clearance_m': 0.35, 'min_clearance_m': 0.30},
+    },
+
+    'explorations': {
+        # Named exploration profiles: WHERE to go next. type = a registered strategy (see mission/exploration.py).
+        'tiles': {
+            'type': 'tiles',
+            'max_adjacency': 2,           # 0 open side w/ current tile, 1 open side w/ a visited tile,
+                                          # 2 any side (also across a wall) w/ a visited tile, 3 anywhere
+            'fallback_any': True,         # no tile within max_adjacency -> offer the rest (else: none)
+            'direct_path_only': True,     # next tile: a neighbour of the current tile, path through their shared side
+            'direct_fallback': True,      # none qualifies -> best reachable tile (False: none)
+            'prefer_current': True,       # rank neighbours of the current tile before other visited tiles' neighbours
+            'eliminate_after': 2,         # consecutive failed Nav2 path checks before a tile is eliminated; 0 = never
+            'candidate_limit': 12,        # tiles sent to the Nav2 path check per decision
+            'target_limit': 6,
+            'min_clearance_m': 0.30,
+        },
+        'frontier': {                     # optional: add to modes.exploring.exploration to use it
+            'type': 'frontier',
+            'min_cluster_cells': 8,
+            'goal_clearance_m': 0.35,
+            'min_clearance_m': 0.30,
+            'distance_weight': 1.0,
+            'size_weight': 0.5,
+            'min_goal_distance_m': 0.6,
+            'blacklist_radius_m': 0.6,
+            'candidate_limit': 8,
+            'target_limit': 6,
+            'replan_when_explored': True,
+            'explored_radius_m': 0.5,
+        },
+    },
+
+    'traversals': {
+        # Named traversal profiles. type = a registered traversal class (see mission/traversal.py).
+        'route': {'type': 'nav2_route',   # FollowWaypoints: N waypoints along the Nav2 path, then the tile centre
+                  'waypoints': 3,         # intermediate waypoints, evenly spaced along the path
+                  'skip_start_m': 0.20,   # spread them over the path after this much of it (capped at 1/4 of it)
+                  'drop_backward_waypoints': False},   # True: drop waypoints facing away from the goal (fewer than N)
+        'direct': {'type': 'nav2_pose', 'behavior_tree': ''},   # NavigateToPose straight to the goal
+    },
+
+    'modes': {
+        'idle': {
+            'type': 'idle',
+            'auto_start': True,           # leave idle by itself once TF / Nav2 / AI are ready
+            'start_wait_s': 60.0,         # ... or after this long anyway
+        },
+        'scanning': {
+            'type': 'scanning',
+            'turn': True,                 # false = no turning, just refresh the tiles
+            'turn_deg': 360.0,
+            'opening_sweep_deg': 90.0,    # first scan: -this .. +this in the flat gait
+            'opening_retries': 2,
+            'time_allowance_s': 20.0,
+            'use_crawl': True,            # crawl gait while turning (gait_switcher /spin_crawl)
+            'settle_s': 1.0,
+            'check_room': True,           # skip the turn where the body would hit the local costmap
+            'map_wait_s': 30.0,           # max wait for the map around the start before placing the tile grid
+            'next_mode': 'exploring',
+        },
+        'exploring': {
+            'type': 'exploring',
+            'exploration': ['tiles'],     # exploration profiles tried in order (WHERE); e.g. ['tiles', 'frontier']
+            'traversal': 'route',         # traversal profile used to drive (HOW)
+            'kind_traversals': [''],      # per target kind "kind:profile", e.g. "frontier:direct"
+            'tile_traversals': [''],      # per-tile overrides "i,j:profile", e.g. "3,1:stairs"
+            'path_check_timeout_s': 10.0,
+            'goal_timeout_s': 120.0,
+            'scan_after_reach': True,
+            'scan_mode': 'scanning',
+            'face_away_from_walls': True,   # tile goals: final heading N/W/E/S facing away from the most walls
+            'on_goal_failed': 'decide',   # decide (choose another tile) | recovery
+            'on_no_reachable_tile': 'recovery',   # recovery | scanning | idle
+            'quickscan_on_edge': False,   # true: while driving, stop on a tile's edge and run the quickscan animation
+            'quickscan_edge_margin_m': 0.15,   # "on the edge" = within this distance of the tile boundary
+            'quickscan_mode': 'quickscan',
+        },
+        'quickscan': {
+            'type': 'quickscan',
+            'animation': 'quickscan',     # robot animation (animations.py) played by the animation_player node
+            'settle_s': 1.0,              # wait for the robot to stand still before the animation starts
+            'start_timeout_s': 3.0,       # animation_player did not start it: skip
+            'timeout_s': 30.0,            # give up on (and cancel) an animation that runs this long
+            'next_mode': 'exploring',     # a new decision is made afterwards (the cancelled goal is re-chosen)
+        },
+        'recovery': {
+            'type': 'recovery',
+            'traversal': 'direct',
+            'tile_statuses': ['visited', 'to_visit'],   # which tiles' centres are recovery targets
+            'candidates': 3,
+            'min_distance_m': 0.25,       # skip centres the robot is already on
+            'min_clearance_m': 0.25,
+            'attempt_timeout_s': 45.0,
+            'clear_costmaps': True,
+            'clear_settle_s': 1.0,
+            'give_up_after': 3,           # consecutive recoveries without reaching a new tile; 0 = never give up
+            'next_mode': 'scanning',
+            'fail_mode': 'scanning',
+        },
+        'complete': {'type': 'complete'},
+    },
+}
+
+
+def merge_flat(defaults: Dict[str, Any], flat: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep copy of defaults with dotted keys (a.b.c) set to the given values."""
+    cfg = copy.deepcopy(defaults)
+    for key, value in flat.items():
+        if key in ('use_sim_time',) or key.startswith('qos_overrides'):
+            continue
+        parts = key.split('.')
+        node = cfg
+        for part in parts[:-1]:
+            if not isinstance(node.get(part), dict):
+                node[part] = {}
+            node = node[part]
+        node[parts[-1]] = clean(value)
+    return cfg
+
+
+def clean(value):
+    """ROS string arrays use [''] for an empty list."""
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if v != '']
+    return value
+
+
+def mode_cfg(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """The configuration of mode `name`, with the defaults of its type underneath."""
+    own = dict(cfg.get('modes', {}).get(name, {}))
+    mtype = own.get('type', name)
+    base = dict(DEFAULTS['modes'].get(mtype, {}))
+    base.update(own)
+    base['type'] = mtype
+    return base

@@ -1,0 +1,162 @@
+# lite3_explorer mission manager. Every key here overrides mission/config.py DEFAULTS; unlisted keys keep
+# their defaults. Any key is accepted (the node auto-declares parameters), so new modes, traversal profiles and
+# end-condition settings can be added here without code changes.
+# ROS 2 can't type an empty list: write [''] for "none".
+mission_manager:
+  ros__parameters:
+    global_frame: map
+    robot_frame: base_link
+    map_topic: /map
+    global_costmap_topic: /global_costmap/costmap
+    local_costmap_topic: /local_costmap/costmap
+    output_dir: "~/lite3_survey_runs"        # run_<time>/events.jsonl, tiles.json, AI images
+    reports_dir: "~/2d-challenge/reports"    # tile_report_<run>.md
+    use_ai: true                             # AI tile descriptions (lite3_llm_tools llm_client)
+    llm_report_timeout_s: 180.0
+    llm_report_retries: 5
+    robot_length_m: 0.61                     # turn-room check; match the local costmap footprint
+    robot_width_m: 0.37
+
+    tiles:
+      size_m: 1.0
+      reach_radius_m: 0.30                   # a tile is explored once the robot is this close to its centre
+      max_failures: 2                        # failed attempts (Nav2 abort, stuck, timeout) before a tile is unreachable
+
+    # ---------------------------------------------------------------- mission manager
+    mission:
+      modes: [idle, scanning, exploring, quickscan, recovery, complete]   # instances to build (configured under modes.<name>)
+      initial_mode: idle
+      start_mode: scanning                   # set_active(true) / auto start goes here
+      recovery_mode: recovery                # the stuck supervisor sends the robot here
+      complete_mode: complete
+
+    # ---------------------------------------------------------------- stuck supervisor
+    # Stuck while unexplored tiles remain -> recovery_mode (drive to the nearest tile centre, then rescan).
+    stuck:
+      enabled: true
+      watch_modes: [exploring]
+      triggers: [no_motion, costmap]
+      window_s: 60.0                         # no_motion: driving this long (only a long unresponsive spell counts) ...
+      min_motion_m: 0.15                     # ... and moving less than this
+      costmap_cost: 99                       # costmap: robot centre on a global-costmap cell >= this (99 inscribed, 100 lethal)
+      costmap_hold_s: 20.0                   # ... for this long
+      cooldown_s: 5.0                        # grace period after entering a watched mode
+
+    # ---------------------------------------------------------------- end condition
+    # combine: any = finish when one condition is met; all = when every one is.
+    # Built in: all_tiles_explored, no_frontiers_left (checked at each exploring decision), time_limit,
+    # max_tiles_visited (checked continuously).
+    end_condition:
+      combine: any
+      conditions: [all_tiles_explored]       # e.g. [all_tiles_explored, time_limit]
+      all_tiles_explored:
+        min_visited: 1
+        ignore_unreachable: true             # tiles given up on count as done
+      time_limit:
+        seconds: 0.0                         # 0 = off
+      max_tiles_visited:
+        count: 0                             # 0 = off
+      no_frontiers_left:                     # use with frontier exploration: [all_tiles_explored, no_frontiers_left], combine: all
+        min_cluster_cells: 8
+        min_clearance_m: 0.30
+
+    # ---------------------------------------------------------------- exploration profiles
+    # WHERE to go next. type = a registered strategy (tiles, frontier; add your own in code).
+    # modes.exploring.exploration lists the profiles to try, in order: later ones are fallbacks.
+    explorations:
+      tiles:
+        type: tiles
+        max_adjacency: 2                     # the next tile must touch an explored tile:
+                                             #   0 open side with the current tile, 1 open side with any visited tile,
+                                             #   2 any side (also across a wall) with a visited tile, 3 no requirement
+        fallback_any: true                   # no tile within max_adjacency -> offer the others (else the mission stalls)
+        direct_path_only: true               # next tile = a neighbour of the current tile, reached by a path through their shared side
+        direct_fallback: true                # none qualifies (dead end, backtracking) -> any reachable tile (else none)
+        prefer_current: true                 # rank the current tile's neighbours before other visited tiles' neighbours
+        eliminate_after: 2                   # failed Nav2 path checks in a row before a tile is eliminated (0 = never)
+        candidate_limit: 12                  # tiles path-checked per decision
+        target_limit: 6
+        min_clearance_m: 0.30                # tiles with no point this far from walls are eliminated
+      frontier:                              # OPTIONAL: add it to modes.exploring.exploration to use it
+        type: frontier
+        min_cluster_cells: 8
+        goal_clearance_m: 0.35
+        min_clearance_m: 0.30
+        distance_weight: 1.0                 # cost = distance_weight * Nav2 path length - size_weight * frontier size
+        size_weight: 0.5
+        min_goal_distance_m: 0.6
+        blacklist_radius_m: 0.6              # failed frontier goals are blacklisted
+        candidate_limit: 8
+        target_limit: 6
+        replan_when_explored: true           # drop the goal once its frontier got mapped on the way
+        explored_radius_m: 0.5
+
+    # ---------------------------------------------------------------- traversal profiles
+    # HOW to drive. type = a registered traversal (nav2_route, nav2_pose; add your own in code).
+    traversals:
+      route:                                 # FollowWaypoints: waypoints along the Nav2 path, then the tile centre
+        type: nav2_route
+        waypoints: 3                         # intermediate waypoints, evenly spaced along the path (driven through)
+        skip_start_m: 0.20                   # spread over the path after this much of it (skips the start-up wiggle)
+        drop_backward_waypoints: false       # true: drop waypoints facing away from the goal (then fewer than 3)
+      direct:                                # straight NavigateToPose
+        type: nav2_pose
+        behavior_tree: ""                    # '' = Nav2's default tree
+      # stairs:                              # example slot for a future stair traversal
+      #   type: stairs
+
+    # ---------------------------------------------------------------- modes
+    modes:
+      idle:
+        type: idle
+        auto_start: true                     # start by itself once TF / Nav2 / AI are up ...
+        start_wait_s: 60.0                   # ... or after this long anyway
+      scanning:
+        type: scanning
+        turn: true
+        turn_deg: 360.0
+        opening_sweep_deg: 90.0              # the first scan sweeps -90..+90 deg in the flat gait
+        opening_retries: 2
+        time_allowance_s: 20.0
+        use_crawl: true                      # crawl gait while turning (gait_switcher)
+        settle_s: 1.0
+        check_room: true                     # skip the turn where the body would hit the local costmap
+        map_wait_s: 30.0
+        next_mode: exploring
+      exploring:
+        type: exploring
+        exploration: [tiles]                 # WHERE: profiles tried in order, e.g. [tiles, frontier]
+        traversal: route                     # HOW: default traversal profile
+        kind_traversals: ['']                # per target kind "kind:profile", e.g. ["frontier:direct"]
+        tile_traversals: ['']                # per-tile overrides "i,j:profile", e.g. ["3,1:stairs"]
+        path_check_timeout_s: 10.0
+        goal_timeout_s: 120.0
+        scan_after_reach: true
+        scan_mode: scanning
+        face_away_from_walls: true           # final heading on a tile: N/W/E/S, facing away from the most walls
+        on_goal_failed: decide               # decide (pick another tile) | recovery
+        on_no_reachable_tile: recovery       # no candidate of any profile has a Nav2 path: recovery | scanning | idle
+        quickscan_on_edge: false             # true (or launch arg quickscan_on_edge:=true): stop on a tile edge, run quickscan
+        quickscan_edge_margin_m: 0.15        # on the edge = within this distance of a tile boundary (once per tile)
+      quickscan:
+        type: quickscan
+        animation: quickscan                 # animations.py, played by the animation_player node (its quickscan.* parameters)
+        settle_s: 1.0                        # stand still this long before the animation starts
+        start_timeout_s: 3.0                 # animation_player did not start it: skip
+        timeout_s: 30.0                      # cancel an animation that runs longer
+        next_mode: exploring                 # a new decision follows (the cancelled goal is re-chosen)
+      recovery:
+        type: recovery
+        traversal: direct
+        tile_statuses: [visited, to_visit]   # whose centres count as recovery targets
+        candidates: 3                        # nearest centres tried in turn
+        min_distance_m: 0.25                 # skip the centre the robot is already on
+        min_clearance_m: 0.25
+        attempt_timeout_s: 45.0
+        clear_costmaps: true
+        clear_settle_s: 1.0
+        give_up_after: 3                     # recoveries in a row without a new tile -> give up on the failing tiles
+        next_mode: scanning
+        fail_mode: scanning
+      complete:
+        type: complete

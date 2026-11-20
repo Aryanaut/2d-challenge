@@ -13,6 +13,8 @@ terrain_classifier:
     use_depth: true
     publish_debug_clouds: true    # ~/lidar_points, ~/depth_points (intensity = height above ground plane)
     start_enabled: true
+    trigger_mode: false           # true: classify only on ~/classify (once at startup too), then hold the label
+    trigger_duration_s: 1.5       # trigger_mode: how long each triggered run lasts (>= confirm_frames / rate_hz)
 
     lidar:
       topic: /livox/points        # Livox MID-360 PointCloud2 (xfer_format 0)

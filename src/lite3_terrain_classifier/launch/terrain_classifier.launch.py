@@ -26,9 +26,11 @@ def _classifier(context):
     overrides = {'use_sim_time': lc('use_sim_time').lower() == 'true'}
     for arg, param in (('cloud_topic', 'lidar.topic'), ('depth_topic', 'depth.image_topic'),
                        ('depth_info_topic', 'depth.info_topic'), ('fusion_mode', 'fusion_mode'),
-                       ('base_frame', 'base_frame')):
+                       ('base_frame', 'base_frame'), ('trigger_mode', 'trigger_mode')):
         if lc(arg):
             overrides[param] = lc(arg)
+    if lc('trigger_mode'):
+        overrides['trigger_mode'] = lc('trigger_mode').lower() == 'true'
     if lc('use_depth'):
         overrides['use_depth'] = lc('use_depth').lower() == 'true'
     return [Node(package=PKG, executable='terrain_classifier', name='terrain_classifier',
@@ -48,6 +50,8 @@ def generate_launch_description():
         DeclareLaunchArgument('fusion_mode', default_value='',
                               description='lidar_primary | require_agreement | any_rugged'),
         DeclareLaunchArgument('base_frame', default_value=''),
+        DeclareLaunchArgument('trigger_mode', default_value='',
+                              description='true: classify only on service ~/classify; false: continuous'),
         # base_link -> lidar (only if nothing else publishes it)
         DeclareLaunchArgument('publish_lidar_tf', default_value='false'),
         DeclareLaunchArgument('lidar_frame', default_value='livox_frame'),
