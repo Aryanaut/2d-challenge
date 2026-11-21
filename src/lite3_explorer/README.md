@@ -17,7 +17,7 @@ What changed from `lite3_kitchen_explorer`:
 | AI could place the first tile / pick targets (off by default) | not ported: tiles snap to the walls, target = the profile's top-ranked candidate (`choose_target()` hook left for an AI picker) |
 
 The AI tile report is unchanged: when a new tile is reached, `lite3_llm_tools`'s `llm_client` is asked in the
-background what it looks like, and the answers are compiled into `~/2d-challenge/reports/tile_report_<run>.md`.
+background what it looks like, and the answers are compiled into `~/2d/reports/tile_report_<run>.md`.
 
 ## Modes
 

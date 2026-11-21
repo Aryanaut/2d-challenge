@@ -10,7 +10,8 @@ mission_manager:
     global_costmap_topic: /global_costmap/costmap
     local_costmap_topic: /local_costmap/costmap
     output_dir: "~/lite3_survey_runs"        # run_<time>/events.jsonl, tiles.json, AI images
-    reports_dir: "~/2d-challenge/reports"    # tile_report_<run>.md
+    reports_dir: "~/2d/reports"    # tile_report_<run>.md
+    scene_images_dir: "~/2d/images/runs"     # scene tile images sent to the AI: <dir>/<run>/scene_<tile>_q<n>.jpg (+ .json answer)
     use_ai: true                             # AI tile descriptions (lite3_llm_tools llm_client)
     llm_report_timeout_s: 180.0
     llm_report_retries: 5
@@ -22,10 +23,12 @@ mission_manager:
       reach_radius_m: 0.30                   # a tile is explored once the robot is this close to its centre
       max_failures: 2                        # failed attempts (Nav2 abort, stuck, timeout) before a tile is unreachable
       min_known: 0.5                         # a tile exists once this share of it is scanned (was 0.7: the 1.7 m lidar range left edge tiles unknown)
+      scene_min_known: 0.95                  # scene tile (drawn blue hatched in RViz): scanned at least this much ...
+      scene_max_free: 0.85                   # ... but less than this share of it traversable
 
     # ---------------------------------------------------------------- mission manager
     mission:
-      modes: [idle, scanning, exploring, quickscan, curtain, mppi, recovery, complete]   # instances to build (configured under modes.<name>)
+      modes: [idle, scanning, exploring, quickscan, curtain, scene, mppi, recovery, complete]   # instances to build (configured under modes.<name>)
       initial_mode: idle
       start_mode: scanning                   # set_active(true) / auto start goes here
       recovery_mode: recovery                # the stuck supervisor sends the robot here
@@ -72,6 +75,8 @@ mission_manager:
         max_adjacency: 2                     # the next tile must touch an explored tile:
                                              #   0 open side with the current tile, 1 open side with any visited tile,
                                              #   2 any side (also across a wall) with a visited tile, 3 no requirement
+        neighbours_only: true                # choose only among tiles sharing a side with the current tile; the others are marked irrelevant (tile 'relevant': false)
+        neighbours_fallback: true            # ... but with no such tile left (dead end) offer the others, so the mission cannot stall (false: wait / recover)
         fallback_any: false                  # true: no tile within max_adjacency -> offer non-adjacent tiles too (they were picked while the neighbours were only transiently 'no path'); false: retry/recover instead
         reject_via_other_tiles: true         # drop a tile whose Nav2 path runs through any tile other than the current one and itself
         via_tile_tolerance_m: 0.15           # a path point counts as inside another tile only when this far past its border
@@ -141,6 +146,8 @@ mission_manager:
         path_check_timeout_s: 10.0
         goal_timeout_s: 120.0
         scan_after_reach: true
+        scenes: true                         # a scene tile shares a side with the current tile -> scene mode (face it, AI describes it, mark explored; never entered)
+        scene_mode: scene
         curtains: false                      # use_curtains:=true (launch / explorer.sh --curtains): a curtain on the current tile's edge -> curtain mode
         curtain_edge_tol_m: 0.30             # curtain spots within this of the tile edge line count as on the edge
         curtain_min_span_m: 0.40             # ... spread over at least this much of it
@@ -163,6 +170,18 @@ mission_manager:
         start_timeout_s: 3.0                 # animation_player did not start it: skip
         timeout_s: 30.0                      # cancel an animation that runs longer
         next_mode: exploring                 # a new decision follows (the cancelled goal is re-chosen)
+      scene:                                 # scene tile next to the current tile: face it, ask the AI to describe it, mark it explored (never entered)
+        type: scene
+        next_mode: exploring
+        rest_s: 1.5                          # stand still first (a scan spin just before is still coasting)
+        commit_deg: 150.0                    # target further round than this: keep the turn's direction (no flip at 180 deg)
+        align_tol_deg: 6.0
+        align_timeout_s: 15.0
+        min_turn_rad_s: 0.2
+        max_turn_rad_s: 0.6
+        turn_gain: 1.0
+        settle_s: 1.0                        # stand still facing it before the AI looks
+        llm_attempts: 2                      # AI tries; after the last the tile is marked explored anyway
       mppi:
         type: mppi                           # stuck in the costmap obstacle zone: nudge the robot out with linear x / y velocity
         next_mode: exploring                 # clear -> decide again

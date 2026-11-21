@@ -86,6 +86,11 @@ class TileExploration(Exploration):
     tile across a wall, 3 = anywhere. Default 2: the next tile must share a side with an explored tile. Only if NO
     tile qualifies are the others offered (fallback_any: true), so the mission can't stall behind an eliminated tile.
 
+    Neighbours only (neighbours_only): the next tile is chosen ONLY among the tiles that share a side with the current
+    tile; every other unexplored tile is marked irrelevant (tile dict 'relevant': False) for this decision and is
+    not offered. With none left (a dead end) the other tiles are offered after all (neighbours_fallback: true), so
+    the mission can't stall; with it false the mission waits / recovers instead.
+
     Reachability: every candidate gets a Nav2 path check. A tile with no path is dropped for this decision and
     gets a strike; after eliminate_after strikes in a row it is ELIMINATED (marked unreachable, so the end condition
     no longer waits for it). Strikes are only given when some other candidate did get a path, so a planner that
@@ -126,6 +131,7 @@ class TileExploration(Exploration):
             others = [t for t in raw if t['tile'] not in self.avoid]
             if others:
                 raw = others
+        raw = self._neighbours_only(raw)
         visited, current = set(tiles.trail), tiles.current
         max_level = int(self.cfg.get('max_adjacency', T.ADJ_WALL))
         within, beyond = [], []
@@ -145,6 +151,29 @@ class TileExploration(Exploration):
             self.ctx.log('info', f'{len(beyond)} unexplored tile(s), none within adjacency level {max_level}.')
         out.sort(key=lambda t: (self._level_key(t['adjacency']), t['distance_m']))
         return out[:int(self.cfg.get('candidate_limit', 12))]
+
+    def _neighbours_only(self, raw):
+        """Keep the tiles that share a side with the current tile; mark the unexplored rest irrelevant."""
+        tiles = self.ctx.tiles
+        if not self.cfg.get('neighbours_only', True) or tiles.current is None:
+            return raw
+        ci, cj = tiles.current
+        near = {(ci + 1, cj), (ci - 1, cj), (ci, cj + 1), (ci, cj - 1)}
+        for tile, d in tiles.tiles.items():
+            d['relevant'] = tile in near
+        keep = [t for t in raw if tuple(int(v) for v in t['tile'].split(',')) in near]
+        skipped = [t['tile'] for t in raw if t not in keep]
+        if skipped:
+            self.ctx.log('info', f'Tiles not sharing a side with {T.tile_label(tiles.current)} are irrelevant now: '
+                                 f'{", ".join(skipped)}.')
+        if keep or not self.cfg.get('neighbours_fallback', True):
+            return keep
+        if raw:
+            self.ctx.log('info', f'No unexplored neighbour of tile {T.tile_label(tiles.current)}: '
+                                 f'offering the other tiles.')
+            for d in tiles.tiles.values():
+                d['relevant'] = True
+        return raw
 
     def select(self, checked, pose):
         tiles = self.ctx.tiles

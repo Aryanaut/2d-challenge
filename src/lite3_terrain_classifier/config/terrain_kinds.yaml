@@ -33,10 +33,13 @@ terrains:
     type: hough_slats
     sources: [depth, color]  # which cameras may vote
     mode: any                # any: one camera is enough | all: every camera that has frames must agree
-    require: [depth]         # cameras that MUST confirm whatever the mode: colour alone is fooled by block edges / grain
+    require: []              # cameras that MUST confirm whatever the mode (was [depth]: the depth camera saw 0 rungs on the real
+                             # slats of tile 1,1 in testrun_21_11_075956, so they were never named). Colour alone can be fooled by
+                             # block edges / grain: its line counts below are what keeps it honest.
     min_lines:                # distinct slat-like lines for a frame to vote "slats", per camera and family
       depth: {rungs: 4, converging: 3}
-      color: {rungs: 15, converging: 6}   # colour: only many lines count (cubes and stairs give up to 12 rungs)
+      color: {rungs: 7, converging: 5}    # colour: labelled slats photos give 8 / 16 rungs (or 4 rungs + 7 converging), the
+                                          # curtain / uneven photos at most 3 rungs / 3 converging. Was 15 / 6: only 1 of 3 slats photos
     min_vote_fraction: 0.6   # share of a camera's latest frames that must vote
     min_frames: 5
     marker: {style: solid, color: [1.0, 0.0, 0.0, 0.55], label: SLATS}

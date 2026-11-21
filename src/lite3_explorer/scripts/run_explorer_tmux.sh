@@ -4,7 +4,7 @@
 #   window 1 "explorer": the full launch (SLAM, Nav2, mission manager, AI client)
 #   window 2 "status"  : mission mode | mission events (decisions, stuck, recovery)
 #                        tile report for every tile reached (full width)
-#                        last AI answer | velocity sent to the dog
+#                        last AI answer | velocity sent to the dog / current gait
 #   window 3 "health"  : /scan rate | /map rate | odom->base_link TF | free shell
 #
 # Usage:
@@ -103,6 +103,11 @@ run "$SESSION:status.3" "LAST AI ANSWER" \
     "ros2 topic echo /llm/last_result std_msgs/msg/String --field data"
 run "$SESSION:status.4" "VELOCITY TO DOG (/cmd_vel)" \
     "ros2 topic echo /cmd_vel geometry_msgs/msg/Twist"
+
+# current gait (latched /gait_switcher/gait): a small pane under the velocity pane
+GAIT_PANE=$(tmux split-window -t "$SESSION:status.4" -v -l 30% -P -F '#{pane_id}')
+run "$GAIT_PANE" "CURRENT GAIT (gait_switcher)" \
+    "ros2 topic echo /gait_switcher/gait std_msgs/msg/String --field data $LATCHED"
 
 # ---- window 3: health ------------------------------------------------------
 tmux new-window -t "$SESSION" -n health

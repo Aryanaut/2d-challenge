@@ -198,8 +198,33 @@ class FakeCtx:
     def on_mode_change(self, mode, phase):
         pass
 
+    # scene mode: the robot turns in place (drive) and a fake AI answers describe_scene
+    def drive(self, vx, wz, vy=0.0):
+        self.pose_[2] += wz * 0.2                # one tick = 0.2 s of turning in the fake
+        self.drives.append(('cmd', wz))
+
+    def stop(self):
+        pass
+
     def on_complete(self, reason):
         self.complete = reason
+
+    def describe_scene(self, label, pose):
+        self.asked = getattr(self, 'asked', []) + [(label, list(pose))]
+        return FakeCall(ok=label not in getattr(self, 'ai_fails', set()))
+
+    def record_scene(self, label, pose, call):
+        self.recorded = getattr(self, 'recorded', []) + [(label, call.ok)]
+
+
+class FakeCall:
+    done = True
+
+    def __init__(self, ok=True):
+        self.ok, self.result = ok, {'scene_description': 'a table with a vase'}
+
+    def failure(self):
+        return 'no reply'
 
 
 def run(ctx, machine, steps=400, until_complete=True):
@@ -582,3 +607,94 @@ def test_unseen_target_tile_is_dropped_for_another():
     asked = [lab for lab, _ in ctx.classified]
     assert asked.count('1,0') == 1                               # asked once, never in a loop
     assert len(ctx.drives) > 1                                   # and the mission went on to other tiles
+
+
+def test_only_tiles_sharing_a_side_with_the_current_tile_are_candidates():
+    ctx, m = make(length_m=4.0)
+    ctx.nav_up = False                                       # scan and place the grid, but never drive
+    run(ctx, m, steps=30, until_complete=False)
+    assert ctx.tiles.current == (0, 0)
+    strat = m.exploration('tiles')
+    cands = strat.candidates(ctx.pose())
+    assert [c['tile'] for c in cands] == ['1,0']             # 2,0 and 3,0 are not neighbours of 0,0
+    assert ctx.tiles.tiles[(1, 0)]['relevant'] is True and ctx.tiles.tiles[(2, 0)]['relevant'] is False
+    strat.cfg.update(neighbours_only=False, max_adjacency=3)
+    assert len(strat.candidates(ctx.pose())) > 1
+
+
+def scene_world():
+    """A 3 m corridor whose last tile (2,0) is a scene tile: fully scanned, half of it occupied."""
+    grid, info = corridor(3.0)
+    r0, c0 = info.world_to_cell(2.0, 0.0)
+    r1, c1 = info.world_to_cell(3.0, 0.5)
+    grid[r0:r1, c0:c1] = 100
+    return grid, info
+
+
+def test_scene_tile_beside_the_current_tile_is_looked_at_never_entered():
+    ctx, m = make(world=scene_world())
+    run(ctx, m, 300)
+    assert ctx.tiles.tiles[(2, 0)]['scene'] is True
+    assert [a[0] for a in ctx.asked] == ['2,0']
+    assert ctx.recorded == [('2,0', True)]
+    assert (2, 0) not in ctx.tiles.trail and (2, 0) in ctx.tiles.described      # explored, not entered
+    assert ctx.tiles.tiles[(2, 0)]['status'] == 'visited'
+    assert all(lab != '2,0' for name, lab in ctx.drives if name != 'cmd')       # never driven to
+    assert 'scene' in modes_seen(m) and ctx.complete
+
+
+def test_scene_tile_is_marked_explored_even_when_the_ai_fails():
+    ctx, m = make(world=scene_world())
+    ctx.ai_fails = {'2,0'}
+    run(ctx, m, 300)
+    assert len(ctx.asked) == 2 and (2, 0) in ctx.tiles.described and ctx.complete
+
+
+def test_no_scene_mode_when_scenes_are_off():
+    ctx, m = make(flat={'modes.exploring.scenes': False}, world=scene_world())
+    run(ctx, m, 300)
+    assert not getattr(ctx, 'asked', [])
+
+
+def test_a_flat_answer_never_replaces_an_uneven_one_within_one_look():
+    t = TileTracker()
+    t.begin_terrain_look('-1,1')
+    assert t.set_terrain('-1,1', {'kind': 'uneven', 'source': 'terrain_type'}) is True
+    assert t.set_terrain('-1,1', {'kind': 'flat', 'n_cells': 9}) is False       # 0.4 s later, from 9 cells: ignored
+    assert t.terrain['-1,1']['kind'] == 'uneven'
+    assert t.set_terrain('-1,1', {'kind': 'slats'}) is True                     # a more specific non-flat answer is taken
+    t.begin_terrain_look('-1,1')                                                # asked again: a fresh look
+    assert t.set_terrain('-1,1', {'kind': 'flat'}) is True and t.terrain['-1,1']['kind'] == 'flat'
+
+
+def test_scene_turn_does_not_flip_direction_when_the_scene_tile_is_behind():
+    ctx, m = make(world=scene_world(), pose=(1.5, 0.5, math.pi - 0.05))      # tile 2,0 (east) is straight behind
+    ctx.nav_up = False
+    run(ctx, m, steps=20, until_complete=False)                              # the opening scan places the tile grid
+    ctx.pose_[:] = [1.5, 0.5, math.pi - 0.05]
+    orig = ctx.drive
+    state = {'n': 0}
+
+    def kicked(vx, wz, vy=0.0):                                              # the robot coasts the wrong way once
+        orig(vx, wz, vy)
+        state['n'] += 1
+        if state['n'] == 2:
+            ctx.pose_[2] += 0.4
+    ctx.drive = kicked
+    m.request('scene', tile='2,0')
+    run(ctx, m, steps=80, until_complete=False)
+    turns = [w for name, w in ctx.drives if name == 'cmd' and abs(w) > 1e-6]
+    assert turns and len({w > 0 for w in turns}) == 1                         # one direction all the way round
+
+
+def test_scene_tiles_only_count_beside_the_current_tile_and_are_checked_once_per_arrival():
+    ctx, m = make(world=scene_world())
+    ctx.nav_up = False
+    run(ctx, m, steps=30, until_complete=False)               # grid placed, robot on tile 0,0; the scene tile 2,0 is two tiles away
+    assert ctx.tiles.tiles[(2, 0)]['scene'] is True and ctx.tiles.current == (0, 0)
+    assert ctx.tiles.scene_tiles() == [] and not ctx.tiles.is_scene((2, 0))     # not beside the current tile: ordinary tile
+    assert ctx.tiles._drivable('2,0') or not ctx.tiles.skip_scene
+    ctx.tiles.trail.append((1, 0))                            # now it is next to 1,0
+    assert ctx.tiles.scene_tiles() == [(2, 0)] and ctx.tiles.is_scene((2, 0))
+    ctx.tiles.trail.append((0, 0))                            # and away again
+    assert ctx.tiles.scene_tiles() == []

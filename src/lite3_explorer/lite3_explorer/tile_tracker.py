@@ -18,16 +18,23 @@ from lite3_explorer.tile_reports import within_reach
 class TileTracker:
     def __init__(self, size_m: float = 1.0, reach_radius_m: float = 0.30, max_failures: int = 2,
                  on_reached: Optional[Callable[[tuple, list, str], None]] = None,
-                 on_enter: Optional[Callable[[tuple], None]] = None, min_known: float = 0.5):
+                 on_enter: Optional[Callable[[tuple], None]] = None, min_known: float = 0.5,
+                 scene_min_known: float = 0.95, scene_max_free: float = 0.80):
         self.size_m = size_m
         self.min_known = min_known           # share of a tile the lidar must have scanned before it becomes a tile
+        self.scene_min_known, self.scene_max_free = scene_min_known, scene_max_free   # scene tile: scanned >= this, traversable < this
         self.reach_radius_m = reach_radius_m
+        self.wall_release_fraction = 0.25               # a virtual wall stays until less than this share of its edge is mapped wall
+        self._wall_keys = set()                         # edges that are virtual walls now (hysteresis)
+        self.skip_scene = False                        # True: scene tiles are never driven to (the scene mode looks at them)
+        self.described: set = set()                    # scene tiles already looked at: explored without being entered
         self.max_failures = max_failures     # 0 = never give up on a tile
         self.on_reached = on_reached                   # called (tile, pose, source) for every NEW tile reached
         self.on_enter = on_enter                       # called (tile) whenever the robot enters another tile
         self.grid = None                               # T.TileGrid
         self.init_info: Optional[dict] = None
         self.terrain: Dict[str, dict] = {}              # tile label -> what the terrain classifier said about it
+        self._look_rugged = set()                      # tiles that were called non-flat during their current terrain look
         self.start_wall = None                         # ((x, y), (x, y)): virtual wall behind the robot at the start
         self.tiles: Dict[tuple, dict] = {}
         self.trail: List[tuple] = []
@@ -76,6 +83,8 @@ class TileTracker:
         self.start_wall = self.grid.edge(start, back)
         self.start_wall_side = back
         self.trail, self.trail_log = [], []
+        self._wall_keys = set()
+        self.described = set()
         self._visit(start, pose, 'start')
         self.update(force=True)
         return start
@@ -90,7 +99,8 @@ class TileTracker:
         self._classified_version = self._map_version
         self.version += 1
         grid, info = self._map
-        self.tiles = T.classify_tiles(grid, info, self.grid, self.trail, min_known=self.min_known)
+        self.tiles = T.classify_tiles(grid, info, self.grid, list(self.trail) + sorted(self.described), min_known=self.min_known,
+                                      scene_min_known=self.scene_min_known, scene_max_free=self.scene_max_free)
         for tile, t in self.tiles.items():
             if t['status'] != 'unknown':
                 t['sides'] = T.tile_sides(grid, info, self.grid, tile)
@@ -105,12 +115,33 @@ class TileTracker:
         if start_wall and getattr(self, 'start_wall', None):
             segs.append(self.start_wall)
         if self.grid is not None and self._map is not None:
-            segs += T.wall_edges(self._map[0], self._map[1], self.grid, self.tiles, min_fraction=min_fraction)
+            # Hysteresis: an edge becomes a wall above min_fraction but is only released below wall_release_fraction. Next
+            # to a wall the SLAM map thins it (the robot is close, grazing rays), so the share hovers around min_fraction
+            # and the wall would flicker or vanish while it is still there.
+            keys = set()
+            for key, seg, share in T.edge_coverage(self._map[0], self._map[1], self.grid, self.tiles):
+                if share > min_fraction or (key in self._wall_keys and share >= self.wall_release_fraction):
+                    keys.add(key)
+                    segs.append(seg)
+            self._wall_keys = keys
         return segs
 
+    def begin_terrain_look(self, label: str):
+        """The classifier is asked about this tile again: answers of this look are compared with each other only."""
+        self._look_rugged.discard(label)
+
     def set_terrain(self, label: str, result: dict) -> bool:
-        """Store the terrain classifier's answer for a tile. True if the kind changed."""
-        changed = self.terrain.get(label, {}).get('kind') != result.get('kind')
+        """Store the terrain classifier's answer for a tile. True if the kind changed.
+
+        Within one look a "flat" never replaces an answer that said the floor is not flat (uneven / slats): the classifier's
+        answers flip around its thresholds (and the lidar sees little at first), and calling rough ground flat is the
+        costly mistake. A new look (begin_terrain_look) starts afresh."""
+        kind = result.get('kind')
+        if kind == 'flat' and label in self._look_rugged:
+            return False
+        if kind and kind != 'flat':
+            self._look_rugged.add(label)
+        changed = self.terrain.get(label, {}).get('kind') != kind
         self.terrain[label] = result
         self.version += 1                      # republish the tile map
         return changed
@@ -182,6 +213,35 @@ class TileTracker:
     def counts(self) -> Dict[str, int]:
         return T.tile_counts(self.tiles)
 
+    def _beside_current(self, tile) -> bool:
+        return self.current is not None and abs(tile[0] - self.current[0]) + abs(tile[1] - self.current[1]) == 1
+
+    def scene_tiles(self) -> List[tuple]:
+        """Scene tiles that count: completely scanned but less than scene_max_free traversable, AND sharing a side with the
+        current tile (the scene detection is not used anywhere else), plus the ones already looked at."""
+        return [t for t, d in sorted(self.tiles.items())
+                if t in self.described or (d.get('scene') and self._beside_current(t))]
+
+    def mark_described(self, tile):
+        """A scene tile was looked at from a neighbouring tile: it counts as explored (status visited) although the robot
+        never entered it. The trail (and so the current tile) is untouched."""
+        self.described.add(tuple(tile))
+        self.invalidate()
+        self.update()
+
+    def is_scene(self, tile) -> bool:
+        tile = tuple(tile)
+        return tile in self.described or (bool(self.tiles.get(tile, {}).get('scene')) and self._beside_current(tile))
+
+    def scene_neighbours(self, tile) -> List[tuple]:
+        """Scene tiles that share a side with `tile` and have not been described yet."""
+        i, j = tile
+        return [n for n in ((i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1))
+                if n not in self.described and self.tiles.get(n, {}).get('scene')]    # (call with the current tile)
+
+    def _drivable(self, label: str) -> bool:
+        return not (self.skip_scene and self.is_scene(tuple(int(v) for v in label.split(','))))
+
     def unexplored(self) -> List[str]:
         """Identified, walkable tiles not visited yet and not given up on."""
         return [T.tile_label(t) for t, d in sorted(self.tiles.items()) if d['status'] == 'to_visit']
@@ -196,7 +256,7 @@ class TileTracker:
                                           limit=limit, min_clearance_m=min_clearance_m, grid_connected=False)
         if skip_failed:
             raw = [t for t in raw if t['tile'] not in self.unreachable]
-        return raw
+        return [t for t in raw if self._drivable(t['tile'])]
 
     def recovery_targets(self, robot_xy, *, statuses=('visited', 'to_visit'), limit: int = 5,
                          min_distance_m: float = 0.25, min_clearance_m: float = 0.25,
@@ -205,10 +265,11 @@ class TileTracker:
             return []
         grid, info = self._map
         excl = [tuple(int(v) for v in lab.split(',')) for lab in exclude]
-        return T.nearest_tile_centres(grid, info, self.grid, self.tiles, robot_xy, statuses=statuses, limit=limit,
-                                      min_distance_m=min_distance_m, min_clearance_m=min_clearance_m,
-                                      exclude=excl,
-                                      adjacent_to=self.grid.tile_of(robot_xy[0], robot_xy[1]) if adjacent_only else None)
+        out = T.nearest_tile_centres(grid, info, self.grid, self.tiles, robot_xy, statuses=statuses, limit=limit,
+                                     min_distance_m=min_distance_m, min_clearance_m=min_clearance_m,
+                                     exclude=excl,
+                                     adjacent_to=self.grid.tile_of(robot_xy[0], robot_xy[1]) if adjacent_only else None)
+        return [t for t in out if self._drivable(t['tile'])]
 
     def tile_of(self, x, y):
         return self.grid.tile_of(x, y) if self.grid is not None else None

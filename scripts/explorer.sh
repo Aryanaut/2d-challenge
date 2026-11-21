@@ -4,7 +4,7 @@
 #   window 1 "explorer": the full launch (SLAM, Nav2, mission manager, AI client)
 #   window 2 "status"  : mission mode | mission events (decisions, stuck, recovery)
 #                        tile report for every tile reached | chosen tile (what it is driving to)
-#                        last AI answer | velocity sent to the dog
+#                        last AI answer | velocity sent to the dog / current gait
 #   window 3 "health"  : /scan rate | /map rate | odom->base_link TF | rviz2 (Ctrl-C it to get a shell)
 #   window 4 "bag"     : only with --bag: rosbag record (Ctrl-C there to stop it)
 #
@@ -51,7 +51,7 @@ LATCHED="--qos-durability transient_local --qos-reliability reliable"
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
 /exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /mission_manager/route /curtain/points /curtain/markers /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
 
 BAG=0
 BAG_NAME=""
@@ -207,6 +207,11 @@ run "$SESSION:status.3" "CHOSEN TILE (driving to)" \
     "ros2 topic echo /mission_manager/next_target std_msgs/msg/String --field data $LATCHED | sed -u 's/^/DRIVING TO: /'"
 run "$SESSION:status.4" "VELOCITY TO DOG (/cmd_vel)" \
     "ros2 topic echo /cmd_vel geometry_msgs/msg/Twist"
+
+# current gait (latched /gait_switcher/gait): a small pane under the velocity pane
+GAIT_PANE=$(tmux split-window -t "$SESSION:status.4" -v -l 30% -P -F '#{pane_id}')
+run "$GAIT_PANE" "CURRENT GAIT (gait_switcher)" \
+    "ros2 topic echo /gait_switcher/gait std_msgs/msg/String --field data $LATCHED"
 
 # ---- window 3: health + rviz ----------------------------------------------
 tmux new-window -t "$SESSION:" -n health

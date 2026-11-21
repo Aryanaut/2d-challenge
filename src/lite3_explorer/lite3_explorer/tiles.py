@@ -174,9 +174,9 @@ def tile_sides(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, *, fr
     return result
 
 
-def wall_edges(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, min_fraction: float = 0.5,
-               occupied_threshold: int = 65, samples: int = 20) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
-    """Tile edges (world segments, each shared edge once) where MORE than min_fraction of the edge lies on mapped wall."""
+def edge_coverage(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, occupied_threshold: int = 65,
+                  samples: int = 20) -> List[Tuple[tuple, Tuple[Tuple[float, float], Tuple[float, float]], float]]:
+    """Every tile edge (each shared edge once) as (key, world segment, share of it that lies on mapped wall)."""
     out, seen = [], set()
     for tile, t in tiles.items():
         if t.get('status') == 'unknown':
@@ -193,18 +193,28 @@ def wall_edges(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, min_fra
                 win = grid[max(0, r - 1):r + 2, max(0, c - 1):c + 2]
                 if win.size and (win >= occupied_threshold).any():
                     occ += 1
-            if occ > min_fraction * samples:
-                out.append(((x0, y0), (x1, y1)))
+            out.append((key, ((x0, y0), (x1, y1)), occ / samples))
     return out
 
 
+def wall_edges(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, min_fraction: float = 0.5,
+               occupied_threshold: int = 65, samples: int = 20) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Tile edges (world segments, each shared edge once) where MORE than min_fraction of the edge lies on mapped wall."""
+    return [seg for _, seg, share in edge_coverage(grid, info, tg, tiles, occupied_threshold=occupied_threshold,
+                                                   samples=samples) if share > min_fraction]
+
+
 def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, free_threshold: int = 25,
-                   occupied_threshold: int = 65, min_free: float = 0.15, min_known: float = 0.70) -> Dict[Tile, dict]:
+                   occupied_threshold: int = 65, min_free: float = 0.15, min_known: float = 0.70,
+                   scene_min_known: float = 0.95, scene_max_free: float = 0.80) -> Dict[Tile, dict]:
     """Status and coverage for every tile that has any mapped cell (plus every visited tile).
 
     A tile is defined (to_visit / blocked) only once at least min_known of its area has been
     scanned by the lidar; before that it is 'unknown' and is not offered as a target. Visited
-    tiles (including the initial tile the robot stands in) are always defined."""
+    tiles (including the initial tile the robot stands in) are always defined.
+
+    'scene' marks a SCENE tile: completely scanned (known >= scene_min_known) but with less than scene_max_free of its
+    area traversable (free map cells). It is a flag only: the status (and so the tile selection) is unchanged."""
     h, w = grid.shape
     cols, rows = np.meshgrid(np.arange(w), np.arange(h))
     xs = info.origin_x + (cols + 0.5) * info.resolution
@@ -237,7 +247,8 @@ def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, f
         tile = (int(k // nj + i0), int(k % nj + j0))
         tot = max(1, int(total[k]))
         info_t = {'free': round(free_c[k] / tot, 2), 'occupied': round(occ_c[k] / tot, 2),
-                  'known': round(known_c[k] / tot, 2), 'unmapped_edge': bool(edge_c[k] > 0)}
+                  'known': round(known_c[k] / tot, 2), 'unmapped_edge': bool(edge_c[k] > 0),
+                  'scene': bool(known_c[k] / tot >= scene_min_known and free_c[k] / tot < scene_max_free)}
         if tile in visited:
             status = 'visited'
         elif info_t['known'] < min_known:
@@ -249,7 +260,7 @@ def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, f
         info_t['status'] = status
         tiles[tile] = info_t
     for tile in visited:
-        tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False})
+        tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False, 'scene': False})
         tiles[tile]['status'] = 'visited'
     return tiles
 

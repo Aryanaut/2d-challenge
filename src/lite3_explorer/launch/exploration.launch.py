@@ -66,6 +66,10 @@ def _mission_manager(context):
         params.append({'modes.exploring.quickscan_on_edge': edge.lower() == 'true'})
     if LaunchConfiguration('use_curtains').perform(context).lower() == 'true':
         params.append({'modes.exploring.curtains': True})
+    for arg in ('scene_max_free', 'scene_min_known'):
+        value = LaunchConfiguration(arg).perform(context)
+        if value:
+            params.append({f'tiles.{arg}': float(value)})
     auto = LaunchConfiguration('auto_start').perform(context)
     if auto:
         params.append({'modes.idle.auto_start': auto.lower() == 'true'})
@@ -108,6 +112,11 @@ def generate_launch_description():
                               description='true/false: leave idle by itself (empty = mission.yaml)'),
         DeclareLaunchArgument('quickscan_on_edge', default_value='',
                               description='true: stop on each tile edge and run the quickscan animation (empty = mission.yaml)'),
+        DeclareLaunchArgument('scene_max_free', default_value='',
+                              description='Scene tile: scanned, but less than this share of it traversable, e.g. 0.6 '
+                                          '(empty = mission.yaml tiles.scene_max_free, 0.80)'),
+        DeclareLaunchArgument('scene_min_known', default_value='',
+                              description='Scene tile: scanned at least this much (empty = mission.yaml, 0.95)'),
         DeclareLaunchArgument('use_curtains', default_value='false',
                               description='Optional: detect hanging curtains in the depth image (low rate); one along the '
                                           "current tile's edge is squared up to and walked through with vx commands"),

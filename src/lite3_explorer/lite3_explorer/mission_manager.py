@@ -67,7 +67,7 @@ from lite3_explorer import tiles as T
 from lite3_explorer import turn_check as TC
 from lite3_explorer import nav2_traversal  # noqa: F401  (registers nav2_pose / nav2_route)
 from lite3_explorer.llm_link import LlmLink
-from lite3_explorer.mission.config import DEFAULTS, merge_flat
+from lite3_explorer.mission.config import DEFAULTS, merge_flat, mode_cfg
 from lite3_explorer.mission.core import ModeMachine
 from lite3_explorer.mission.traversal import FAILED, SUCCEEDED, build_traversal
 from lite3_explorer.tile_reports import TileReportBook
@@ -236,15 +236,18 @@ class MissionManager(Node):
         self.llm = LlmLink(self, enabled=self.use_ai, default_timeout_s=float(cfg['llm_report_timeout_s']))
         stamp = os.path.basename(self.run_dir)[len('run_'):]
         tcfg = cfg['tiles']
+        self.scene_images_dir = os.path.join(os.path.expanduser(cfg['scene_images_dir']), os.path.basename(self.run_dir)[len('run_'):])
         self.book = TileReportBook(os.path.join(os.path.expanduser(cfg['reports_dir']), f'tile_report_{stamp}.md'),
                                    self.run_dir, self.use_ai, float(tcfg['reach_radius_m']))
         self.report_args, self.report_tries, self.report_calls = {}, {}, {}
         self.query_count = 0
-        self.text_markers = []
 
         self.tiles = TileTracker(float(tcfg['size_m']), float(tcfg['reach_radius_m']), int(tcfg['max_failures']),
                                  on_reached=self._on_tile_reached,
-                                 min_known=float(tcfg.get('min_known', 0.5)))
+                                 min_known=float(tcfg.get('min_known', 0.5)),
+                                 scene_min_known=float(tcfg.get('scene_min_known', 0.95)),
+                                 scene_max_free=float(tcfg.get('scene_max_free', 0.80)))
+        self.tiles.skip_scene = bool(mode_cfg(cfg, 'exploring').get('scenes', False))   # scene tiles are looked at, never entered
         self.target = None                     # (label, goal_xy) for the RViz highlight
         self._published_tiles = -1
 
@@ -679,6 +682,7 @@ class MissionManager(Node):
         """Ask the terrain classifier what the floor is; the answer goes to tile `label` (the one the robot is pointing at)."""
         self._terrain_label, self._terrain_after = label, self.now()
         self._terrain_seen.discard(label)
+        self.tiles.begin_terrain_look(label)
         self._terrain_asked[label] = self.now()
         if self.terrain_client is not None and self.terrain_client.service_is_ready():
             self.terrain_client.call_async(Trigger.Request())
@@ -724,6 +728,12 @@ class MissionManager(Node):
         if label is None or result.get('kind') in (None, 'unknown') or self.now() < self._terrain_after:
             return
         self._terrain_seen.add(label)
+        if result['kind'] == 'flat' and self.tiles.terrain.get(label, {}).get('kind') not in (None, 'flat'):
+            kept = self.tiles.terrain[label]['kind']
+            self.get_logger().info(f'Tile {label}: the classifier now says flat (spread {result.get("spread_median_m")} m, '
+                                   f'rough {result.get("rough_fraction")}), but this look already found it {kept.upper()}: keeping that.')
+            self.event('terrain_kept', tile=label, kept=kept, ignored='flat')
+            return
         if self.tiles.set_terrain(label, result):
             self.get_logger().info(f'Tile {label}: terrain {result["kind"].upper()} '
                                    f'(spread {result.get("spread_median_m")} m, cells {result.get("n_cells")}).')
@@ -757,6 +767,36 @@ class MissionManager(Node):
         self.report_calls[label] = self.llm.request('describe_tile', **self.report_args[label])
         self._write_book()
 
+    def describe_scene(self, label, pose):
+        """Scene mode: ask the AI what the scene tile (the robot stands on a neighbour, facing it) looks like.
+        Returns an LlmCall (done / ok / result / failure()); an AI that is off gives a call that has already failed."""
+        self.query_count += 1
+        size = self.tiles.size_m
+        here = T.tile_label(self.tiles.grid.tile_of(pose[0], pose[1])) if self.tiles.ready else '?'
+        context = (f"SCENE TILE CONTEXT: tile {label} of the robot's {size:g} m x {size:g} m tile grid is a scene tile "
+                   f'(a scanned, mostly non-traversable tile the robot does not enter). The robot stands on the '
+                   f'neighbouring tile {here} at ({pose[0]:.2f}, {pose[1]:.2f}) in the map frame and is facing tile {label}. '
+                   f'Describe what is on tile {label}.')
+        return self.llm.request('describe_tile', timeout_s=float(self.cfg['llm_report_timeout_s']),
+                                name=f'scene_{label.replace(",", "_")}_q{self.query_count:04d}', tile=label, pose=pose,
+                                context=context, save_dir=self.scene_images_dir)
+
+    def record_scene(self, label, pose, call):
+        """Write the scene tile's description (or the failure) into the tile report."""
+        self.book.reached(label, pose, 'scene tile (looked at, not entered)', {})
+        if call.ok:
+            result = dict(call.result)
+            if result.get('image'):
+                result['image'] = os.path.join(self.scene_images_dir, result['image'])   # the report joins run_dir: absolute wins
+            self.book.set_result(label, result)
+            self.get_logger().info(f'Scene tile {label}: {call.result.get("scene_description")}')
+        elif not self.use_ai:
+            self.book.set_no_ai(label, 'AI disabled (use_ai:=false)')
+        else:
+            self.book.set_error(label, call.failure())
+        self._write_book()
+        self._publish_tile_report(label)
+
     def _poll_tile_reports(self):
         for label, call in list(self.report_calls.items()):
             if not call.done:
@@ -786,23 +826,7 @@ class MissionManager(Node):
 
     def _publish_tile_report(self, label):
         entry = self.book.entries[label]
-        self.tile_report_pub.publish(String(data=json.dumps(entry, ensure_ascii=False, default=str)))
-        if not self.tiles.ready:
-            return
-        cx, cy = self.tiles.grid.center(tuple(int(v) for v in label.split(',')))
-        m = Marker()
-        m.header.frame_id = self.global_frame
-        m.header.stamp = self.get_clock().now().to_msg()
-        m.ns, m.id, m.type, m.action = 'tile_report', entry['order'], Marker.TEXT_VIEW_FACING, Marker.ADD
-        m.pose.position.x, m.pose.position.y, m.pose.position.z = cx, cy, 0.35
-        m.pose.orientation.w = 1.0
-        m.scale.z = 0.16
-        m.color.r, m.color.g, m.color.b, m.color.a = (1.0, 0.8, 0.1, 1.0) if entry['status'] == 'done' else \
-            (0.8, 0.8, 0.8, 1.0)
-        text = entry.get('description') if entry['status'] == 'done' else f'({entry["status"]})'
-        m.text = f'{label}: {text[:60]}'
-        self.text_markers = [x for x in self.text_markers if x.id != m.id] + [m]
-        self.marker_pub.publish(MarkerArray(markers=self.text_markers))
+        self.tile_report_pub.publish(String(data=json.dumps(entry, ensure_ascii=False, default=str)))   # no RViz text: the descriptions are in the tile report
 
     # ===================================================== RViz
     def _publish_terrain_markers(self):
@@ -872,7 +896,7 @@ class MissionManager(Node):
     def _publish_tile_markers(self):
         tg = self.tiles.grid
         stamp = self.get_clock().now().to_msg()
-        markers = []
+        markers = [Marker(action=Marker.DELETEALL)]      # clears every namespace: scene tiles that stopped being scene disappear
         for n, (status, (r, g, b, a)) in enumerate(TILE_COLOURS.items()):
             m = Marker()
             m.header.frame_id = self.global_frame
@@ -893,7 +917,7 @@ class MissionManager(Node):
         trail.header.frame_id = self.global_frame
         trail.header.stamp = stamp
         trail.ns, trail.id, trail.type, trail.action = 'tiles', 10, Marker.LINE_STRIP, Marker.ADD
-        trail.pose = markers[0].pose
+        trail.pose = markers[1].pose
         trail.scale.x = 0.06
         trail.color.r, trail.color.g, trail.color.b, trail.color.a = 0.0, 0.15, 0.6, 1.0
         for i, j in self.tiles.trail:
@@ -903,8 +927,60 @@ class MissionManager(Node):
         if len(trail.points) < 2:
             trail.action = Marker.DELETE
         markers.append(trail)
+        markers.extend(self._scene_markers(stamp))
+        markers.extend(self._free_label_markers(stamp))
         markers.extend(self._target_markers(stamp))
         self.tile_marker_pub.publish(MarkerArray(markers=markers))
+
+    def _hatch_marker(self, tg, tile, mid, ns, stamp, z=0.04, rgba=(0.2, 0.5, 1.0, 1.0), hatch_m=0.12):
+        """A tile drawn as an outline with diagonal hatch lines."""
+        cx, cy = tg.center(tile)
+        c, sn = math.cos(tg.yaw), math.sin(tg.yaw)
+        m = Marker()
+        m.header.frame_id, m.header.stamp, m.ns, m.id = self.global_frame, stamp, ns, mid
+        m.type, m.action = Marker.LINE_LIST, Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.012
+        m.color.r, m.color.g, m.color.b, m.color.a = rgba
+        half = 0.48 * tg.size
+
+        def pt(lu, lv):
+            q = type(m.pose.position)()
+            q.x, q.y, q.z = cx + c * lu - sn * lv, cy + sn * lu + c * lv, z
+            return q
+        corners = [(-half, -half), (half, -half), (half, half), (-half, half)]
+        for q in range(4):
+            m.points += [pt(*corners[q]), pt(*corners[(q + 1) % 4])]
+        d = -2 * half + hatch_m
+        while d < 2 * half - 1e-6:
+            u0, u1 = max(-half, -half - d), min(half, half - d)
+            if u1 > u0:
+                m.points += [pt(u0, u0 + d), pt(u1, u1 + d)]
+            d += hatch_m
+        return m
+
+    def _scene_markers(self, stamp):
+        """Scene tiles (completely scanned, less than scene_max_free traversable) as blue hatched tiles."""
+        tg = self.tiles.grid
+        return [self._hatch_marker(tg, tile, 100 + n, 'scene_tiles', stamp, z=0.05)
+                for n, tile in enumerate(self.tiles.scene_tiles())]
+
+    def _free_label_markers(self, stamp):
+        """Per-tile text: traversable share (compare with scene_max_free) and scanned share (compare with scene_min_known)."""
+        tg = self.tiles.grid
+        out = []
+        for n, (tile, d) in enumerate(sorted(self.tiles.tiles.items())):
+            cx, cy = tg.center(tile)
+            m = Marker()
+            m.header.frame_id, m.header.stamp = self.global_frame, stamp
+            m.ns, m.id, m.type, m.action = 'tile_free', n, Marker.TEXT_VIEW_FACING, Marker.ADD
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = cx, cy, 0.15
+            m.pose.orientation.w = 1.0
+            m.scale.z = 0.14
+            m.color.r = m.color.g = m.color.b = m.color.a = 1.0
+            m.text = f"free {d['free']:.2f}\nknown {d['known']:.2f}"
+            out.append(m)
+        return out
 
     def _target_markers(self, stamp):
         """Orange highlight on the tile being driven to (DELETE when there is none, so RViz clears it)."""

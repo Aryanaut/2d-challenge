@@ -21,7 +21,8 @@ DEFAULTS: Dict[str, Any] = {
     'local_costmap_topic': '/local_costmap/costmap',
     'tick_period_s': 0.2,
     'output_dir': '~/lite3_survey_runs',
-    'reports_dir': '~/2d-challenge/reports',
+    'reports_dir': '~/2d/reports',
+    'scene_images_dir': '~/2d/images/runs',   # the images sent to the AI for scene tiles: <dir>/<run>/scene_<tile>_q<n>.jpg (+ .json answer)
     'use_ai': True,                       # AI tile descriptions via lite3_llm_tools/llm_client
     'terrain_classify_service': '/terrain_classifier/classify',   # asked for the tile being driven to ('' = never)
     'terrain_wait_s': 3.0,            # no terrain answer this long after asking = the floor of that tile cannot be seen
@@ -36,12 +37,14 @@ DEFAULTS: Dict[str, Any] = {
         'reach_radius_m': 0.30,           # a tile is reached (explored) this close to its centre
         'max_failures': 2,                # failed attempts before a tile is given up on (unreachable); 0 = never
         'min_known': 0.5,                 # share of a tile that must be scanned before it becomes a tile
+        'scene_min_known': 0.95,          # scene tile: scanned at least this much ...
+        'scene_max_free': 0.80,           # ... but less than this share of it traversable (drawn blue hatched in RViz)
     },
 
     'mission': {
         # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
         # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
-        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'mppi', 'recovery', 'complete'],
+        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'scene', 'mppi', 'recovery', 'complete'],
         'initial_mode': 'idle',
         'start_mode': 'scanning',         # where set_active(true) / auto start goes
         'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
@@ -78,6 +81,8 @@ DEFAULTS: Dict[str, Any] = {
             'type': 'tiles',
             'max_adjacency': 2,           # 0 open side w/ current tile, 1 open side w/ a visited tile,
                                           # 2 any side (also across a wall) w/ a visited tile, 3 anywhere
+            'neighbours_only': True,      # choose only among the tiles sharing a side with the current tile (the rest: irrelevant)
+            'neighbours_fallback': True,  # ... unless none of them is left (dead end): then offer the others (False: wait / recover)
             'fallback_any': False,         # no tile within max_adjacency -> offer the rest (else: none)
             'reject_via_other_tiles': True,   # drop a tile whose path runs through other tiles (not the current one / itself)
             'via_tile_tolerance_m': 0.15,
@@ -146,6 +151,8 @@ DEFAULTS: Dict[str, Any] = {
             'path_check_timeout_s': 10.0,
             'goal_timeout_s': 120.0,
             'scan_after_reach': True,
+            'scenes': True,               # a scene tile (scanned, mostly not traversable) shares a side with the current tile -> scene mode
+            'scene_mode': 'scene',        # (scene tiles are never driven to; the scene mode looks at them from the neighbouring tile)
             'curtains': False,            # use_curtains:=true: a curtain on the current tile's edge -> curtain mode (walk through it)
             'curtain_mode': 'curtain',
             'curtain_edge_tol_m': 0.30,   # curtain spots within this of the tile edge line count as on the edge
@@ -172,6 +179,19 @@ DEFAULTS: Dict[str, Any] = {
             'start_timeout_s': 3.0,       # animation_player did not start it: skip
             'timeout_s': 30.0,            # give up on (and cancel) an animation that runs this long
             'next_mode': 'exploring',     # a new decision is made afterwards (the cancelled goal is re-chosen)
+        },
+        'scene': {
+            'type': 'scene',
+            'next_mode': 'exploring',     # the scene tile is marked explored (looked at, not entered), then exploration goes on
+            'rest_s': 1.5,                # stand still first (a scan spin just before is still coasting)
+            'align_tol_deg': 6.0,         # turn in place until facing the scene tile's centre within this
+            'commit_deg': 150.0,          # target further round than this: keep the direction the turn started in (no flip at 180 deg)
+            'align_timeout_s': 15.0,
+            'min_turn_rad_s': 0.2,
+            'max_turn_rad_s': 0.6,
+            'turn_gain': 1.0,
+            'settle_s': 1.0,              # stand still facing it before the AI looks (sharp image)
+            'llm_attempts': 2,            # AI description tries; after the last the tile is marked explored anyway
         },
         'mppi': {
             'type': 'mppi',

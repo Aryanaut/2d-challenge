@@ -107,9 +107,45 @@ def test_adjacency_levels():
         [T.ADJ_CURRENT, T.ADJ_VISITED, T.ADJ_WALL, T.ADJ_NONE]
 
 
+def test_scene_tiles_are_scanned_but_less_than_80_percent_traversable():
+    info = fc.GridInfo(40, 20, 0.05, 0.0, 0.0)                 # two 1 m tiles side by side
+    grid = np.zeros((20, 40), dtype=np.int16)
+    grid[0:8, 20:40] = 100                                     # tile 1,0: 40% occupied (an object / scene)
+    tg = T.TileGrid(0.0, 0.0, 0.0)
+    tiles = T.classify_tiles(grid, info, tg, [(0, 0)])
+    assert tiles[(0, 0)]['scene'] is False and tiles[(1, 0)]['scene'] is True
+    assert tiles[(1, 0)]['status'] == 'to_visit'               # a flag only: tile selection is unchanged
+    part = grid.copy()
+    part[:, 30:] = -1                                          # half of tile 1,0 never scanned: not completely scanned
+    assert T.classify_tiles(part, info, tg, [(0, 0)], min_known=0.4)[(1, 0)]['scene'] is False
+
+
 def test_edge_distance():
     from lite3_explorer.tiles import TileGrid
     g = TileGrid(0.0, 0.0, 0.0, 1.0)
     assert abs(g.edge_distance(0.5, 0.5) - 0.5) < 1e-9
     assert abs(g.edge_distance(0.1, 0.5) - 0.1) < 1e-9
     assert abs(g.edge_distance(1.95, 0.5) - 0.05) < 1e-9
+
+
+def test_virtual_wall_survives_a_thinned_map_but_not_a_cleared_one():
+    from lite3_explorer.tile_tracker import TileTracker
+    info = fc.GridInfo(40, 20, 0.05, 0.0, 0.0)                 # two 1 m tiles side by side, wall on their shared edge x=1
+    grid = np.zeros((20, 40), dtype=np.int16)
+    grid[:, 19:21] = 100
+    t = TileTracker()
+    t.grid = T.TileGrid(0.0, 0.0, 0.0)
+    t.start_wall = None
+
+    def walls(g):
+        t.set_map(g, info)
+        t.update(force=True)
+        return [s for s in t.virtual_walls(start_wall=False) if abs(s[0][0] - 1.0) < 1e-6 and abs(s[1][0] - 1.0) < 1e-6]
+    assert walls(grid)                                         # fully mapped wall: virtual wall
+    thin = grid.copy()
+    thin[:11, 19:21] = 0                                       # the map thins it to 45% of the edge (robot close by)
+    assert walls(thin)                                         # kept (was: dropped below 50%)
+    gone = grid.copy()
+    gone[:, 19:21] = 0                                         # really gone
+    assert not walls(gone)
+    assert not walls(thin)                                     # and 45% alone does not bring it back

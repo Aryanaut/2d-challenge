@@ -35,6 +35,9 @@ class GaitSwitcher(Node):
         cmd_qos = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE)
         self.cmd_pub = self.create_publisher(MotionSimpleCMD, '/simple_cmd', cmd_qos)
+        # The gait in use, latched (the tmux status window echoes it): 'flat_slow  (terrain)' etc.
+        self.gait_pub = self.create_publisher(String, '~/gait', latched)
+        self._publish_gait('none sent yet')
         # While the explorer spins to look around, hold the crawl gait (set from the reporter).
         self.crawl_hold = False
         self.hold_gait = 'flat_crawl'                     # gait held while crawl_hold is set
@@ -54,6 +57,9 @@ class GaitSwitcher(Node):
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def _publish_gait(self, why):
+        self.gait_pub.publish(String(data=f'{self.switcher.gait or "-"}  ({why})'))
+
     def _on_terrain(self, msg):
         if self.switcher.update_terrain(msg.data, self._now()):
             self.get_logger().info(f'terrain: {msg.data}')
@@ -69,6 +75,8 @@ class GaitSwitcher(Node):
         self._burst = (out, self.repeats - 1, now)
         self.switcher.mark_sent(cmd, now)
         self.get_logger().info(f'gait -> {cmd.gait} (0x{cmd.cmd_code:08X})')
+        self._publish_gait('crawl hold: spinning' if self.crawl_hold else 'animation' if self.animating
+                           else f'terrain {self.switcher.terrain}')
 
     def _on_crawl_hold(self, msg):
         now = self._now()

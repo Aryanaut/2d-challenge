@@ -117,6 +117,8 @@ class ModeMachine:
         for mode in self.modes.values():          # fail at start-up on a bad exploration profile, not mid-mission
             for name in getattr(mode, 'exploration_profiles', []):
                 self.exploration(name)
+        self.scene_checked = set()         # (trail length, tile): arrivals already checked for a scene tile beside them
+        self.scenes_done = set()           # scene tiles already looked at (never twice)
         self.curtains_tried = set()        # tiles behind a curtain that was already walked into (never twice)
         self.current: Optional[Mode] = None
         self.started_at: Optional[float] = None

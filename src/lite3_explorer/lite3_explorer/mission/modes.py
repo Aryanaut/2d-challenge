@@ -6,6 +6,8 @@
   exploring  asks its exploration profiles (WHERE: tiles, optionally frontiers) for a reachable target and drives
              there with a traversal profile (HOW), then hands over to scanning. Checks the end condition at every
              decision.
+  scene      a scene tile (scanned, mostly not traversable) shares a side with the current tile: face it, ask the AI
+             to describe it, mark it explored and go back to exploring. The robot never enters it.
   recovery   the robot is stuck (or no target has a Nav2 path): drive to the nearest tile centre, then rescan.
   complete   the end condition is met. /exploration_complete is published.
 
@@ -288,6 +290,8 @@ class ExploringMode(Mode):
             out.append(self.machine.recovery_mode)
         if c.get('quickscan_on_edge', False):
             out.append(c.get('quickscan_mode', 'quickscan'))
+        if c.get('scenes', False) and c.get('scene_mode', 'scene') in self.machine.modes:
+            out.append(c.get('scene_mode', 'scene'))
         if c.get('curtains', False):
             out.append(c.get('curtain_mode', 'curtain'))
         return out
@@ -336,6 +340,9 @@ class ExploringMode(Mode):
         if pose is None:
             return None
         if self.index == 0:
+            hop = self._scene_beside(pose)
+            if hop is not None:
+                return hop
             hop = self._curtain_on_edge(pose)
             if hop is not None:
                 return hop
@@ -560,6 +567,28 @@ class ExploringMode(Mode):
             return None
         return self._failed(res.reason or 'failed')
 
+    def _scene_beside(self, pose):
+        """scenes: true. Right after the robot has reached a tile (once per arrival): that tile shares a side with a scene
+        tile that was not looked at yet -> the scene mode faces it, has the AI describe it and marks it explored.
+        Scene tiles are only considered next to the current tile."""
+        tiles = self.ctx.tiles
+        if (not self.cfg.get('scenes', False) or tiles.grid is None
+                or self.cfg.get('scene_mode', 'scene') not in self.machine.modes):
+            return None
+        here = tuple(tiles.grid.tile_of(pose[0], pose[1]))
+        arrival = (len(tiles.trail), here)                # checked once per arrival at a tile, not at every decision
+        if tiles.current is None or here != tuple(tiles.current) or arrival in self.machine.scene_checked:
+            return None
+        self.machine.scene_checked.add(arrival)
+        for tile in tiles.scene_neighbours(here):
+            label = T.tile_label(tile)
+            if label in self.machine.scenes_done:
+                continue
+            self.ctx.log('info', f'Scene tile {label} shares a side with tile {T.tile_label(here)}: looking at it.')
+            return self.go(self.cfg.get('scene_mode', 'scene'), f'scene tile {label} beside tile {T.tile_label(here)}',
+                           tile=label)
+        return None
+
     def _curtain_on_edge(self, pose):
         """curtains: true. A detected curtain (depth camera) along an edge of the tile the robot stands on, with an
         unvisited tile behind it -> the curtain mode aligns with it and walks through."""
@@ -739,6 +768,107 @@ class MppiMode(Mode):
 
 
 # ----------------------------------------------------------------------------------------- curtain
+@register_mode('scene')
+class SceneMode(Mode):
+    """A scene tile shares a side with the tile the robot stands on: look at it, never enter it.
+
+    Phases: rest (stand still: a spin just before, e.g. the scan, is still coasting) -> align (turn in place to face the
+    scene tile's centre by the shorter way, and keep that direction while it is almost behind the robot: right at 180 deg
+    the shorter way flips with every bit of coasting) -> settle (stand still) -> describe (the AI is asked
+    what is on the tile; retried llm_attempts times) -> next_mode (exploring), with the scene tile marked explored
+    whatever the AI said (machine.scenes_done: never twice). The robot does not leave its tile."""
+
+    def __init__(self, name, machine, cfg):
+        super().__init__(name, machine, cfg)
+        self.label, self.tile, self.yaw, self.call, self.attempt, self.pose0 = None, None, 0.0, None, 0, None
+        self.turn_dir = 0                                  # +1 / -1: the direction the turn started in
+
+    def targets(self):
+        return [self.cfg.get('next_mode', 'exploring')]
+
+    def enter(self, reason, tile=None, **kw):
+        self.label, self.call, self.attempt, self.turn_dir = tile, None, 0, 0
+        self.ctx.set_target(None, None, None)
+        pose, tiles = self.ctx.pose(), self.ctx.tiles
+        if not tile or pose is None or tiles.grid is None:
+            self.tile = None
+            self.set_phase('abort')
+            return
+        self.tile = tuple(int(v) for v in tile.split(','))
+        self.machine.scenes_done.add(tile)
+        cx, cy = tiles.grid.center(self.tile)
+        self.yaw = math.atan2(cy - pose[1], cx - pose[0])
+        self.ctx.event('scene', tile=tile, yaw_deg=round(math.degrees(self.yaw), 1))
+        self.set_phase('rest')
+
+    def _finish(self, why):
+        self.ctx.stop()
+        if self.tile is not None:
+            self.ctx.tiles.mark_described(self.tile)
+            self.ctx.event('scene_done', tile=self.label, why=why)
+        self.ctx.log('info', f'Scene tile {self.label}: {why}; marked explored.')
+        return self.go(self.cfg.get('next_mode', 'exploring'), f'scene tile {self.label}: {why}')
+
+    def _ask(self):
+        self.attempt += 1
+        self.call = self.ctx.describe_scene(self.label, self.pose0)
+        self.set_phase('describe')
+
+    def tick(self):
+        c = self.cfg
+        pose = self.ctx.pose()
+        if self.phase == 'abort':
+            return self._finish('nothing to look at')
+        if pose is None or len(pose) < 3:
+            self.ctx.stop()
+            return self._finish('no pose') if self.in_phase_s() > 3.0 else None
+        if self.phase == 'rest':
+            self.ctx.stop()
+            if self.in_phase_s() >= float(c.get('rest_s', 1.5)):
+                self.set_phase('align')
+            return None
+        if self.phase == 'align':
+            err = math.atan2(math.sin(self.yaw - pose[2]), math.cos(self.yaw - pose[2]))
+            if self.turn_dir and abs(err) > math.radians(float(c.get('commit_deg', 150.0))) \
+                    and (err > 0) != (self.turn_dir > 0):
+                err -= math.copysign(2 * math.pi, err)         # almost behind: carry on the way it started, do not flip
+            elif abs(err) > math.radians(float(c.get('align_tol_deg', 6.0))):
+                self.turn_dir = 1 if err > 0 else -1
+            if abs(err) <= math.radians(float(c.get('align_tol_deg', 6.0))):
+                self.ctx.stop()
+                self.set_phase('settle')
+                return None
+            if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
+                self.ctx.log('warn', f'Scene tile {self.label}: could not turn to face it; describing from here.')
+                self.ctx.stop()
+                self.set_phase('settle')
+                return None
+            w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+                                                              float(c.get('turn_gain', 1.0)) * abs(err)))
+            self.ctx.drive(0.0, math.copysign(w, err))
+        elif self.phase == 'settle':
+            self.ctx.stop()
+            if self.in_phase_s() >= float(c.get('settle_s', 1.0)):
+                self.pose0 = pose
+                self._ask()
+        elif self.phase == 'describe':
+            if not self.call.done:
+                return None
+            if self.call.ok:
+                self.ctx.record_scene(self.label, self.pose0, self.call)
+                return self._finish('described')
+            self.ctx.log('warn', f'Scene tile {self.label}: AI description failed ({self.call.failure()}), '
+                                 f'try {self.attempt}/{int(c.get("llm_attempts", 2))}.')
+            if self.attempt >= int(c.get('llm_attempts', 2)):
+                self.ctx.record_scene(self.label, self.pose0, self.call)
+                return self._finish('AI description failed')
+            self._ask()
+        return None
+
+    def exit(self, next_mode, reason):
+        self.ctx.stop()
+
+
 @register_mode('curtain')
 class CurtainMode(Mode):
     """A curtain hangs along the edge of the current tile: face it squarely, then walk through it with forward (vx)
