@@ -178,6 +178,9 @@ DEFAULTS: Dict[str, Any] = {
             'next_mode': 'exploring',     # clear of the costmap obstacle zone: decide again
             'fail_mode': 'recovery',      # could not get out (timeout, no way out, moved too far)
             'speed_mps': 0.15,            # x / y speed while adjusting
+            'hold_heading': True,         # keep the heading the robot had on entering (wz P-controller); False = wz 0
+            'heading_kp': 1.5,            # rad/s of wz per rad of heading error
+            'wz_max': 0.3,                # rad/s limit of that correction
             'clear_cost': 70,             # clear = the robot's cell costs less than this (and the way out aims for such a cell)
             'clear_hold_s': 0.6,          # ... for this long
             'search_m': 1.0,              # how far around the robot to look for clear floor

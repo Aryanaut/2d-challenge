@@ -50,11 +50,11 @@ controller_server:
       vx_max: 0.4
       vx_min: -0.2
       vy_max: 0.3
-      wz_max: 0.6
+      wz_max: 0.3                        # low on purpose: lateral moves keep the heading (was 0.6)
       # sampling noise: how far the samples spread around the current best control
       vx_std: 0.2
       vy_std: 0.2
-      wz_std: 0.4
+      wz_std: 0.1                        # samples barely rotate (was 0.4)
       temperature: 0.3
       gamma: 0.015
       prune_distance: 1.7                # path length ahead that is optimised
@@ -64,10 +64,11 @@ controller_server:
       TrajectoryVisualizer:
         trajectory_step: 5
         time_step: 3
-      # The cost terms, in order. Holonomic: no PreferForwardCritic, PathAngleCritic mode 1 = no direction preference,
-      # so the robot may move sideways along the path.
+      # The cost terms, in order. Holonomic and heading-holding: no PreferForwardCritic and no PathAngleCritic (in this
+      # Nav2 it turns the robot to face the path; Humble has no 'mode' parameter), TwirlingCritic penalises rotation, so
+      # the robot sidesteps with vy and keeps its heading.
       critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic",
-                "PathFollowCritic", "PathAngleCritic"]
+                "PathFollowCritic", "TwirlingCritic"]
       ConstraintCritic:
         enabled: true
         cost_power: 1
@@ -106,14 +107,10 @@ controller_server:
         cost_weight: 5.0
         offset_from_furthest: 5
         threshold_to_consider: 1.4
-      PathAngleCritic:
+      TwirlingCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 2.0
-        offset_from_furthest: 4
-        threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.0
-        mode: 1
+        cost_weight: 10.0                # raise it if the heading still drifts, lower it if the robot cannot turn when it must
 
 local_costmap:
   local_costmap:
@@ -266,8 +263,8 @@ velocity_smoother:
     scale_velocities: false
     feedback: "OPEN_LOOP"
     # Lite3 accepts vx, vy, wz on /cmd_vel; MPPI (holonomic) uses all three.
-    max_velocity: [0.4, 0.3, 0.6]
-    min_velocity: [-0.2, -0.3, -0.6]
+    max_velocity: [0.4, 0.3, 0.3]
+    min_velocity: [-0.2, -0.3, -0.3]
     max_accel: [0.6, 0.5, 1.5]
     max_decel: [-0.8, -0.5, -2.0]
     odom_topic: /odom

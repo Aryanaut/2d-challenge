@@ -168,6 +168,9 @@ mission_manager:
         next_mode: exploring                 # clear -> decide again
         fail_mode: recovery                  # no way out / timeout / moved too far
         speed_mps: 0.15
+        hold_heading: true                   # the heading on entering is held while the robot slides out (wz P-controller)
+        heading_kp: 1.5                      # rad/s of wz per rad of heading error
+        wz_max: 0.3                          # limit of that correction (rad/s)
         clear_cost: 70                       # clear = the robot's costmap cell is cheaper than this ...
         clear_hold_s: 0.6                    # ... for this long
         search_m: 1.0                        # how far around the robot to look for clear floor

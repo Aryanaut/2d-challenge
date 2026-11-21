@@ -676,7 +676,8 @@ class MppiMode(Mode):
 
     Each tick the global costmap around the robot gives the direction that reaches clear floor soonest without crossing
     a wall (costmap_escape.escape_direction); it is sent as linear x / y velocity in the robot frame (the Lite3 takes
-    vx, vy and wz, no turning needed). Exit to next_mode once the robot's cell has cost < clear_cost for clear_hold_s.
+    vx, vy and wz). The heading the robot has on entering is the heading to maintain: wz is a P-controller that keeps the
+    robot on it while it slides out (hold_heading: false = wz 0, open loop). Exit to next_mode once the robot's cell has cost < clear_cost for clear_hold_s.
     No way out, no costmap, a timeout or moving further than max_travel_m: fail_mode (recovery)."""
 
     def targets(self):
@@ -688,6 +689,7 @@ class MppiMode(Mode):
 
     def enter(self, reason, **kw):
         self.clear_since, self.start = None, self.ctx.pose()
+        self.heading = self.start[2] if self.start is not None and len(self.start) >= 3 else None   # the heading to maintain
         self.ctx.set_target(None, None, None)
         self.ctx.clear_costmaps()                  # marks from before the robot moved can be what keeps the zone lethal
         self.set_phase('adjust')
@@ -724,7 +726,12 @@ class MppiMode(Mode):
         ux, uy, _ = way
         cy, sy = math.cos(pose[2]), math.sin(pose[2])
         v = float(c.get('speed_mps', 0.15))
-        self.ctx.drive(v * (ux * cy + uy * sy), 0.0, v * (-ux * sy + uy * cy))      # map -> robot frame
+        wz = 0.0
+        if c.get('hold_heading', True) and self.heading is not None:
+            err = math.atan2(math.sin(self.heading - pose[2]), math.cos(self.heading - pose[2]))
+            wlim = float(c.get('wz_max', 0.3))
+            wz = max(-wlim, min(wlim, float(c.get('heading_kp', 1.5)) * err))
+        self.ctx.drive(v * (ux * cy + uy * sy), wz, v * (-ux * sy + uy * cy))      # map -> robot frame
         return None
 
     def exit(self, next_mode, reason):

@@ -194,3 +194,29 @@ def test_costmap_stuck_goes_to_the_mppi_mode():
         ctx.t += 1.0
         m.tick()
     assert 'mppi' in modes_seen(m), modes_seen(m)
+
+
+def test_mppi_mode_holds_the_heading_it_entered_with():
+    from lite3_explorer.mission.core import Transition
+    ctx, m = make({'modes.exploring.scan_after_reach': False}, length_m=4.0)
+    grid, info = wall_costmap()
+    ctx.pose_[:] = [0.9, 0.0, 0.6]
+    ctx.costmap_snapshot = lambda: (grid, info)
+    ctx.stop = lambda: None
+    wzs = []
+
+    def drive(vx, wz, vy=0.0):
+        wzs.append(wz)
+    ctx.drive = drive
+    m._switch(Transition('mppi', 'test'))
+    ctx.t += 0.5
+    m.tick()
+    assert wzs and wzs[-1] == 0.0                       # on the entry heading: no turning
+    ctx.pose_[2] = 0.6 + 0.4                            # knocked 0.4 rad to the left: turn back (negative wz)
+    ctx.t += 0.5
+    m.tick()
+    assert wzs[-1] < 0 and abs(wzs[-1]) <= 0.3 + 1e-9
+    ctx.pose_[2] = 0.6 - 0.4                            # and the other way
+    ctx.t += 0.5
+    m.tick()
+    assert wzs[-1] > 0
