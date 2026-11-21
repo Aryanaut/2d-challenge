@@ -1,0 +1,56 @@
+# Terrain KINDS (flat / uneven / slats ...) as strategies, used by the terrain_classifier node (terrain_kinds.py).
+# Every kind is a strategy; the classifier names the floor around the robot with the FIRST strategy in `terrains` whose
+# rule accepts it. Add a kind: write a TerrainStrategy subclass with @register_terrain('mytype'), list it here.
+# Another file: kinds_file:=/path/file.yaml (terrain_classifier parameter). Tile-independent: no tile grid is involved.
+
+# measurement settings shared by every strategy
+common:
+  cell_m: 0.30               # height spread is measured per cell of this size
+  min_points_per_cell: 6
+  wall_height_m: 0.30        # a cell with a point higher than this holds a wall / object: not floor
+  min_cells: 5               # floor cell measurements needed before there is a kind (the area in front is ~1 m x 0.9 m)
+  spread_threshold_m: 0.08   # a cell is rough when its p90 - p10 height exceeds this
+  coherence_bin_m: 0.02
+  max_floor_points: 20000
+
+  image_window: 15           # per camera: how many of the latest frames take part in the slats vote
+
+# Hough line detection on the camera images (slat_lines.py). `common` applies to both cameras, then each camera's own
+# block overrides it. Only the lower part of the image (the floor in front of the robot) is searched.
+images:
+  common:
+    roi_top_fraction: 0.5
+    hough_threshold: 30
+    min_length_fraction: 0.10
+    min_rung_span: 0.35             # a rung must run across this share of the image width (block / step edges are short)
+    max_rung_angle_std_deg: 5.0     # rungs must be parallel (ramps / wedges give lines at mixed angles: not slats)
+    max_vanishing_residual: 0.0125  # converging lines must meet at one point (share of the image width)
+  depth: {}
+  color: {}
+
+terrains:
+  - name: slats              # parallel straight lines in the depth and / or colour image (Hough transform)
+    type: hough_slats
+    sources: [depth, color]  # which cameras may vote
+    mode: any                # any: one camera is enough | all: every camera that has frames must agree
+    require: [depth]         # cameras that MUST confirm whatever the mode: colour alone is fooled by block edges / grain
+    min_lines:                # distinct slat-like lines for a frame to vote "slats", per camera and family
+      depth: {rungs: 4, converging: 3}
+      color: {rungs: 15, converging: 6}   # colour: only many lines count (cubes and stairs give up to 12 rungs)
+    min_vote_fraction: 0.6   # share of a camera's latest frames that must vote
+    min_frames: 5
+    marker: {style: solid, color: [1.0, 0.0, 0.0, 0.55], label: SLATS}
+
+  # Slats from the lidar height profile instead (one ridge direction explains the height variance; weak on real data):
+  # - {name: slats, type: slats, rugged_median_m: 0.12, rugged_fraction: 0.60, min_coherence: 0.35,
+  #    marker: {style: solid, color: [1.0, 0.0, 0.0, 0.55], label: SLATS}}
+
+  - name: uneven             # rugged, anything else
+    type: uneven
+    rugged_median_m: 0.12
+    rugged_fraction: 0.60
+    marker: {style: hatch, color: [1.0, 0.75, 0.0, 1.0], label: UNEVEN}
+
+  - name: flat               # everything left
+    type: flat
+    marker: {style: none}    # solid | hatch | none

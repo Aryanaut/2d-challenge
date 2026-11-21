@@ -23,7 +23,8 @@ DEFAULTS: Dict[str, Any] = {
     'output_dir': '~/lite3_survey_runs',
     'reports_dir': '~/2d-challenge/reports',
     'use_ai': True,                       # AI tile descriptions via lite3_llm_tools/llm_client
-    'terrain_classify_service': '/terrain_classifier/classify',   # called on entering a new tile ('' = never)
+    'terrain_classify_service': '/terrain_classifier/classify',   # asked for the tile being driven to ('' = never)
+    'terrain_wait_s': 3.0,            # no terrain answer this long after asking = the floor of that tile cannot be seen
     'llm_report_timeout_s': 180.0,
     'llm_report_retries': 5,
     'robot_length_m': 0.61,               # turn-room check (match the local costmap footprint)
@@ -34,12 +35,13 @@ DEFAULTS: Dict[str, Any] = {
         'size_m': 1.0,
         'reach_radius_m': 0.30,           # a tile is reached (explored) this close to its centre
         'max_failures': 2,                # failed attempts before a tile is given up on (unreachable); 0 = never
+        'min_known': 0.5,                 # share of a tile that must be scanned before it becomes a tile
     },
 
     'mission': {
         # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
         # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
-        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'recovery', 'complete'],
+        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'mppi', 'recovery', 'complete'],
         'initial_mode': 'idle',
         'start_mode': 'scanning',         # where set_active(true) / auto start goes
         'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
@@ -55,6 +57,7 @@ DEFAULTS: Dict[str, Any] = {
         'costmap_cost': 99,               # costmap: robot centre on a cell this costly (99 inscribed, 100 lethal) ...
         'costmap_hold_s': 20.0,           # ... for this long = stuck in the global costmap
         'cooldown_s': 5.0,                # ignore triggers this long after (re-)entering a watched mode
+        'costmap_mode': 'mppi',           # stuck in the costmap obstacle zone -> this mode moves the robot out ('' = recovery)
     },
 
     'end_condition': {
@@ -62,7 +65,7 @@ DEFAULTS: Dict[str, Any] = {
         'conditions': ['all_tiles_explored'],
         'all_tiles_explored': {
             'min_visited': 1,             # never finish before this many tiles were reached
-            'ignore_unreachable': True,   # tiles given up on count as done
+            'ignore_unreachable': False,  # False: tiles given up on still count as unexplored (retried), no early finish
         },
         'time_limit': {'seconds': 0.0},   # 0 = off
         'max_tiles_visited': {'count': 0},
@@ -75,7 +78,9 @@ DEFAULTS: Dict[str, Any] = {
             'type': 'tiles',
             'max_adjacency': 2,           # 0 open side w/ current tile, 1 open side w/ a visited tile,
                                           # 2 any side (also across a wall) w/ a visited tile, 3 anywhere
-            'fallback_any': True,         # no tile within max_adjacency -> offer the rest (else: none)
+            'fallback_any': False,         # no tile within max_adjacency -> offer the rest (else: none)
+            'reject_via_other_tiles': True,   # drop a tile whose path runs through other tiles (not the current one / itself)
+            'via_tile_tolerance_m': 0.15,
             'direct_path_only': True,     # next tile: a neighbour of the current tile, path through their shared side
             'direct_fallback': True,      # none qualifies -> best reachable tile (False: none)
             'prefer_current': True,       # rank neighbours of the current tile before other visited tiles' neighbours
@@ -103,8 +108,10 @@ DEFAULTS: Dict[str, Any] = {
     'traversals': {
         # Named traversal profiles. type = a registered traversal class (see mission/traversal.py).
         'route': {'type': 'nav2_route',   # FollowWaypoints: N waypoints along the Nav2 path, then the tile centre
+                  'route_mode': 'straight',   # straight: waypoints on the line current tile centre -> next tile centre; path: along the Nav2 path
                   'waypoints': 3,         # intermediate waypoints, evenly spaced along the path
-                  'skip_start_m': 0.20,   # spread them over the path after this much of it (capped at 1/4 of it)
+                  'skip_start_m': 0.0,    # 0 = equal gaps start->wp->goal; >0 skips this much of the path first (first gap longer)
+                  'max_waypoint_deviation_m': 0.25,   # drop waypoints further than this off the straight line to the tile centre (0 = keep all)
                   'drop_backward_waypoints': False},   # True: drop waypoints facing away from the goal (fewer than N)
         'direct': {'type': 'nav2_pose', 'behavior_tree': ''},   # NavigateToPose straight to the goal
     },
@@ -119,8 +126,10 @@ DEFAULTS: Dict[str, Any] = {
             'type': 'scanning',
             'turn': True,                 # false = no turning, just refresh the tiles
             'turn_deg': 360.0,
-            'opening_sweep_deg': 90.0,    # first scan: -this .. +this in the flat gait
-            'opening_retries': 2,
+            'opening_setpoints_deg': [0.0, 80.0, -160.0, -80.0],   # opening spin: yaw setpoints relative to the start heading, then back to 0
+            'opening_retries': 5,           # the opening scan must finish before exploring
+            'opening_min_turn_deg': 160.0,    # the opening spin may stop early (map not sparse) only after turning this far
+            'return_tolerance_deg': 3.0,  # after the opening sweep turn back to the starting heading
             'time_allowance_s': 20.0,
             'use_crawl': True,            # crawl gait while turning (gait_switcher /spin_crawl)
             'settle_s': 1.0,
@@ -137,9 +146,20 @@ DEFAULTS: Dict[str, Any] = {
             'path_check_timeout_s': 10.0,
             'goal_timeout_s': 120.0,
             'scan_after_reach': True,
+            'curtains': False,            # use_curtains:=true: a curtain on the current tile's edge -> curtain mode (walk through it)
+            'curtain_mode': 'curtain',
+            'curtain_edge_tol_m': 0.30,   # curtain spots within this of the tile edge line count as on the edge
+            'curtain_min_span_m': 0.40,   # ... spread over at least this much of it
+            'classify_target': True,      # ask the terrain classifier about the target tile once the robot points at it;
+                                          # floor not visible -> choose another tile
+            'classify_max_angle_deg': 20.0,   # "pointing at it": heading within this angle of the tile
+            'retry_period_s': 15.0,       # nothing reachable but tiles left: wait, then retry every tile (never finish early)
+            'retry_rescan': True,         # rescan first: new map data may open a Nav2 path
+            'retry_clear_costmaps': True,
             'scan_mode': 'scanning',
             'face_away_from_walls': True,   # tile goals: final heading N/W/E/S facing away from the most walls
             'on_goal_failed': 'decide',   # decide (choose another tile) | recovery
+            'no_path_retries': 2,         # rescan + retry this many times (retry_period_s apart) before going to recovery
             'on_no_reachable_tile': 'recovery',   # recovery | scanning | idle
             'quickscan_on_edge': False,   # true: while driving, stop on a tile's edge and run the quickscan animation
             'quickscan_edge_margin_m': 0.15,   # "on the edge" = within this distance of the tile boundary
@@ -153,12 +173,37 @@ DEFAULTS: Dict[str, Any] = {
             'timeout_s': 30.0,            # give up on (and cancel) an animation that runs this long
             'next_mode': 'exploring',     # a new decision is made afterwards (the cancelled goal is re-chosen)
         },
+        'mppi': {
+            'type': 'mppi',
+            'next_mode': 'exploring',     # clear of the costmap obstacle zone: decide again
+            'fail_mode': 'recovery',      # could not get out (timeout, no way out, moved too far)
+            'speed_mps': 0.15,            # x / y speed while adjusting
+            'clear_cost': 70,             # clear = the robot's cell costs less than this (and the way out aims for such a cell)
+            'clear_hold_s': 0.6,          # ... for this long
+            'search_m': 1.0,              # how far around the robot to look for clear floor
+            'max_travel_m': 1.0,          # give up after moving this far from where it started
+            'timeout_s': 20.0,
+        },
+        'curtain': {
+            'type': 'curtain',
+            'next_mode': 'exploring',
+            'speed_mps': 0.25,            # forward speed (vx) through the curtain
+            'align_tol_deg': 5.0,         # square to the edge within this before walking
+            'align_timeout_s': 15.0,
+            'min_turn_rad_s': 0.2,
+            'max_turn_rad_s': 0.6,
+            'turn_gain': 1.0,
+            'heading_gain': 1.0,          # wz that holds the heading while walking
+            'extra_m': 0.0,               # stop this much beyond the next tile's centre
+            'cross_timeout_s': 20.0,
+        },
         'recovery': {
             'type': 'recovery',
             'traversal': 'direct',
             'tile_statuses': ['visited', 'to_visit'],   # which tiles' centres are recovery targets
             'candidates': 3,
             'min_distance_m': 0.25,       # skip centres the robot is already on
+            'adjacent_only': True,        # only the robot's own tile / tiles sharing a side with it (never through another tile)
             'min_clearance_m': 0.25,
             'attempt_timeout_s': 45.0,
             'clear_costmaps': True,

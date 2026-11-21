@@ -10,7 +10,12 @@ terrain_classifier:
     # any_rugged         rugged if either sensor says rugged (most cautious)
     fusion_mode: lidar_primary
     depth_fallback: true          # use the camera alone when the lidar has no usable data
+    flat_needs_lidar: true        # ... but that camera-only answer can never switch RUGGED -> non_rugged (flat gait on rough ground):
+                                  #     leaving rugged needs a lidar-backed flat reading
     use_depth: true
+    use_color: true               # the colour camera only feeds the slats lines (terrain_kinds.yaml)
+    color:
+      image_topic: /camera/color/image_raw
     publish_debug_clouds: true    # ~/lidar_points, ~/depth_points (intensity = height above ground plane)
     start_enabled: true
     trigger_mode: false           # true: classify only on ~/classify (once at startup too), then hold the label
@@ -20,11 +25,12 @@ terrain_classifier:
       topic: /livox/points        # Livox MID-360 PointCloud2 (xfer_format 0)
       accumulate_s: 0.3           # stack this much lidar history (MID-360 frames are sparse)
       max_age_s: 1.0
-      # Area checked, metres in base_link (x forward, y left, z up)
-      x_min: -1.5
-      x_max: 2.5
-      y_min: -1.5
-      y_max: 1.5
+      # Area checked, metres in base_link (x forward, y left, z up): only the floor DIRECTLY IN FRONT of the robot,
+      # about one tile long and a body wide
+      x_min: 0.40
+      x_max: 1.40
+      y_min: -0.45
+      y_max: 0.45
       z_min: -1.0
       z_max: 0.4
       # The robot's own body / legs, cut out of the area above
@@ -63,10 +69,11 @@ terrain_classifier:
       # With a TF base_link <- camera frame the points are checked in base_link (crop box below
       # and the tilt test work). Without it the check runs in the camera frame, which still works.
       use_tf: true
-      x_min: 0.0
-      x_max: 2.5
-      y_min: -1.5
-      y_max: 1.5
+      # the same area as the lidar: directly in front of the robot
+      x_min: 0.40
+      x_max: 1.40
+      y_min: -0.45
+      y_max: 0.45
       z_min: -1.0
       z_max: 0.4
       cell_size_m: 0.20

@@ -32,6 +32,10 @@ Visualization Manager:
       Alpha: 1
       Decay Time: 0
     - Class: rviz_default_plugins/MarkerArray
+      Name: Tile terrain kind (from the terrain classifier)
+      Enabled: true
+      Topic: {Value: /mission_manager/terrain_markers, Depth: 5, Durability Policy: Transient Local, Reliability Policy: Reliable}
+    - Class: rviz_default_plugins/MarkerArray
       Name: Tiles (blue visited, green to_visit, red blocked, purple unreachable) + trail + CHOSEN tile (orange)
       Enabled: true
       Topic: {Value: /mission_manager/tile_markers, Depth: 5, Durability Policy: Transient Local, Reliability Policy: Reliable}

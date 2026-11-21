@@ -41,7 +41,7 @@ class GaitCommand:
 
 
 class TerrainGaitSwitcher:
-    def __init__(self, flat_gait: str = 'flat_medium', rugged_gait: str = 'rug_general',
+    def __init__(self, flat_gait: str = 'flat_slow', rugged_gait: str = 'rug_general',
                  flat_delay_s: float = 2.0, min_switch_interval_s: float = 1.0):
         for gait in (flat_gait, rugged_gait):
             if gait not in GAIT_CODES:

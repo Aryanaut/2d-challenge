@@ -21,10 +21,11 @@ mission_manager:
       size_m: 1.0
       reach_radius_m: 0.30                   # a tile is explored once the robot is this close to its centre
       max_failures: 2                        # failed attempts (Nav2 abort, stuck, timeout) before a tile is unreachable
+      min_known: 0.5                         # a tile exists once this share of it is scanned (was 0.7: the 1.7 m lidar range left edge tiles unknown)
 
     # ---------------------------------------------------------------- mission manager
     mission:
-      modes: [idle, scanning, exploring, quickscan, recovery, complete]   # instances to build (configured under modes.<name>)
+      modes: [idle, scanning, exploring, quickscan, curtain, mppi, recovery, complete]   # instances to build (configured under modes.<name>)
       initial_mode: idle
       start_mode: scanning                   # set_active(true) / auto start goes here
       recovery_mode: recovery                # the stuck supervisor sends the robot here
@@ -41,6 +42,7 @@ mission_manager:
       costmap_cost: 99                       # costmap: robot centre on a global-costmap cell >= this (99 inscribed, 100 lethal)
       costmap_hold_s: 20.0                   # ... for this long
       cooldown_s: 5.0                        # grace period after entering a watched mode
+      costmap_mode: mppi                     # stuck in the costmap obstacle zone -> this mode moves the robot out with x / y velocity ('' = recovery)
 
     # ---------------------------------------------------------------- end condition
     # combine: any = finish when one condition is met; all = when every one is.
@@ -51,7 +53,8 @@ mission_manager:
       conditions: [all_tiles_explored]       # e.g. [all_tiles_explored, time_limit]
       all_tiles_explored:
         min_visited: 1
-        ignore_unreachable: true             # tiles given up on count as done
+        ignore_unreachable: false            # false: tiles given up on still count as unexplored, so the mission does not finish
+                                             #        until they are visited (they are retried every retry_period_s)
       time_limit:
         seconds: 0.0                         # 0 = off
       max_tiles_visited:
@@ -69,7 +72,9 @@ mission_manager:
         max_adjacency: 2                     # the next tile must touch an explored tile:
                                              #   0 open side with the current tile, 1 open side with any visited tile,
                                              #   2 any side (also across a wall) with a visited tile, 3 no requirement
-        fallback_any: true                   # no tile within max_adjacency -> offer the others (else the mission stalls)
+        fallback_any: false                  # true: no tile within max_adjacency -> offer non-adjacent tiles too (they were picked while the neighbours were only transiently 'no path'); false: retry/recover instead
+        reject_via_other_tiles: true         # drop a tile whose Nav2 path runs through any tile other than the current one and itself
+        via_tile_tolerance_m: 0.15           # a path point counts as inside another tile only when this far past its border
         direct_path_only: true               # next tile = a neighbour of the current tile, reached by a path through their shared side
         direct_fallback: true                # none qualifies (dead end, backtracking) -> any reachable tile (else none)
         prefer_current: true                 # rank the current tile's neighbours before other visited tiles' neighbours
@@ -96,8 +101,10 @@ mission_manager:
     traversals:
       route:                                 # FollowWaypoints: waypoints along the Nav2 path, then the tile centre
         type: nav2_route
+        route_mode: straight                 # straight = waypoints on the straight line current tile centre -> next tile centre; path = along the Nav2 path
         waypoints: 3                         # intermediate waypoints, evenly spaced along the path (driven through)
-        skip_start_m: 0.20                   # spread over the path after this much of it (skips the start-up wiggle)
+        skip_start_m: 0.0                      # 0 = equal gaps start->waypoints->tile centre; >0 skips that much of the path first (longer first gap)
+        max_waypoint_deviation_m: 0.25       # drop waypoints further than this off the straight line start -> tile centre (0 = keep all)
         drop_backward_waypoints: false       # true: drop waypoints facing away from the goal (then fewer than 3)
       direct:                                # straight NavigateToPose
         type: nav2_pose
@@ -115,8 +122,10 @@ mission_manager:
         type: scanning
         turn: true
         turn_deg: 360.0
-        opening_sweep_deg: 90.0              # the first scan sweeps -90..+90 deg in the flat gait
-        opening_retries: 2
+        opening_setpoints_deg: [0, 80, -160, -80]   # opening spin: yaw setpoints relative to the starting heading (flat gait), then back to 0
+        opening_retries: 2                  # the opening scan must finish: retry the sweep (alternating sides) this often
+        opening_min_turn_deg: 160            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
+        return_tolerance_deg: 3.0            # after the opening sweep, turn back to the starting heading (within this)
         time_allowance_s: 20.0
         use_crawl: true                      # crawl gait while turning (gait_switcher)
         settle_s: 1.0
@@ -132,10 +141,19 @@ mission_manager:
         path_check_timeout_s: 10.0
         goal_timeout_s: 120.0
         scan_after_reach: true
+        curtains: false                      # use_curtains:=true (launch / explorer.sh --curtains): a curtain on the current tile's edge -> curtain mode
+        curtain_edge_tol_m: 0.30             # curtain spots within this of the tile edge line count as on the edge
+        curtain_min_span_m: 0.40             # ... spread over at least this much of it
+        classify_target: true                # terrain-classify the target tile as soon as the robot points at it; floor not visible -> choose another tile
+        classify_max_angle_deg: 20.0         # "points at it": heading within this angle of the tile
+        retry_period_s: 15.0                 # nothing reachable but tiles are left: wait this long, then give every tile another chance
+        retry_rescan: true                   # ... after a rescan (new map data may open a Nav2 path)
+        retry_clear_costmaps: true
         scan_mode: scanning
         face_away_from_walls: true           # final heading on a tile: N/W/E/S, facing away from the most walls
         on_goal_failed: decide               # decide (pick another tile) | recovery
         on_no_reachable_tile: recovery       # no candidate of any profile has a Nav2 path: recovery | scanning | idle
+        no_path_retries: 2                   # no Nav2 path to any tile: wait retry_period_s, rescan and retry this many times before recovery
         quickscan_on_edge: false             # true (or launch arg quickscan_on_edge:=true): stop on a tile edge, run quickscan
         quickscan_edge_margin_m: 0.15        # on the edge = within this distance of a tile boundary (once per tile)
       quickscan:
@@ -145,12 +163,35 @@ mission_manager:
         start_timeout_s: 3.0                 # animation_player did not start it: skip
         timeout_s: 30.0                      # cancel an animation that runs longer
         next_mode: exploring                 # a new decision follows (the cancelled goal is re-chosen)
+      mppi:
+        type: mppi                           # stuck in the costmap obstacle zone: nudge the robot out with linear x / y velocity
+        next_mode: exploring                 # clear -> decide again
+        fail_mode: recovery                  # no way out / timeout / moved too far
+        speed_mps: 0.15
+        clear_cost: 70                       # clear = the robot's costmap cell is cheaper than this ...
+        clear_hold_s: 0.6                    # ... for this long
+        search_m: 1.0                        # how far around the robot to look for clear floor
+        max_travel_m: 1.0
+        timeout_s: 20.0
+      curtain:
+        type: curtain                        # a curtain along the current tile's edge: square up to it, walk through with vx, go back to exploring
+        next_mode: exploring
+        speed_mps: 0.25                      # forward speed (vx) through the curtain
+        align_tol_deg: 5.0                   # square to the edge within this before walking
+        align_timeout_s: 15.0
+        min_turn_rad_s: 0.2
+        max_turn_rad_s: 0.6
+        turn_gain: 1.0
+        heading_gain: 1.0                    # wz that holds the heading while walking
+        extra_m: 0.0                         # stop this much beyond the next tile's centre
+        cross_timeout_s: 20.0
       recovery:
         type: recovery
         traversal: direct
         tile_statuses: [visited, to_visit]   # whose centres count as recovery targets
         candidates: 3                        # nearest centres tried in turn
         min_distance_m: 0.25                 # skip the centre the robot is already on
+        adjacent_only: true                  # only the robot's own tile and tiles sharing a side with it (never through another tile)
         min_clearance_m: 0.25
         attempt_timeout_s: 45.0
         clear_costmaps: true

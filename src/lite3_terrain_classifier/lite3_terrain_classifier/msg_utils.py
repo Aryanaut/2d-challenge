@@ -75,3 +75,18 @@ def xyzi_cloud(header, points: np.ndarray, intensity: np.ndarray, cloud_cls, fie
     msg.is_dense = True
     msg.data = data.tobytes()
     return msg
+
+
+def image_to_gray8(msg) -> np.ndarray:
+    """sensor_msgs/Image (mono8 / rgb8 / bgr8 / rgba8 / bgra8) -> (H, W) uint8 grey, without cv_bridge."""
+    channels = {'mono8': 1, '8UC1': 1, 'rgb8': 3, 'bgr8': 3, '8UC3': 3, 'rgba8': 4, 'bgra8': 4, '8UC4': 4}
+    enc = msg.encoding
+    if enc not in channels:
+        raise ValueError(f'unsupported colour image encoding {enc!r}')
+    c = channels[enc]
+    raw = np.frombuffer(_buffer(msg.data), dtype=np.uint8, count=msg.step * msg.height)
+    img = raw.reshape(msg.height, msg.step)[:, :msg.width * c].reshape(msg.height, msg.width, c)
+    if c == 1:
+        return img[:, :, 0].copy()
+    r, b = (0, 2) if enc.startswith('rgb') else (2, 0)
+    return (0.299 * img[:, :, r] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, b]).astype(np.uint8)

@@ -38,6 +38,7 @@ import math
 import os
 import time
 
+import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
@@ -48,7 +49,7 @@ from rclpy.time import Time
 
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration as DurationMsg
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from lifecycle_msgs.msg import State as LifecycleState
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import ComputePathToPose, Spin
@@ -170,18 +171,23 @@ class Nav2PathChecker:
         if not self.client.server_is_ready():
             return False
         self.seq += 1
-        seq = self.seq
         self.goals, self.results = list(goals), {}
-        for idx, (x, y) in enumerate(self.goals):
-            goal = ComputePathToPose.Goal()
-            goal.goal.header.frame_id = self.node.global_frame
-            goal.goal.header.stamp = self.node.get_clock().now().to_msg()
-            goal.goal.pose.position.x, goal.goal.pose.position.y = float(x), float(y)
-            goal.goal.pose.orientation.w = 1.0
-            goal.use_start = False                 # plan from the robot's current pose
-            self.client.send_goal_async(goal).add_done_callback(
-                lambda fut, i=idx: self._on_response(seq, i, fut))
+        self._send(self.seq, 0)
         return True
+
+    def _send(self, seq, idx):
+        """Goals go out ONE AT A TIME: Nav2's planner server runs a single goal and a newer one replaces the pending
+        one, so sending them all at once aborts every goal but the first and the last (reported as 'no path')."""
+        if seq != self.seq or idx >= len(self.goals):
+            return
+        x, y = self.goals[idx]
+        goal = ComputePathToPose.Goal()
+        goal.goal.header.frame_id = self.node.global_frame
+        goal.goal.header.stamp = self.node.get_clock().now().to_msg()
+        goal.goal.pose.position.x, goal.goal.pose.position.y = float(x), float(y)
+        goal.goal.pose.orientation.w = 1.0
+        goal.use_start = False                 # plan from the robot's current pose
+        self.client.send_goal_async(goal).add_done_callback(lambda fut: self._on_response(seq, idx, fut))
 
     def _on_response(self, seq, idx, future):
         if seq != self.seq:
@@ -189,6 +195,7 @@ class Nav2PathChecker:
         handle = future.result()
         if handle is None or not handle.accepted:
             self.results[idx] = None
+            self._send(seq, idx + 1)
             return
         handle.get_result_async().add_done_callback(lambda fut: self._on_result(seq, idx, fut.result()))
 
@@ -199,6 +206,7 @@ class Nav2PathChecker:
         if wrapped is not None and wrapped.status == GoalStatus.STATUS_SUCCEEDED and wrapped.result.path.poses:
             path = [(p.pose.position.x, p.pose.position.y) for p in wrapped.result.path.poses]
         self.results[idx] = path
+        self._send(seq, idx + 1)
 
     def poll(self):
         if len(self.results) < len(self.goals):
@@ -235,7 +243,8 @@ class MissionManager(Node):
         self.text_markers = []
 
         self.tiles = TileTracker(float(tcfg['size_m']), float(tcfg['reach_radius_m']), int(tcfg['max_failures']),
-                                 on_reached=self._on_tile_reached, on_enter=self._on_tile_enter)
+                                 on_reached=self._on_tile_reached,
+                                 min_known=float(tcfg.get('min_known', 0.5)))
         self.target = None                     # (label, goal_xy) for the RViz highlight
         self._published_tiles = -1
 
@@ -246,6 +255,13 @@ class MissionManager(Node):
         self._traversals = {}
         self.scanner = Nav2Scanner(self)
         self.paths = Nav2PathChecker(self)
+        self.wall_paths = Nav2PathChecker(self)      # own checker: re-evaluates the tiles after the virtual walls change
+        self._walls_sig = None
+        self.opening_done = False                    # virtual walls + tile maths wait for the opening spin
+        self.initial_heading = None                  # yaw the robot had when the opening spin began (it returns to it)
+        self._reeval_at = None
+        self._reeval_tiles = []
+        self._reeval_back = {}
         self.clear_clients = [self.create_client(ClearEntireCostmap, n) for n in
                               ('/global_costmap/clear_entirely_global_costmap',
                                '/local_costmap/clear_entirely_local_costmap')]
@@ -278,6 +294,15 @@ class MissionManager(Node):
         self.tile_report_pub = self.create_publisher(String, '/tile_report', QoSProfile(
             depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.tile_marker_pub = self.create_publisher(MarkerArray, '~/tile_markers', latched)
+        self.terrain_marker_pub = self.create_publisher(MarkerArray, '~/terrain_markers', latched)
+        # terrain kind (flat / uneven / slats ...) from the terrain classifier, which knows nothing about tiles: the tile
+        # that was being looked at when it was asked gets the answer
+        self.create_subscription(String, '/terrain_kind', self._on_terrain_kind, latched)
+        # fallback when no kind could be named (e.g. the lidar patch is too sparse): rugged / non_rugged still decides
+        # between hatched (uneven) and nothing
+        self.create_subscription(String, '/terrain_classifier/details', self._on_terrain_details, 10)
+        self._terrain_label, self._terrain_after = None, 0.0
+        self._terrain_seen, self._terrain_asked = set(), {}
         self.marker_pub = self.create_publisher(MarkerArray, '~/markers', latched)
         self.crawl_pub = self.create_publisher(Bool, '/spin_crawl', 10)
         self.flat_pub = self.create_publisher(Bool, '/spin_flat', 10)
@@ -292,8 +317,15 @@ class MissionManager(Node):
         self.create_timer(float(cfg['tick_period_s']), self._tick)
         self.create_timer(0.5, self._track_tiles)
         self.create_timer(1.0, self._refresh_tiles)
+        self.create_timer(0.5, self._reevaluate_tiles)
         self.create_timer(1.0, self._publish_virtual_walls)     # re-marked every second: the lidar must not clear them
         self.create_timer(1.0, self._publish_status)
+        # curtain mode (use_curtains): the detector's confirmed curtain spots, and direct velocity commands for the walk through it
+        self._curtain_pts = np.zeros((0, 4))
+        self.create_subscription(String, '/curtain/points', self._on_curtain_points, latched)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._cmd = None                                  # (vx, wz, expires): republished at 20 Hz until it expires
+        self.create_timer(0.05, self._publish_cmd)
 
     # ===================================================== context API used by the modes
     def now(self):
@@ -378,6 +410,41 @@ class MissionManager(Node):
         if profile not in self._traversals:
             self._traversals[profile] = build_traversal(self, profile, self.cfg['traversals'])
         return self._traversals[profile]
+
+    def _on_curtain_points(self, msg):
+        try:
+            self._curtain_pts = np.array(json.loads(msg.data).get('points', []), float).reshape(-1, 4)
+        except (ValueError, TypeError):
+            pass
+
+    def curtain_points(self):
+        return self._curtain_pts
+
+    def drive(self, vx, wz, vy=0.0):
+        """Direct velocity command (curtain / mppi modes); lapses 0.5 s after the last call, so a stalled mission stops the robot."""
+        self._cmd = (float(vx), float(wz), float(vy), time.monotonic() + 0.5)
+
+    def stop(self):
+        if self._cmd is not None:
+            self._cmd = None
+            self.cmd_pub.publish(Twist())
+
+    def _publish_cmd(self):
+        if self._cmd is None:
+            return
+        vx, wz, vy, until = self._cmd
+        if time.monotonic() > until:
+            self.stop()
+            return
+        msg = Twist()
+        msg.linear.x, msg.linear.y, msg.angular.z = vx, vy, wz
+        self.cmd_pub.publish(msg)
+
+    def costmap_snapshot(self):
+        """(grid, GridInfo) of the latest global costmap, or None when it is missing or stale."""
+        if self.global_costmap is None or time.monotonic() - self.global_costmap[2] > 10.0:
+            return None
+        return self.global_costmap[0], self.global_costmap[1]
 
     def costmap_cost_at_robot(self):
         if self.global_costmap is None or time.monotonic() - self.global_costmap[2] > 10.0:
@@ -509,19 +576,29 @@ class MissionManager(Node):
         self.machine.tick()
 
     def _track_tiles(self):
-        if self.tiles.ready:
+        if self.tiles.ready and self.opening_done:
             self.tiles.track(self.pose())
 
     def _publish_virtual_walls(self):
         """Virtual walls as a point cloud (Nav2 global costmap, source 'virtual_walls'): the wall behind the robot at
         the start and every tile edge with more than half of it on a mapped wall."""
-        if not self.tiles.ready:
+        if not self.tiles.ready or not self.opening_done:
             return
         step = 0.05
         pts = []
-        for (x0, y0), (x1, y1) in self.tiles.virtual_walls():
+        walls = self.tiles.virtual_walls()
+        sig = (tuple(sorted((round(a, 2), round(b, 2), round(c, 2), round(d, 2)) for (a, b), (c, d) in walls)),
+               sum(1 for t in self.tiles.tiles.values() if t.get('status') != 'unknown'))   # new tiles re-trigger it
+        if sig != self._walls_sig:
+            self._walls_sig = sig
+            self._reeval_at = self.now() + 3.0       # let the global costmap take the new walls in first
+        info = self.tiles.map[1] if self.tiles.map else None
+        for (x0, y0), (x1, y1) in walls:
             n = max(1, int(math.dist((x0, y0), (x1, y1)) / step))
             pts += [(x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n, 0.1) for k in range(n + 1)]
+        if info is not None:   # only inside the SLAM map: the global costmap has its size and logs 'worldToMap failed'
+            pts = [p for p in pts if 0 <= info.world_to_cell(p[0], p[1])[0] < info.height - 1
+                   and 0 <= info.world_to_cell(p[0], p[1])[1] < info.width - 1]
         if not pts:
             return
         header = PoseStamped().header
@@ -529,7 +606,65 @@ class MissionManager(Node):
         header.stamp = self.get_clock().now().to_msg()
         self.walls_pub.publish(point_cloud2.create_cloud_xyz32(header, pts))
 
+    def _reevaluate_tiles(self):
+        """After the virtual walls changed: ask Nav2 for a path to every unexplored tile; a tile with none is eliminated.
+        Nothing is eliminated when NO tile got a path (the planner failing from where the robot stands is not a wall)."""
+        if self._reeval_tiles:
+            results = self.wall_paths.poll()
+            if results is None:
+                if self.now() - self._reeval_started > 10.0:
+                    self.wall_paths.cancel()
+                    self._reeval_tiles = []
+                    for label, why in self._reeval_back.items():
+                        self.tiles.mark_unreachable(label, why)
+                    self._reeval_back = {}
+                return
+            tiles, self._reeval_tiles = self._reeval_tiles, []
+            back, self._reeval_back = self._reeval_back, {}
+            if not any(results):
+                self.log('warn', 'Virtual walls: no tile has a Nav2 path from here; eliminating nothing.')
+                for label, why in back.items():           # keep the earlier eliminations
+                    self.tiles.mark_unreachable(label, why)
+                return
+            doomed = [t['tile'] for t, path in zip(tiles, results)
+                      if not path and t['tile'] in self.tiles.unexplored()]
+            for label in doomed:
+                self.tiles.mark_unreachable(label, 'no Nav2 path with the virtual walls')
+            restored = [lab for lab in back if lab not in doomed]
+            if restored:
+                self.log('info', f'Newly scanned area: tile(s) {", ".join(restored)} have a Nav2 path again: restored.')
+                self.event('restored', tiles=restored, why='Nav2 path after new scans')
+                self._publish_tile_markers()
+            if doomed:
+                self.log('warn', f'Virtual walls: no Nav2 path to tile(s) {", ".join(doomed)}: eliminated.')
+                self.event('eliminated', tiles=doomed, why='no Nav2 path with the virtual walls')
+                self._publish_tile_markers()
+            return
+        if (self._reeval_at is None or self.now() < self._reeval_at or not self.tiles.ready
+                or not self.opening_done):
+            return
+        pose = self.pose()
+        if pose is None or not self.wall_paths.ready:
+            return
+        self._reeval_at = None
+        # tiles eliminated for the virtual walls are checked again: new scans can open a way to them
+        back = {lab: why for lab, why in self.tiles.unreachable.items()
+                if why.startswith('no Nav2 path with the virtual walls')}
+        for lab in back:
+            self.tiles.unreachable.pop(lab)
+        if back:
+            self.tiles.invalidate()
+            self.tiles.update()
+        targets = self.tiles.targets(pose[:2], limit=10 ** 6, min_clearance_m=0.30)
+        if targets and self.wall_paths.start([t['goal_xy'] for t in targets]):
+            self._reeval_tiles, self._reeval_started, self._reeval_back = targets, self.now(), back
+        else:
+            for lab, why in back.items():
+                self.tiles.mark_unreachable(lab, why)
+
     def _refresh_tiles(self):
+        if not self.opening_done:
+            return
         self.tiles.update()
         if self.tiles.ready and self.tiles.version != self._published_tiles:
             self._published_tiles = self.tiles.version
@@ -540,10 +675,61 @@ class MissionManager(Node):
         self.status_pub.publish(String(data=json.dumps(self.machine.status(), default=str)))
 
     # ===================================================== tile reports (AI descriptions)
-    def _on_tile_enter(self, tile):
-        """Entering another tile: ask the (triggered) terrain classifier to classify once."""
+    def classify_tile(self, label):
+        """Ask the terrain classifier what the floor is; the answer goes to tile `label` (the one the robot is pointing at)."""
+        self._terrain_label, self._terrain_after = label, self.now()
+        self._terrain_seen.discard(label)
+        self._terrain_asked[label] = self.now()
         if self.terrain_client is not None and self.terrain_client.service_is_ready():
             self.terrain_client.call_async(Trigger.Request())
+
+    def terrain_status(self, label):
+        """'pending' (asked, no answer yet) | 'seen' (the classifier named the floor) | 'unseen' (no answer within
+        terrain_wait_s: the floor could not be seen). Without a classifier service every tile counts as seen."""
+        if self.terrain_client is None or label in self._terrain_seen:
+            return 'seen'
+        if self.now() - self._terrain_asked.get(label, self.now()) >= float(self.cfg.get('terrain_wait_s', 3.0)):
+            return 'unseen'
+        return 'pending'
+
+    TERRAIN_DEBUG_COLOURS = {'flat': [0.1, 0.8, 0.2, 0.25]}
+    UNEVEN_MARKER = {'style': 'hatch', 'color': [1.0, 0.75, 0.0, 1.0], 'label': 'UNEVEN'}
+
+    def _on_terrain_details(self, msg):
+        """The classifier's rugged / non_rugged answer for the tile being looked at; used when no kind was named."""
+        label = self._terrain_label
+        if label is None or label in self._terrain_seen or self.now() < self._terrain_after:
+            return
+        try:
+            details = json.loads(msg.data)
+        except ValueError:
+            return
+        state = details.get('candidate', details.get('terrain'))      # this frame's answer, not the held label
+        if state == 'rugged':
+            self.tiles.set_terrain(label, {'kind': 'uneven', 'source': 'terrain_type', 'marker': self.UNEVEN_MARKER})
+            self.get_logger().info(f'Tile {label}: terrain UNEVEN (rugged, no finer kind yet).')
+            self.event('terrain', tile=label, terrain='uneven', info={'source': 'terrain_type'})
+            self._publish_terrain_markers()
+            self._terrain_seen.add(label)
+        elif state == 'non_rugged':
+            self.tiles.set_terrain(label, {'kind': 'flat', 'source': 'terrain_type', 'marker': {'style': 'none'}})
+            self._terrain_seen.add(label)
+
+    def _on_terrain_kind(self, msg):
+        label = self._terrain_label
+        try:
+            result = json.loads(msg.data)
+        except ValueError:
+            return
+        if label is None or result.get('kind') in (None, 'unknown') or self.now() < self._terrain_after:
+            return
+        self._terrain_seen.add(label)
+        if self.tiles.set_terrain(label, result):
+            self.get_logger().info(f'Tile {label}: terrain {result["kind"].upper()} '
+                                   f'(spread {result.get("spread_median_m")} m, cells {result.get("n_cells")}).')
+            self.event('terrain', tile=label, terrain=result['kind'], info={k: v for k, v in result.items()
+                                                                          if k not in ('marker', 'kind')})
+        self._publish_terrain_markers()
 
     def _on_tile_reached(self, tile, pose, source):
         label = T.tile_label(tile)
@@ -619,6 +805,70 @@ class MissionManager(Node):
         self.marker_pub.publish(MarkerArray(markers=self.text_markers))
 
     # ===================================================== RViz
+    def _publish_terrain_markers(self):
+        """Each tile drawn in the marker style its terrain kind has in the classifier's config (solid / hatch)."""
+        tg = self.tiles.grid
+        if tg is None:
+            return
+        stamp = self.get_clock().now().to_msg()
+        markers = [Marker(action=Marker.DELETEALL)]
+        c, sn = math.cos(tg.yaw), math.sin(tg.yaw)
+        hatch_m = 0.12
+        for label, res in self.tiles.terrain.items():
+            mk = dict(res.get('marker') or {})
+            if mk.get('style', 'none') not in ('solid', 'hatch'):
+                # debugging: a tile classified as plain ground is still drawn (faint solid + kind label)
+                mk = {'style': 'solid', 'color': self.TERRAIN_DEBUG_COLOURS.get(res.get('kind'), [0.6, 0.6, 0.6, 0.2]),
+                      'label': str(res.get('kind', '?')).upper()}
+            res = dict(res, marker=mk)
+            style = mk['style']
+            i, j = (int(v) for v in label.split(','))
+            cx, cy = tg.center((i, j))
+            r, g, b, a = (float(v) for v in (list((res['marker']).get('color') or [1.0, 1.0, 1.0, 0.5]) + [1.0] * 4)[:4])
+            base = (i + 500) * 3000 + (j + 500) * 3
+            if style == 'solid':
+                m = Marker()
+                m.type, m.id = Marker.CUBE, base
+                m.pose.position.x, m.pose.position.y, m.pose.position.z = cx, cy, 0.03
+                m.pose.orientation.z, m.pose.orientation.w = math.sin(tg.yaw / 2), math.cos(tg.yaw / 2)
+                m.scale.x = m.scale.y = 0.96 * tg.size
+                m.scale.z = 0.02
+            else:                                                     # hatch: outline + diagonal lines
+                m = Marker()
+                m.type, m.id = Marker.LINE_LIST, base + 2
+                m.pose.orientation.w = 1.0
+                m.scale.x = 0.012
+                half = 0.48 * tg.size
+
+                def pt(lu, lv):
+                    q = type(m.pose.position)()
+                    q.x, q.y, q.z = cx + c * lu - sn * lv, cy + sn * lu + c * lv, 0.04
+                    return q
+                corners = [(-half, -half), (half, -half), (half, half), (-half, half)]
+                for q in range(4):
+                    m.points += [pt(*corners[q]), pt(*corners[(q + 1) % 4])]
+                d = -2 * half + hatch_m
+                while d < 2 * half - 1e-6:
+                    u0, u1 = max(-half, -half - d), min(half, half - d)
+                    if u1 > u0:
+                        m.points += [pt(u0, u0 + d), pt(u1, u1 + d)]
+                    d += hatch_m
+            m.header.frame_id, m.header.stamp, m.ns, m.action = self.global_frame, stamp, 'terrain', Marker.ADD
+            m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, a
+            markers.append(m)
+            text = (res['marker']).get('label')
+            if text:
+                t = Marker()
+                t.header.frame_id, t.header.stamp, t.ns, t.action = self.global_frame, stamp, 'terrain', Marker.ADD
+                t.type, t.id = Marker.TEXT_VIEW_FACING, base + 1
+                t.pose.position.x, t.pose.position.y, t.pose.position.z = cx, cy, 0.25
+                t.pose.orientation.w = 1.0
+                t.scale.z = 0.14
+                t.color.r = t.color.g = t.color.b = t.color.a = 1.0
+                t.text = str(text)
+                markers.append(t)
+        self.terrain_marker_pub.publish(MarkerArray(markers=markers))
+
     def _publish_tile_markers(self):
         tg = self.tiles.grid
         stamp = self.get_clock().now().to_msg()

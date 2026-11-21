@@ -164,6 +164,21 @@ class TileExploration(Exploration):
                     self.strikes.pop(label, None)
                 else:
                     self.ctx.log('info', f'Tile {label}: no Nav2 path (strike {self.strikes[label]}/{limit}).')
+        if reachable and self.cfg.get('reject_via_other_tiles', True) and tiles.grid is not None:
+            # a tile that can only be reached THROUGH other tiles is not a choice: it comes up once the robot is next to it
+            here = {tuple(tiles.current)} if tiles.current else set()
+            here.add(tuple(tiles.grid.tile_of(pose[0], pose[1])))
+            tol = float(self.cfg.get('via_tile_tolerance_m', 0.15))
+            direct, via = [], []
+            for t in reachable:
+                goal = tuple(int(v) for v in t['tile'].split(','))
+                crossed = T.tiles_crossed(tiles.grid, t['path_xy'], tol) - here - {goal}
+                (via if crossed else direct).append((t, crossed))
+            if via:
+                self.ctx.log('info', 'Not chosen (path runs through other tiles): ' + ', '.join(
+                    f'{t["tile"]} via {"/".join(T.tile_label(c) for c in sorted(cr))}' for t, cr in via))
+                self.ctx.event('via_other_tiles', tiles=[t['tile'] for t, _ in via])
+            reachable = [t for t, _ in direct]
         if reachable and self.cfg.get('direct_path_only', True) and tiles.grid is not None and tiles.current:
             direct = [t for t in reachable if T.direct_path_through_shared_side(
                 tiles.grid, tiles.current, tuple(int(v) for v in t['tile'].split(',')), t['path_xy'])]

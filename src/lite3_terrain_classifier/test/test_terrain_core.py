@@ -172,3 +172,13 @@ def test_depth_decode_16uc1():
                           data=img.tobytes())
     out = depth_to_metres(msg)
     assert np.isnan(out[0, 0]) and out[0, 1] == pytest.approx(1.0) and out[1, 0] == pytest.approx(2.5)
+
+
+def test_depth_only_flat_cannot_leave_rugged():
+    depth_flat = tc.FusionResult(tc.NON_RUGGED, 'depth', False, None)
+    lidar_flat = tc.FusionResult(tc.NON_RUGGED, 'lidar+depth', True, True)
+    assert tc.vote(depth_flat, tc.RUGGED) is None                       # lidar blind: stay rugged
+    assert tc.vote(lidar_flat, tc.RUGGED) == tc.NON_RUGGED              # the lidar saw flat floor: leave rugged
+    assert tc.vote(depth_flat, tc.NON_RUGGED) == tc.NON_RUGGED          # not in rugged: unchanged
+    assert tc.vote(tc.FusionResult(tc.RUGGED, 'depth', False, None), tc.NON_RUGGED) == tc.RUGGED   # rugged is always trusted
+    assert tc.vote(depth_flat, tc.RUGGED, flat_needs_lidar=False) == tc.NON_RUGGED

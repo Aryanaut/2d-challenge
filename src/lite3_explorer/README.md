@@ -100,7 +100,7 @@ Arguments: `animation` and the optional overrides `pause_s`, `move_s`, `lean`, `
 2. **Adjacency**: keep the tiles that share a side with an explored (visited) tile. Each gets a level:
    `0` open side with the current tile, `1` open side with any visited tile, `2` touches a visited tile only across a
    wall, `3` touches none. Kept: level ≤ `max_adjacency` (default 2). If none qualifies, the rest are offered
-   (`fallback_any`), so the mission can't stall behind an eliminated tile.
+   (`fallback_any`, default off: neighbours that are only briefly "no path" must not make the robot jump to a non-adjacent tile).
 3. **Reachability**: Nav2 plans a path to each. Tiles without a path are dropped and get a strike; after
    `eliminate_after` (2) strikes in a row a tile is eliminated. Strikes are only given when some other tile did get a
    path, so a planner failing from where the robot stands (stuck in an inflated wall) eliminates nothing — that goes
@@ -155,6 +155,25 @@ Launch arguments are the same as before (`use_slam`, `use_nav2`, `use_terrain`, 
 `server_url`, ...), plus `mission_params:=<yaml>`, `auto_start:=true|false`, `use_mission:=false` and
 `quickscan_on_edge:=true` (see [Robot animations](#robot-animations)).
 `mission_only.launch.py` skips odom TF, cloud→scan, SLAM and Nav2 for robots that already run them.
+
+### Local controller: pure pursuit or holonomic MPPI
+
+`controller:=rpp` (default) uses Nav2's regulated pure pursuit (`config/nav2_params.yaml`): it only drives forward
+(vx) and turns (wz). `controller:=mppi` uses Nav2's **MPPI** controller with the **Omni** (holonomic) motion model
+(`config/nav2_params_mppi.yaml`): it also commands sideways speed vy, so the robot can strafe along a path and turn while
+moving (the Lite3 takes vx, vy and wz on `/cmd_vel`).
+
+```bash
+ros2 launch lite3_explorer exploration.launch.py controller:=mppi
+```
+
+The MPPI file differs from `nav2_params.yaml` only in `controller_server`: the `FollowPath` block, the
+`min_y_velocity_threshold` (0.001, so vy is not thrown away) and the velocity smoother's vy limits (0.3 m/s). Main knobs
+in `FollowPath`: `vx_max` / `vy_max` / `wz_max` (speed limits), `batch_size` (sampled trajectories per cycle; lower it
+if the controller misses its 10 Hz rate), `time_steps` x `model_dt` (the horizon; `model_dt` must equal the controller
+period, 0.1 s), the critic weights (`PathAlignCritic` / `PathFollowCritic` keep it on the path, `CostCritic` keeps it
+off walls using the body footprint, `GoalCritic` / `GoalAngleCritic` shape the arrival). `visualize: true` publishes the
+sampled and the chosen trajectories on `/trajectories` for RViz. Use another file with `nav2_params:=/path/file.yaml`.
 
 Commands while it runs:
 ```bash
@@ -234,6 +253,7 @@ missions in simulated corridors and rooms, including a fake lidar that reveals t
 | File | Role |
 |---|---|
 | `mission_manager.py` | The ROS node: TF, maps, costmaps, Nav2 spin / planner clients, tile reports, RViz, services. It is the `ctx` the modes use. |
+| `config/nav2_params_mppi.yaml` | Nav2 parameters with the holonomic MPPI local controller (`controller:=mppi`). |
 | `nav2_traversal.py` | `nav2_pose` and `nav2_route` traversal types. |
 | `mission/core.py` | `Mode`, `Transition`, `ModeMachine` (switching, stuck supervisor, end-condition checks). |
 | `mission/modes.py` | `idle`, `scanning`, `exploring`, `quickscan`, `recovery`, `complete`. |

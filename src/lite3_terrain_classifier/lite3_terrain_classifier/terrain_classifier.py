@@ -8,7 +8,12 @@ Verification: Orbbec depth image (/camera/depth/image_raw). Only the bottom part
 frame is used (depth.roi_top_fraction), because the camera is pitched down and that part
 shows the ground just ahead of the robot.
 
+Slats are found with Hough line transforms on the depth and colour images (slat_lines.py).
+
 Output: /terrain_type (std_msgs/String, latched): "rugged", "non_rugged" or "unknown".
+/terrain_kind (JSON, latched): the terrain KIND of the floor around the robot (flat / uneven / slats / ...) from the
+configurable strategies in terrain_kinds.py (config/terrain_kinds.yaml). It knows nothing about tiles: whoever calls
+~/classify (the explorer, when it looks at a tile) matches the answer to the place it was looking at via "seq".
 Details for tuning: ~/details (JSON string), ~/lidar_points and ~/depth_points
 (PointCloud2, intensity = height above the fitted ground plane in metres).
 
@@ -19,21 +24,27 @@ remote (manual) or by Nav2 / the frontier explorer (auto). Pause it with
 from collections import deque
 from dataclasses import fields
 import json
+import os
 
+import cv2
 import numpy as np
+import yaml
+from ament_index_python.packages import get_package_share_directory
 import rclpy
 import rclpy.executors
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2, PointField
 from std_msgs.msg import Header, String
 from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from lite3_terrain_classifier import terrain_core as tc
-from lite3_terrain_classifier.msg_utils import cloud_to_xyz, depth_to_metres, xyzi_cloud
+from lite3_terrain_classifier.terrain_kinds import KindClassifier
+from lite3_terrain_classifier import slat_lines
+from lite3_terrain_classifier.msg_utils import cloud_to_xyz, depth_to_metres, image_to_gray8, xyzi_cloud
 
 # Per-sensor defaults that differ from RoughnessParams (the depth camera is noisier with range).
 LIDAR_DEFAULTS = {}
@@ -54,6 +65,7 @@ class TerrainClassifier(Node):
         if self.fusion_mode not in tc.FUSION_MODES:
             raise ValueError(f'fusion_mode must be one of {tc.FUSION_MODES}')
         self.depth_fallback = p('depth_fallback', True)
+        self.flat_needs_lidar = p('flat_needs_lidar', True)     # a depth-only flat reading cannot leave RUGGED
         self.use_depth = p('use_depth', True)
         self.publish_debug_clouds = p('publish_debug_clouds', True)
         self.enabled = p('start_enabled', True)
@@ -87,6 +99,14 @@ class TerrainClassifier(Node):
         self.depth_box = self._box('depth', (0.0, 2.5), (-1.5, 1.5), (-1.0, 0.4))
         self.depth_params = self._roughness('depth', DEPTH_DEFAULTS)
 
+        # ---- colour camera (only for the slats lines) ----
+        self.use_color = p('use_color', True)
+        self.color_topic = p('color.image_topic', '/camera/color/image_raw')
+        # the camera often only publishes the compressed colour image: both topics are listened to
+        self.color_compressed_topic = p('color.compressed_topic', self.color_topic + '/compressed')
+        self.color_max_age_s = p('color.max_age_s', 1.0)
+        self.color_msg, self.color_recv_s, self.color_seen = None, None, None
+
         # ---- state ----
         self.rng = np.random.default_rng(0)
         self.clouds = deque()           # (recv_s, frame, points)
@@ -104,10 +124,20 @@ class TerrainClassifier(Node):
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.terrain_pub = self.create_publisher(String, self.terrain_topic, latched)
         self.details_pub = self.create_publisher(String, '~/details', 10)
+        self.kind_pub = self.create_publisher(String, '/terrain_kind', latched)
+        # debug: what the Hough line detection sees (only computed while someone subscribes)
+        self.slats_depth_pub = self.create_publisher(Image, '~/slats_depth_debug', 2)
+        self.slats_color_pub = self.create_publisher(Image, '~/slats_color_debug', 2)
+        self.slats_json_pub = self.create_publisher(String, '~/slats_detections', 10)
         self.lidar_dbg_pub = self.create_publisher(PointCloud2, '~/lidar_points', 2)
         self.depth_dbg_pub = self.create_publisher(PointCloud2, '~/depth_points', 2)
 
         self.create_subscription(PointCloud2, self.cloud_topic, self._on_cloud, qos_profile_sensor_data)
+        if self.use_color:
+            self.create_subscription(Image, self.color_topic, self._on_color, qos_profile_sensor_data)
+            if self.color_compressed_topic:
+                self.create_subscription(CompressedImage, self.color_compressed_topic, self._on_color_compressed,
+                                         qos_profile_sensor_data)
         if self.use_depth:
             self.create_subscription(Image, self.depth_topic, self._on_depth, qos_profile_sensor_data)
             self.create_subscription(CameraInfo, self.info_topic, self._on_info, qos_profile_sensor_data)
@@ -115,9 +145,22 @@ class TerrainClassifier(Node):
         self.create_service(Trigger, '~/classify', self._on_classify)
         self.create_timer(1.0 / max(rate_hz, 0.1), self._tick)
 
+        # terrain kinds (strategies): which kind of floor is this? independent of any tile grid
+        self.kinds_enabled = p('kinds.enabled', True)
+        self.kinds_window_s = p('kinds.window_s', 5.0)       # continuous mode: start a new patch this often
+        kinds_file = p('kinds_file', '') or os.path.join(
+            get_package_share_directory('lite3_terrain_classifier'), 'config', 'terrain_kinds.yaml')
+        with open(kinds_file, encoding='utf-8') as fh:
+            self.kinds = KindClassifier(yaml.safe_load(fh) or {})
+        self.kinds_seq = 0                      # counts triggers: a result belongs to the trigger with this number
+        self.kinds_started_s = self._now_s()
+        self.kind_last = None
+        self.get_logger().info(f'Terrain kinds from {kinds_file}: {[s.name for s in self.kinds.strategies]}')
+
         self._publish_label(tc.UNKNOWN)
         if self.trigger_mode:
             self.active_until_s = self._now_s() + self.trigger_duration_s
+            self._new_patch()
         self.get_logger().info(
             f'{"TRIGGERED (service ~/classify)" if self.trigger_mode else "continuous"}: '
             f'Lidar {self.cloud_topic} (primary), depth {self.depth_topic if self.use_depth else "off"} '
@@ -166,14 +209,35 @@ class TerrainClassifier(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _new_patch(self):
+        """Start collecting a new patch of floor for the terrain kind."""
+        self.kinds.reset()
+        self.kinds_seq += 1
+        self.kinds_started_s = self._now_s()
+        self.kind_last = None
+
     def _on_classify(self, request, response):
         if self.trigger_mode:
             self.active_until_s = self._now_s() + self.trigger_duration_s
+            self._new_patch()
             response.message = f'classifying for {self.trigger_duration_s:g} s'
         else:
             response.message = 'continuous mode: already classifying'
         response.success = True
         return response
+
+    def _on_color_compressed(self, msg):
+        """JPEG / PNG colour frame -> an Image-like record the rest of the code understands (grey only)."""
+        img = cv2.imdecode(np.frombuffer(bytes(msg.data), np.uint8), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return
+        out = Image(header=msg.header, height=img.shape[0], width=img.shape[1], encoding='mono8', is_bigendian=0,
+                    step=img.shape[1], data=img.tobytes())
+        self._on_color(out)
+
+    def _on_color(self, msg):
+        self.color_msg = msg
+        self.color_recv_s = self._now_s()
 
     def _on_info(self, msg):
         self.camera_info = msg
@@ -296,7 +360,7 @@ class TerrainClassifier(Node):
         depth, depth_dbg = self._assess_depth(now_s)
         fused = tc.fuse(lidar, depth, self.fusion_mode, self.depth_fallback)
         previous = self.debounce.state
-        state = self.debounce.update(fused.label)
+        state = self.debounce.update(tc.vote(fused, previous, self.flat_needs_lidar))
         self._publish_label(state)
 
         if state != previous:
@@ -312,6 +376,7 @@ class TerrainClassifier(Node):
             self.get_logger().info(f'Lidar says {lidar.label}, depth camera says {depth.label}',
                                    throttle_duration_sec=2.0)
 
+        self._update_kind(lidar_dbg, now_s)
         details = {
             'terrain': state, 'candidate': fused.label, 'source': fused.source,
             'verified': fused.verified, 'sensors_agree': fused.agree,
@@ -322,6 +387,61 @@ class TerrainClassifier(Node):
         if self.publish_debug_clouds:
             self._publish_debug(self.lidar_dbg_pub, lidar_dbg)
             self._publish_debug(self.depth_dbg_pub, depth_dbg)
+
+    def _update_kind(self, lidar_dbg, now_s):
+        """Feed this assessment's floor points to the kind strategies; publish the kind when it changes."""
+        if not self.kinds_enabled:
+            return
+        if not self.trigger_mode and now_s - self.kinds_started_s > self.kinds_window_s:
+            self._new_patch()
+        if lidar_dbg is not None and len(lidar_dbg[1]):          # lidar floor cells (may be missing: images still count)
+            _frame, used, res = lidar_dbg
+            fixed = None
+            to_odom = self._lookup(self.odom_frame, self.base_frame) if self.odom_frame else None
+            if to_odom:
+                fixed = tc.transform_points(used, *to_odom)[:, :2]
+            self.kinds.add(used[:, :2], res, fixed)
+        self._feed_images(now_s)
+        result = self.kinds.classify()
+        key = (result['kind'], result.get('n_cells', 0) // 25)       # republish as the evidence grows
+        if key != self.kind_last:
+            self.kind_last = key
+            if result['kind'] != 'unknown':
+                self.get_logger().info(f'Terrain kind: {result["kind"].upper()} {result}')
+            self.kind_pub.publish(String(data=json.dumps(dict(result, seq=self.kinds_seq))))
+
+    def _add_image(self, camera, gray, pub, header):
+        """Run the slat lines on one frame; publish the annotated picture and the counts for debugging."""
+        watch = pub.get_subscription_count() > 0 or self.slats_json_pub.get_subscription_count() > 0
+        out = self.kinds.add_image(camera, gray, debug=watch)
+        if not watch:
+            return
+        res, picture = out
+        if pub.get_subscription_count() > 0:
+            pub.publish(Image(header=header, height=picture.shape[0], width=picture.shape[1], encoding='bgr8',
+                              is_bigendian=0, step=picture.shape[1] * 3, data=picture.tobytes()))
+        self.slats_json_pub.publish(String(data=json.dumps(dict(res, camera=camera, frames=len(self.kinds.images[camera])))))
+
+    def _feed_images(self, now_s):
+        """Depth and colour frame (each only once) -> Hough lines for the slats strategy."""
+        if self.depth_msg is not None and self.use_depth and now_s - self.depth_recv_s <= self.depth_max_age_s \
+                and self.depth_msg is not getattr(self, 'depth_seen', None):
+            self.depth_seen = self.depth_msg
+            try:
+                depth = depth_to_metres(self.depth_msg, self.mm_scale)
+                # no depth (0 / NaN) between the slats shows as a dark streak: keep it dark
+                gray = slat_lines.to_gray8(np.nan_to_num(depth, nan=0.0))
+                self._add_image('depth', gray, self.slats_depth_pub, self.depth_msg.header)
+            except ValueError as exc:
+                self.get_logger().warn(f'depth image for slats: {exc}', throttle_duration_sec=10.0)
+        if self.color_msg is not None and self.use_color and now_s - self.color_recv_s <= self.color_max_age_s \
+                and self.color_msg is not self.color_seen:
+            self.color_seen = self.color_msg
+            try:
+                self._add_image('color', slat_lines.to_gray8(image_to_gray8(self.color_msg)), self.slats_color_pub,
+                                self.color_msg.header)
+            except ValueError as exc:
+                self.get_logger().warn(f'colour image for slats: {exc}', throttle_duration_sec=10.0)
 
     def _publish_label(self, label):
         self.terrain_pub.publish(String(data=label))

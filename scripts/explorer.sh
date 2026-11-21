@@ -15,6 +15,10 @@
 # Usage:
 #   ./explorer.sh                    start (or re-attach to) the session
 #   ./explorer.sh --scan             (alias --quickscan) run the quickscan animation (lean, look left/right) on every tile edge
+#   ./explorer.sh --curtains         detect hanging curtains (depth camera, low rate); one along the current tile's edge is squared
+#                                    up to and walked through with forward commands, then exploring goes on
+#   ./explorer.sh --images           with --bag: also record the depth and (compressed) colour camera images, so the slats
+#                                    detection can be replayed offline (large)
 #   ./explorer.sh --bag [bagname]    also record a rosbag to bags/<bagname>_DD_MM_HHMMSS (default bagname: explorer)
 #   ./explorer.sh stop               Ctrl-C the launch, stop the bag, close the session
 #   Ctrl-b d / closing the session   same as stop; every process started from the session is killed
@@ -23,6 +27,7 @@
 #   SERVER_URL, GROUP_ID, LAUNCH_ARGS, WS (default ~/2d), ROS_DISTRO, SESSION (default explorer),
 #   ROS_SETUP, ATTACH (0 = detached), RVIZ_CONFIG (default scripts/explorer_debug.rviz),
 #   BAG_TOPICS  extra topics to record, space separated
+#   CLOUD_TOPIC lidar pointcloud recorded in every bag (default /livox/points)
 set -euo pipefail
 
 SESSION="${SESSION:-explorer}"
@@ -37,19 +42,22 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 RVIZ_CONFIG="${RVIZ_CONFIG:-$HERE/explorer_debug.rviz}"
 BAG_DIR="$WS/bags"
 BAG_TOPICS="${BAG_TOPICS:-}"
+CLOUD_TOPIC="${CLOUD_TOPIC:-/livox/points}"     # raw lidar cloud, always recorded (terrain / floor analysis)
 
 SOURCE="export EXPLORER_TAG=$SESSION; source $ROS_SETUP && source $WS/install/setup.bash"
 LATCHED="--qos-durability transient_local --qos-reliability reliable"
 
 # Everything needed to replay the exploration decisions: map, tiles, plans, goals, mode, commands, TF.
-DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /spin_crawl /spin_flat
-/exploration_complete /tile_map /tile_report /llm/last_result
+DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
+/exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /mission_manager/route /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
+/mission_manager/next_target /mission_manager/route /curtain/points /curtain/markers /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
 
 BAG=0
 BAG_NAME=""
 QUICKSCAN=0
+IMAGES=0
+CURTAINS=0
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,6 +65,8 @@ while [[ $# -gt 0 ]]; do
             BAG=1
             if [[ $# -gt 1 && "$2" != -* && "$2" != stop ]]; then BAG_NAME="$2"; shift; fi ;;
         --quickscan|--scan) QUICKSCAN=1 ;;
+        --images) IMAGES=1 ;;
+        --curtains) CURTAINS=1 ;;
         --bag=*) BAG=1; BAG_NAME="${1#--bag=}" ;;
         *) ARGS+=("$1") ;;
     esac
@@ -128,8 +138,10 @@ LAUNCH="ros2 launch lite3_explorer exploration.launch.py"
 [[ -n "$SERVER_URL" ]] && LAUNCH+=" server_url:=$SERVER_URL"
 [[ -n "$GROUP_ID" ]] && LAUNCH+=" group_id:=$GROUP_ID"
 [[ $QUICKSCAN == 1 ]] && LAUNCH+=" quickscan_on_edge:=true"
+[[ $CURTAINS == 1 ]] && LAUNCH+=" use_curtains:=true"
 [[ -n "$LAUNCH_ARGS" ]] && LAUNCH+=" $LAUNCH_ARGS"
 
+[[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS /camera/depth/image_raw /camera/color/image_raw/compressed"
 if [[ $BAG == 1 ]]; then
     BAG_NAME="${BAG_NAME:-explorer}_$(date +%d_%m_%H%M%S)"     # name_DD_MM_HHMMSS
     BAG_NAME="${BAG_NAME//\//_}"          # a name, not a path: it always lands under bags/
@@ -147,6 +159,16 @@ style_window() {
     tmux set-option -w -t "$1" pane-border-status top
     tmux set-option -w -t "$1" pane-border-format " #{pane_title} "
 }
+
+# ---- refuse to start on top of a stack that is still shutting down ------------------------------------
+# A second launch next to a dying one gives two slam_toolbox / Nav2 stacks on the same TF tree (map->odom stops,
+# "extrapolation into the past", "Invalid frame ID odom"). Nav2 can take ~50 s to die after Ctrl-C.
+LEFT="$(bash -c "$SOURCE; ros2 node list 2>/dev/null" | grep -E '^/(slam_toolbox|planner_server|controller_server|bt_navigator|behavior_server|mission_manager|odom_tf_bridge)$' | sort -u | tr '\n' ' ' || true)"
+if [[ -n "$LEFT" ]]; then
+    echo "Nodes of a previous run are still alive: $LEFT" >&2
+    echo "Wait for them to exit (or: pkill -INT -f nav2; ./explorer.sh stop), then start again." >&2
+    exit 1
+fi
 
 # ---- Lite3 into auto mode, before anything is started ---------------------
 # Same command as the lite3_auto alias in ~/.bashrc. Without it the robot ignores /cmd_vel.

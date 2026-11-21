@@ -10,6 +10,9 @@ Rules:
     keeps the rugged gait until it is fully past the step.
   * UNKNOWN (no sensor data, classifier paused) keeps the current gait.
   * Two commands are never sent closer together than min_switch_interval_s.
+  * EVENT-DRIVEN: the gait is only changed after arm() (the robot starts for a new tile, or a hold such as the spin
+    ended and the terrain gait must come back) or when the terrain label changes (a new terrain was classified).
+    Between those events the gait is left alone, whatever the label says.
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -54,6 +57,15 @@ class TerrainGaitSwitcher:
         self.terrain_since: Optional[float] = None
         self.gait: Optional[str] = None          # last gait sent (None = nothing sent yet)
         self.last_sent_at: Optional[float] = None
+        self.armed = False                       # a switch is allowed (see the module docstring)
+
+    def arm(self):
+        """Allow the next switch: the robot is attempting a new tile."""
+        self.armed = True
+
+    def restore(self):
+        """A hold (spin gait, animation) ended: forget the gait sent and bring the terrain gait back."""
+        self.gait, self.armed = None, True
 
     def update_terrain(self, label: str, now: float) -> bool:
         """Feed a /terrain_type label. Returns True when the terrain state changed."""
@@ -61,6 +73,7 @@ class TerrainGaitSwitcher:
         if terrain == self.terrain:
             return False
         self.terrain, self.terrain_since = terrain, now
+        self.armed = True                        # a new terrain was classified
         return True
 
     def desired_gait(self, now: float) -> Optional[str]:
@@ -76,12 +89,19 @@ class TerrainGaitSwitcher:
 
     def pending_command(self, now: float) -> Optional[GaitCommand]:
         """The command to send now, or None. Call mark_sent() after publishing it."""
+        if not self.armed:
+            return None
         gait = self.desired_gait(now)
-        if gait is None or gait == self.gait:
+        if gait is None:
+            if self.terrain != FLAT:             # nothing to apply (terrain unknown); flat: still waiting out flat_delay_s
+                self.armed = False
+            return None
+        if gait == self.gait:
+            self.armed = False
             return None
         if self.last_sent_at is not None and now - self.last_sent_at < self.min_switch_interval_s:
             return None
         return GaitCommand(gait, GAIT_CODES[gait])
 
     def mark_sent(self, command: GaitCommand, now: float):
-        self.gait, self.last_sent_at = command.gait, now
+        self.gait, self.last_sent_at, self.armed = command.gait, now, False

@@ -43,3 +43,37 @@ def test_min_interval_between_commands():
     s.mark_sent(s.pending_command(0.0), 0.0)
     s.update_terrain('non_rugged', 0.1)
     assert s.pending_command(0.2) is None           # too soon after the last command
+
+
+def test_gait_only_changes_on_a_new_tile_or_a_new_terrain():
+    s = TerrainGaitSwitcher(flat_delay_s=0.0, min_switch_interval_s=0.0)
+    s.update_terrain('rugged', 0.0)
+    s.mark_sent(s.pending_command(0.0), 0.0)                 # new terrain classified -> rug_general
+    assert s.pending_command(1.0) is None and not s.armed     # nothing more happens by itself
+    s.gait = 'flat_medium'                                    # (something else changed the gait)
+    assert s.pending_command(5.0) is None                     # ... and it is left alone: no event
+    s.arm()                                                   # the robot attempts a new tile
+    cmd = s.pending_command(6.0)
+    assert cmd and cmd.gait == 'rug_general'                  # the terrain gait is applied then
+    s.mark_sent(cmd, 6.0)
+    assert s.pending_command(7.0) is None
+
+
+def test_same_terrain_again_does_not_switch_and_a_finished_hold_restores():
+    s = TerrainGaitSwitcher(flat_delay_s=0.0, min_switch_interval_s=0.0)
+    s.update_terrain('non_rugged', 0.0)
+    s.mark_sent(s.pending_command(0.0), 0.0)
+    assert s.update_terrain('non_rugged', 1.0) is False and s.pending_command(1.0) is None
+    s.arm()
+    assert s.pending_command(2.0) is None and not s.armed     # already in the right gait: nothing to send
+    s.restore()                                               # the spin's crawl hold ended
+    cmd = s.pending_command(3.0)
+    assert cmd and cmd.gait == 'flat_medium'
+
+
+def test_unknown_terrain_keeps_the_gait_and_disarms():
+    s = TerrainGaitSwitcher(min_switch_interval_s=0.0)
+    s.update_terrain('rugged', 0.0)
+    s.mark_sent(s.pending_command(0.0), 0.0)
+    s.update_terrain('unknown', 1.0)
+    assert s.pending_command(1.0) is None and not s.armed

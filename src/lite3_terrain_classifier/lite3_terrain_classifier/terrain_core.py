@@ -309,6 +309,17 @@ def fuse(lidar: Optional[TerrainAssessment], depth: Optional[TerrainAssessment],
     return FusionResult(UNKNOWN, 'none', False, None)
 
 
+def vote(fused: FusionResult, state: str, flat_needs_lidar: bool = True) -> Optional[str]:
+    """The label to feed the debouncer for this tick (None = no vote).
+
+    Going from rugged to flat is the risky direction (the flat gait on rough ground). When the lidar had too few cells and
+    the depth camera alone (unverified, `source == 'depth'`) says flat, that is not enough to leave RUGGED: no vote, so
+    the state stays rugged until the lidar sees the floor again."""
+    if flat_needs_lidar and state == RUGGED and fused.label == NON_RUGGED and fused.source == 'depth':
+        return None
+    return fused.label
+
+
 class Debouncer:
     """Only switch state after the same new label has been seen `confirm` times in a row."""
 

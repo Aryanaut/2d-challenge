@@ -391,7 +391,7 @@ def nearest_tile_centres(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles: 
                          robot_xy: Sequence[float], *, statuses=('visited', 'to_visit'), limit: int = 5,
                          min_distance_m: float = 0.0, min_clearance_m: float = 0.25,
                          occupied_threshold: int = 65, free_threshold: int = 25,
-                         exclude: Sequence[Tile] = ()) -> List[dict]:
+                         exclude: Sequence[Tile] = (), adjacent_to: Optional[Tile] = None) -> List[dict]:
     """Recovery targets: walkable tiles ordered by the straight-line distance from the robot to their centre.
 
     The goal is the tile centre itself when it is free and clear of walls, else the clear free point nearest
@@ -402,6 +402,12 @@ def nearest_tile_centres(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles: 
     dist = clearance_map(grid, info, occupied_threshold)
     free = (grid >= 0) & (grid <= free_threshold)
     excluded = set(map(tuple, exclude))
+    if adjacent_to is not None:
+        # only the robot's own tile and the tiles sharing a side with it: anything else (diagonal, further away)
+        # can only be reached THROUGH another tile
+        near = {tuple(adjacent_to)} | {(adjacent_to[0] + di, adjacent_to[1] + dj)
+                                      for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1))}
+        excluded |= {t for t in tiles if t not in near}
     order = sorted((t for t, d in tiles.items() if d.get('status') in statuses and t not in excluded),
                    key=lambda t: math.dist(tg.center(t), robot_xy))
     out = []
@@ -411,15 +417,17 @@ def nearest_tile_centres(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles: 
             continue
         gx, gy, clearance = point
         d = math.dist((gx, gy), robot_xy)
-        if d < min_distance_m:
-            continue
+        if d < min_distance_m and not (adjacent_to is not None and tile == tuple(adjacent_to)):
+            continue        # already there (the robot's own tile is kept: recovery stays in the tile it stands in)
         cx, cy = tg.center(tile)
         out.append({'tile': tile_label(tile), 'goal_xy': [round(gx, 3), round(gy, 3)],
                     'centre_xy': [round(cx, 3), round(cy, 3)], 'distance_m': round(d, 2),
                     'clearance_m': round(clearance, 2), 'status': tiles[tile].get('status')})
-        if len(out) >= limit:
-            break
-    return out
+    # nearest by the distance to the point the robot will really drive to (the goal point moves off the centre when
+    # the centre is blocked), not to the tile centre
+    own = tile_label(tuple(adjacent_to)) if adjacent_to is not None else None
+    out.sort(key=lambda c: (c['tile'] != own, c['distance_m']))     # the tile the robot is in comes first
+    return out[:limit]
 
 
 # ------------------------------------------------------- adjacency to explored tiles
@@ -448,6 +456,20 @@ def direct_path_through_shared_side(tg: TileGrid, current: Tile, tile: Tile, pat
     edge = max(current[axis], tile[axis])
     sign = di + dj                                              # +1: the next tile is on the high side of the edge
     return (pts[0][axis] - edge) * sign < tol and (pts[-1][axis] - edge) * sign > 0
+
+
+def tiles_crossed(tg: TileGrid, path, tol_m: float = 0.15) -> set:
+    """Tiles a path (map-frame points) runs through. A point only counts for a tile when it is more than tol_m
+    inside it, so cutting a corner or hugging a shared side does not count."""
+    out = set()
+    for x, y in (p[:2] for p in path):
+        u, v = tg.to_local(x, y)
+        fu, fv = float(u) / tg.size, float(v) / tg.size
+        i, j = math.floor(fu), math.floor(fv)
+        inside = tg.size * min(fu - i, i + 1 - fu, fv - j, j + 1 - fv)
+        if inside > tol_m:
+            out.add((int(i), int(j)))
+    return out
 
 
 def adjacency_level(tiles: Dict[Tile, dict], tile: Tile, visited, current: Optional[Tile]) -> int:

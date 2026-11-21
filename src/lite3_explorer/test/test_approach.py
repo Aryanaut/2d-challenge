@@ -60,11 +60,11 @@ def test_always_three_waypoints_then_the_tile_centre():
         assert xs == sorted(xs) and len(set(xs)) == 4                 # in order along the path, all distinct
 
 
-def test_waypoints_skip_the_start_and_are_evenly_spaced():
-    r = A.default_route([[0.0, 0.0], [1.0, 0.0]], (1.0, 0.0), 0.0)    # a 1 m tile hop, 0.2 m skipped
+def test_waypoints_are_evenly_spaced_from_the_start():
+    r = A.default_route([[0.0, 0.0], [1.0, 0.0]], (1.0, 0.0), 0.0)    # equal 0.25 m gaps start -> wp -> goal
+    assert [round(x, 3) for x, _, _ in r] == [0.25, 0.5, 0.75, 1.0]
+    r = A.default_route([[0.0, 0.0], [1.0, 0.0]], (1.0, 0.0), 0.0, skip_start_m=0.2)   # optional skip
     assert [round(x, 2) for x, _, _ in r] == [0.4, 0.6, 0.8, 1.0]
-    r = A.default_route([[0.0, 0.0], [0.4, 0.0]], (0.4, 0.0), 0.0)    # short: skip capped at a quarter
-    assert [round(x, 3) for x, _, _ in r] == [0.175, 0.25, 0.325, 0.4]
     assert len(A.default_route([[0.0, 0.0], [1.0, 0.0]], (1.0, 0.0), 0.0, n=5)) == 6   # configurable
 
 

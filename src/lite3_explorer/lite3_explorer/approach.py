@@ -11,7 +11,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 Pose2 = Tuple[float, float, float]            # x, y, yaw (rad)
 N_WAYPOINTS = 3               # intermediate waypoints before the tile centre
-SKIP_START_M = 0.20           # waypoints are spread over the path AFTER this much of it (skips the start-up wiggle)
+SKIP_START_M = 0.0            # 0: waypoints and the goal are equally spaced from the path start (>0 skips the start-up wiggle, making the first gap longer)
 
 
 def _cumulative(points: Sequence[Sequence[float]]) -> List[float]:
@@ -160,6 +160,30 @@ def parse_route(extras: dict, path: Sequence[Sequence[float]], goal_xy: Sequence
 
 def route_json(route: Sequence[Pose2]) -> List[dict]:
     return [{'x': round(x, 3), 'y': round(y, 3), 'yaw_deg': round(math.degrees(yaw), 1)} for x, y, yaw in route]
+
+
+def filter_deviating(route: Sequence[Pose2], start_xy: Sequence[float],
+                     max_dev_m: float) -> Tuple[List[Pose2], List[str]]:
+    """Drop intermediate waypoints more than max_dev_m off the straight line from the start to the goal (the last
+    pose, the tile centre, is kept). Nav2 still plans between the kept poses, so walls are still driven round."""
+    if len(route) < 2 or max_dev_m <= 0:
+        return list(route), []
+    sx, sy = float(start_xy[0]), float(start_xy[1])
+    gx, gy, _ = route[-1]
+    dx, dy = gx - sx, gy - sy
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return list(route), []
+    kept, dropped = [], []
+    for i, (x, y, yaw) in enumerate(route[:-1], 1):
+        dev = abs(dx * (y - sy) - dy * (x - sx)) / length          # distance to the start->goal line
+        along = ((x - sx) * dx + (y - sy) * dy) / length           # position along it (<0 behind, >length beyond)
+        if dev > max_dev_m or along < 0.0 or along > length:
+            dropped.append(f'#{i} {dev:.2f} m off the straight line to the tile centre')
+            continue
+        kept.append((x, y, yaw))
+    kept.append(route[-1])
+    return kept, dropped
 
 
 def filter_route(route: Sequence[Pose2], start_xy: Sequence[float], min_sep_m: float = 0.15,

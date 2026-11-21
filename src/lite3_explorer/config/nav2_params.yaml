@@ -14,19 +14,19 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 10.0
+    controller_frequency: 5.0
     odom_topic: /odom
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 0.5
+    failure_tolerance: 3.0               # controller patience: seconds without a valid command before the goal is aborted
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"]
     controller_plugins: ["FollowPath"]
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.3
-      movement_time_allowance: 15.0
+      movement_time_allowance: 30.0
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -98,7 +98,7 @@ local_costmap:
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
+        cost_scaling_factor: 1.0
         # Minimum clearance from walls: the Spin behaviour checks this costmap, and a larger
         # inflation makes the walls of a 1 m tile look like collisions while turning.
         inflation_radius: 0.1
@@ -147,7 +147,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 1.0
-        inflation_radius: 0.3
+        inflation_radius: 0.25
       always_send_full_costmap: true
 
 planner_server:

@@ -6,7 +6,9 @@
 Subscribes /terrain_type (std_msgs/String, latched) and publishes a
 transfer_interfaces/MotionSimpleCMD {cmd_code, type: 0} on /simple_cmd, the same
 message the lite3_<gait> shell aliases send with `ros2 topic pub --once`.
-Switching rules (flat delay, minimum interval) live in terrain_gait.py.
+Switching rules (flat delay, minimum interval) live in terrain_gait.py. The gait only changes when the robot starts
+for a new tile (/mission_manager/next_target names a tile) or when a new terrain is classified (/terrain_type changes);
+a finished spin / animation brings the terrain gait back.
 """
 import rclpy
 from rclpy.node import Node
@@ -39,6 +41,8 @@ class GaitSwitcher(Node):
         self.repeats = int(p('command_repeats', 3))       # publishes per switch (a lone one can be lost)
         self.repeat_period_s = p('repeat_period_s', 0.3)
         self._burst = None                                # (MotionSimpleCMD, publishes left)
+        # the robot is attempting a new tile: a gait switch is allowed
+        self.create_subscription(String, p('target_topic', '/mission_manager/next_target'), self._on_target, latched)
         self.create_subscription(Bool, '/spin_crawl', self._on_crawl_hold, 10)
         self.create_subscription(Bool, '/spin_flat', self._on_flat_request, 10)
         self.animating = False                            # no gait commands while a robot animation runs
@@ -53,6 +57,10 @@ class GaitSwitcher(Node):
     def _on_terrain(self, msg):
         if self.switcher.update_terrain(msg.data, self._now()):
             self.get_logger().info(f'terrain: {msg.data}')
+
+    def _on_target(self, msg):
+        if msg.data.startswith('tile '):          # '(none)' = no target
+            self.switcher.arm()
 
     def _send(self, cmd, now):
         out = MotionSimpleCMD()
@@ -71,7 +79,7 @@ class GaitSwitcher(Node):
             self._send(GaitCommand('flat_crawl', GAIT_CODES['flat_crawl']), now)
         elif was_holding:
             # Release: the next tick restores the gait for the current terrain.
-            self.switcher.gait = None
+            self.switcher.restore()
 
     def _on_flat_request(self, msg):
         # Hold flat_slow for the opening spin: the terrain loop must not switch back until the reporter releases it.
@@ -81,12 +89,12 @@ class GaitSwitcher(Node):
             self._send(GaitCommand('flat_slow', GAIT_CODES['flat_slow']), self._now())
         elif self.crawl_hold and self.hold_gait == 'flat_slow':
             self.crawl_hold = False
-            self.switcher.gait = None                     # the next tick restores the gait for the current terrain
+            self.switcher.restore()                       # the next tick restores the gait for the current terrain
 
     def _on_animation(self, msg):
         was, self.animating = self.animating, bool(msg.data)
         if was and not self.animating:
-            self.switcher.gait = None                     # move mode is back: restore the terrain gait
+            self.switcher.restore()                       # move mode is back: restore the terrain gait
 
     def _repeat_burst(self, now):
         out, left, last = self._burst

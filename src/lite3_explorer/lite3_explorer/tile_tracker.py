@@ -18,14 +18,16 @@ from lite3_explorer.tile_reports import within_reach
 class TileTracker:
     def __init__(self, size_m: float = 1.0, reach_radius_m: float = 0.30, max_failures: int = 2,
                  on_reached: Optional[Callable[[tuple, list, str], None]] = None,
-                 on_enter: Optional[Callable[[tuple], None]] = None):
+                 on_enter: Optional[Callable[[tuple], None]] = None, min_known: float = 0.5):
         self.size_m = size_m
+        self.min_known = min_known           # share of a tile the lidar must have scanned before it becomes a tile
         self.reach_radius_m = reach_radius_m
         self.max_failures = max_failures     # 0 = never give up on a tile
         self.on_reached = on_reached                   # called (tile, pose, source) for every NEW tile reached
         self.on_enter = on_enter                       # called (tile) whenever the robot enters another tile
         self.grid = None                               # T.TileGrid
         self.init_info: Optional[dict] = None
+        self.terrain: Dict[str, dict] = {}              # tile label -> what the terrain classifier said about it
         self.start_wall = None                         # ((x, y), (x, y)): virtual wall behind the robot at the start
         self.tiles: Dict[tuple, dict] = {}
         self.trail: List[tuple] = []
@@ -62,16 +64,17 @@ class TileTracker:
                     'grid': T.TileGrid(pose[0] - half, pose[1] - half, 0.0, self.size_m)}
             how = 'no map'
         self.grid = cand['grid']
+        self.terrain = {}
         self.init_info = {'placement': cand['id'], 'kind': cand['kind'], 'how': how,
                           'grid': self.grid.as_dict(), 'map_sides': cand.get('sides', {})}
         start = self.grid.tile_of(pose[0], pose[1])
-        # virtual wall directly behind the robot: the robot is assumed to stand in the CENTRE of the start tile, so the
-        # wall is the tile-sized segment half a tile behind it, across its heading
+        # virtual wall along the BACK edge of the start tile: the side of the tile that faces away from the robot's
+        # (original) heading
         yaw = pose[2] if len(pose) > 2 else 0.0
-        hx, hy = math.cos(yaw), math.sin(yaw)
-        bx, by = pose[0] - 0.5 * self.size_m * hx, pose[1] - 0.5 * self.size_m * hy
-        h = 0.5 * self.size_m
-        self.start_wall = ((bx - h * hy, by + h * hx), (bx + h * hy, by - h * hx))
+        normals = {'E': 0.0, 'N': math.pi / 2, 'W': math.pi, 'S': -math.pi / 2}     # outward normals vs. the grid yaw
+        back = max(normals, key=lambda sd: math.cos(self.grid.yaw + normals[sd] - (yaw + math.pi)))
+        self.start_wall = self.grid.edge(start, back)
+        self.start_wall_side = back
         self.trail, self.trail_log = [], []
         self._visit(start, pose, 'start')
         self.update(force=True)
@@ -87,7 +90,7 @@ class TileTracker:
         self._classified_version = self._map_version
         self.version += 1
         grid, info = self._map
-        self.tiles = T.classify_tiles(grid, info, self.grid, self.trail)
+        self.tiles = T.classify_tiles(grid, info, self.grid, self.trail, min_known=self.min_known)
         for tile, t in self.tiles.items():
             if t['status'] != 'unknown':
                 t['sides'] = T.tile_sides(grid, info, self.grid, tile)
@@ -104,6 +107,13 @@ class TileTracker:
         if self.grid is not None and self._map is not None:
             segs += T.wall_edges(self._map[0], self._map[1], self.grid, self.tiles, min_fraction=min_fraction)
         return segs
+
+    def set_terrain(self, label: str, result: dict) -> bool:
+        """Store the terrain classifier's answer for a tile. True if the kind changed."""
+        changed = self.terrain.get(label, {}).get('kind') != result.get('kind')
+        self.terrain[label] = result
+        self.version += 1                      # republish the tile map
+        return changed
 
     def invalidate(self):
         self._classified_version = -1
@@ -190,14 +200,15 @@ class TileTracker:
 
     def recovery_targets(self, robot_xy, *, statuses=('visited', 'to_visit'), limit: int = 5,
                          min_distance_m: float = 0.25, min_clearance_m: float = 0.25,
-                         exclude: Sequence[str] = ()) -> List[dict]:
+                         exclude: Sequence[str] = (), adjacent_only: bool = False) -> List[dict]:
         if self.grid is None or self._map is None:
             return []
         grid, info = self._map
         excl = [tuple(int(v) for v in lab.split(',')) for lab in exclude]
         return T.nearest_tile_centres(grid, info, self.grid, self.tiles, robot_xy, statuses=statuses, limit=limit,
                                       min_distance_m=min_distance_m, min_clearance_m=min_clearance_m,
-                                      exclude=excl)
+                                      exclude=excl,
+                                      adjacent_to=self.grid.tile_of(robot_xy[0], robot_xy[1]) if adjacent_only else None)
 
     def tile_of(self, x, y):
         return self.grid.tile_of(x, y) if self.grid is not None else None
@@ -207,7 +218,8 @@ class TileTracker:
                 'current_tile': T.tile_label(self.current) if self.current else None,
                 'counts': self.counts(), 'trail': [T.tile_label(t) for t in self.trail],
                 'unreachable': dict(self.unreachable),
-                'tiles': {T.tile_label(k): v for k, v in sorted(self.tiles.items())}}
+                'tiles': {T.tile_label(k): (dict(v, terrain=self.terrain[T.tile_label(k)])
+                                       if T.tile_label(k) in self.terrain else v) for k, v in sorted(self.tiles.items())}}
 
 
 def distance(a, b) -> float:

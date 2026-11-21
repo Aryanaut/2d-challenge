@@ -97,7 +97,7 @@ class FakeTraversal(Traversal):
             x, y = g.to_world(i * g.size + 0.05, (j + 0.5) * g.size)
             self.ctx.pose_ = [x, y, 0.0]
             return TraversalResult(RUNNING)
-        if self.ctx.t - self.started >= 2:
+        if self.ctx.t - self.started >= getattr(self.ctx, 'drive_ticks', 2):
             self.ctx.pose_ = [self.goal[0], self.goal[1], 0.0]
             return TraversalResult(SUCCEEDED)
         return TraversalResult(RUNNING)
@@ -154,6 +154,13 @@ class FakeCtx:
 
     def gait_hold(self, kind):
         pass
+
+    # terrain classifier: asked for a tile; tiles in `unseen_tiles` give no answer
+    def classify_tile(self, label):
+        self.classified = getattr(self, 'classified', []) + [(label, list(self.pose_))]
+
+    def terrain_status(self, label):
+        return 'unseen' if label in getattr(self, 'unseen_tiles', set()) else 'seen'
 
     # robot animations: a fake animation_player that finishes 2 ticks after it starts
     def animation_play(self, name):
@@ -417,7 +424,7 @@ def test_unreachable_tiles_are_eliminated_after_strikes():
 
 
 def test_all_paths_failing_eliminates_nothing_and_recovers():
-    ctx, m = make({'modes.recovery.give_up_after': 0})
+    ctx, m = make({'modes.recovery.give_up_after': 0, 'modes.exploring.no_path_retries': 0})
     run(ctx, m, steps=6, until_complete=False)
     ctx.no_path = {'1,0', '2,0', '3,0'}
     ctx.stuck_tiles = {'1,0', '2,0', '3,0'}               # and recovery can't move into them either
@@ -486,7 +493,7 @@ def test_nav2_gets_three_waypoints_then_the_exact_tile_centre():
 
 
 def test_failed_goal_is_followed_by_a_different_tile():
-    ctx, m = make({'tiles.max_failures': 3, 'modes.exploring.scan_after_reach': False}, length_m=4.0)
+    ctx, m = make({'tiles.max_failures': 3, 'explorations.tiles.fallback_any': True, 'modes.exploring.scan_after_reach': False}, length_m=4.0)
     ctx.fail_tiles = {'1,0'}                               # the nearest tile always aborts
     run(ctx, m, steps=40, until_complete=False)
     tiles = [t for _, t in ctx.drives]
@@ -539,3 +546,39 @@ def test_no_quickscan_by_default():
     ctx, m = make()
     run(ctx, m)
     assert 'quickscan' not in modes_seen(m) and not getattr(ctx, 'played', [])
+
+
+def test_no_path_retries_before_recovery():
+    ctx, m = make({'modes.recovery.give_up_after': 0, 'modes.exploring.no_path_retries': 1,
+                   'modes.exploring.retry_period_s': 1.0})
+    run(ctx, m, steps=6, until_complete=False)
+    ctx.no_path = {'1,0', '2,0', '3,0'}
+    ctx.stuck_tiles = {'1,0', '2,0', '3,0'}
+    run(ctx, m, steps=40, until_complete=False)
+    assert any(k == 'retry' for k, _ in ctx.events)       # waited and retried first ...
+    assert 'recovery' in modes_seen(m)                     # ... then recovered
+
+
+def test_target_tile_is_classified_once_the_robot_points_at_it():
+    ctx, m = make({'modes.exploring.scan_after_reach': False}, length_m=4.0)
+    run(ctx, m, steps=40, until_complete=False)
+    asked = [lab for lab, _ in ctx.classified]
+    assert asked and asked[0] == ctx.drives[0][1]                # the tile chosen first is the one asked about
+    import math
+    lab, pose = ctx.classified[0]
+    i, j = (int(v) for v in lab.split(','))
+    gx, gy = ctx.tiles.grid.center((i, j))
+    off = abs(math.atan2(math.sin(math.atan2(gy - pose[1], gx - pose[0]) - pose[2]),
+                         math.cos(math.atan2(gy - pose[1], gx - pose[0]) - pose[2])))
+    assert off <= math.radians(20.0) + 1e-6
+
+
+def test_unseen_target_tile_is_dropped_for_another():
+    ctx, m = make({'modes.exploring.scan_after_reach': False}, length_m=4.0)
+    ctx.unseen_tiles = {'1,0'}                                   # the nearest tile's floor can't be seen
+    ctx.drive_ticks = 8
+    run(ctx, m, steps=60, until_complete=False)
+    assert any(k == 'target_unseen' for k, _ in ctx.events)
+    asked = [lab for lab, _ in ctx.classified]
+    assert asked.count('1,0') == 1                               # asked once, never in a loop
+    assert len(ctx.drives) > 1                                   # and the mission went on to other tiles

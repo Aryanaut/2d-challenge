@@ -29,6 +29,7 @@ class StuckDetector:
         self.history = deque()          # (t, x, y) while driving
         self.driving_since = None
         self.in_cost_since = None
+        self.trigger = None             # which trigger fired last: 'costmap' | 'no_motion'
 
     def update(self, now: float, pose: Optional[Sequence[float]], driving: bool,
                cost: Optional[int] = None) -> Optional[str]:
@@ -40,6 +41,7 @@ class StuckDetector:
                     self.in_cost_since = now
                 elif now - self.in_cost_since >= self.costmap_hold_s:
                     reason = f'in the global costmap obstacle zone (cost {cost}) for {now - self.in_cost_since:.0f} s'
+                    self.trigger = 'costmap'
             else:
                 self.in_cost_since = None
         if 'no_motion' in self.triggers:
@@ -57,4 +59,5 @@ class StuckDetector:
                     moved = max(math.hypot(x - x0, y - y0) for _, x, y in self.history)
                     if moved < self.min_motion_m:
                         reason = f'moved only {moved:.2f} m in {self.window_s:.0f} s while driving'
+                        self.trigger = 'no_motion'
         return reason

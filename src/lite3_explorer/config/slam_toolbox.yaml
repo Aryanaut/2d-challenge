@@ -14,14 +14,14 @@ slam_toolbox:
     mode: mapping
     use_sim_time: false
 
-    debug_logging: false
+    debug_logging: true
     throttle_scans: 1
     transform_publish_period: 0.02
     map_update_interval: 1.0
     resolution: 0.05
     max_laser_range: 1.7
-    minimum_time_interval: 0.3
-    transform_timeout: 0.2
+    minimum_time_interval: 0.2
+    transform_timeout: 1.0                  # map->odom is stamped scan_time + this; SLAM lags of up to ~1 s no longer make Nav2 "extrapolate into the future" (stalled the controller at ~3 Hz)
     tf_buffer_duration: 30.0
     stack_size_to_use: 40000000
     enable_interactive_mode: false
@@ -29,8 +29,11 @@ slam_toolbox:
     use_scan_matching: true
     use_scan_barycenter: true
     # Leg odometry drifts on uneven tiles: update often and trust scan matching
-    minimum_travel_distance: 0.2
-    minimum_travel_heading: 0.2
+    # minimum_travel_distance must be tiny: a scan is only integrated after the robot MOVED this far (heading alone did
+    # not trigger it in a bag replay), and the opening spin turns on the spot, so with 0.2 slam ignored every scan of
+    # the spin (map frozen). With 0.02 the map updates.
+    minimum_travel_distance: 0.02
+    minimum_travel_heading: 0.05
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1

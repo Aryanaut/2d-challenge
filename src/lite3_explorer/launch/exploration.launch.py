@@ -4,6 +4,8 @@ and (lite3_llm_tools) the AI client.
 Example:
   ros2 launch lite3_explorer exploration.launch.py server_url:=http://192.168.10.141:8000 group_id:=team7
   ros2 launch lite3_explorer exploration.launch.py use_ai:=false mission_params:=/path/to/my_mission.yaml
+  ros2 launch lite3_explorer exploration.launch.py controller:=mppi      # holonomic MPPI controller (vx, vy, wz)
+  ros2 launch lite3_explorer exploration.launch.py use_curtains:=true    # walk through curtains on tile edges
 """
 import os
 
@@ -17,6 +19,23 @@ from launch_ros.actions import Node
 
 PKG = 'lite3_explorer'
 LLM_ARGS = ('server_url', 'group_id', 'image_topic', 'prompt_file')
+
+
+def _nav2(context):
+    """Nav2 bringup with the parameter file of the chosen local controller (controller:=rpp | mppi)."""
+    if LaunchConfiguration('use_nav2').perform(context).lower() != 'true':
+        return []
+    controller = LaunchConfiguration('controller').perform(context).lower()
+    if controller not in ('rpp', 'mppi'):
+        raise RuntimeError(f"controller must be 'rpp' or 'mppi', not {controller!r}")
+    params = LaunchConfiguration('nav2_params').perform(context) or os.path.join(
+        get_package_share_directory(PKG), 'config', 'nav2_params_mppi.yaml' if controller == 'mppi' else 'nav2_params.yaml')
+    return [LogInfo(msg=f'Nav2 local controller: {controller.upper()} ({params})'),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(
+                    get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')),
+                launch_arguments={'params_file': params, 'use_sim_time': LaunchConfiguration('use_sim_time').perform(context),
+                                  'autostart': 'true'}.items())]
 
 
 def _llm_client(context):
@@ -45,6 +64,8 @@ def _mission_manager(context):
     edge = LaunchConfiguration('quickscan_on_edge').perform(context)
     if edge:
         params.append({'modes.exploring.quickscan_on_edge': edge.lower() == 'true'})
+    if LaunchConfiguration('use_curtains').perform(context).lower() == 'true':
+        params.append({'modes.exploring.curtains': True})
     auto = LaunchConfiguration('auto_start').perform(context)
     if auto:
         params.append({'modes.idle.auto_start': auto.lower() == 'true'})
@@ -87,8 +108,16 @@ def generate_launch_description():
                               description='true/false: leave idle by itself (empty = mission.yaml)'),
         DeclareLaunchArgument('quickscan_on_edge', default_value='',
                               description='true: stop on each tile edge and run the quickscan animation (empty = mission.yaml)'),
+        DeclareLaunchArgument('use_curtains', default_value='false',
+                              description='Optional: detect hanging curtains in the depth image (low rate); one along the '
+                                          "current tile's edge is squared up to and walked through with vx commands"),
+        DeclareLaunchArgument('curtain_params', default_value=cfg('curtain.yaml')),
         DeclareLaunchArgument('slam_params', default_value=cfg('slam_toolbox.yaml')),
-        DeclareLaunchArgument('nav2_params', default_value=cfg('nav2_params.yaml')),
+        DeclareLaunchArgument('controller', default_value='rpp',
+                              description='Nav2 local controller: rpp (regulated pure pursuit: vx/wz only) | '
+                                          'mppi (MPPI, holonomic: vx, vy and wz)'),
+        DeclareLaunchArgument('nav2_params', default_value='',
+                              description="'' = nav2_params.yaml (controller:=rpp) or nav2_params_mppi.yaml (mppi)"),
         DeclareLaunchArgument('mission_params', default_value=cfg('mission.yaml')),
         DeclareLaunchArgument('use_ai', default_value='', description='true/false (empty = mission.yaml)'),
         DeclareLaunchArgument('server_url', default_value=''),
@@ -115,6 +144,9 @@ def generate_launch_description():
                           'angle_min': -3.14159, 'angle_max': 3.14159, 'angle_increment': 0.0087,
                           'scan_time': 0.1, 'range_min': 0.35, 'range_max': 12.0, 'use_inf': True}],
              condition=IfCondition(lc('use_cloud_to_scan'))),
+        Node(package=PKG, executable='curtain_detector', name='curtain_detector', output='screen',
+             parameters=[lc('curtain_params'), {'use_sim_time': lc('use_sim_time')}],
+             condition=IfCondition(lc('use_curtains'))),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(
                 get_package_share_directory('lite3_terrain_classifier'), 'launch', 'terrain_classifier.launch.py')),
@@ -126,12 +158,7 @@ def generate_launch_description():
                 get_package_share_directory('slam_toolbox'), 'launch', 'online_async_launch.py')),
             launch_arguments={'slam_params_file': lc('slam_params'), 'use_sim_time': lc('use_sim_time')}.items(),
             condition=IfCondition(lc('use_slam'))),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(
-                get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')),
-            launch_arguments={'params_file': lc('nav2_params'), 'use_sim_time': lc('use_sim_time'),
-                              'autostart': 'true'}.items(),
-            condition=IfCondition(lc('use_nav2'))),
+        OpaqueFunction(function=_nav2),
         Node(package=PKG, executable='gait_switcher', name='gait_switcher', output='screen',
              parameters=[{'flat_gait': 'flat_medium', 'rugged_gait': 'rug_general'}],
              condition=IfCondition(lc('use_gait'))),

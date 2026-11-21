@@ -17,6 +17,8 @@ The context object (`ctx`, the ROS node in production, a fake in tests) gives mo
   costmap_cost_at_robot() -> int | None   clear_costmaps()
   animation_play(name) -> bool  animation_state() -> 'pending' | 'running' | 'done'  animation_cancel()
   set_target(label, goal_xy, route)       event(kind, **data)   on_mode_change(mode, phase)   on_complete(reason)
+  curtain_points() -> Nx4 (x, y, ux, uy) | None    (only with curtains: true)
+  drive(vx, wz, vy=0.0)  stop()  costmap_snapshot() -> (grid, GridInfo) | None      (curtain and mppi modes)
 """
 from __future__ import annotations
 
@@ -115,6 +117,7 @@ class ModeMachine:
         for mode in self.modes.values():          # fail at start-up on a bad exploration profile, not mid-mission
             for name in getattr(mode, 'exploration_profiles', []):
                 self.exploration(name)
+        self.curtains_tried = set()        # tiles behind a curtain that was already walked into (never twice)
         self.current: Optional[Mode] = None
         self.started_at: Optional[float] = None
         self.finished_reason: Optional[str] = None
@@ -173,6 +176,11 @@ class ModeMachine:
     def _on_stuck(self, mode, why):
         self.ctx.log('warn', f'STUCK in {mode.name}: {why}')
         self.ctx.event('stuck', mode=mode.name, why=why, target=mode.target_label)
+        nudge = self.cfg['stuck'].get('costmap_mode', '')
+        if nudge and nudge in self.modes and getattr(self.stuck, 'trigger', None) == 'costmap':
+            # inside the costmap obstacle zone Nav2 cannot plan out: move the robot out directly (x / y velocity)
+            self._switch(Transition(nudge, f'stuck: {why}'))
+            return
         if self.ctx.tiles.unexplored():
             exclude = [mode.target_label] if mode.target_label else []
             self._switch(Transition(self.recovery_mode, f'stuck: {why}', {'exclude': exclude}))
@@ -187,7 +195,7 @@ class ModeMachine:
     def snapshot(self) -> MissionSnapshot:
         tiles = self.ctx.tiles
         elapsed = self.ctx.now() - self.started_at if self.started_at is not None else 0.0
-        if not tiles.ready:
+        if not tiles.ready or not getattr(self.ctx, 'opening_done', True):
             return MissionSnapshot({}, 0, elapsed_s=elapsed, tiles_ready=False)
         tiles.update()
         return MissionSnapshot(tiles.counts(), tiles.visited_count(), tiles.unexplored(),
