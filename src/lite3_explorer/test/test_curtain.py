@@ -69,17 +69,22 @@ class Drive:
     """Add a robot that obeys drive(vx, wz) to a FakeCtx."""
     def __init__(self, ctx, pts):
         self.ctx, self.pts, self.cmds = ctx, pts, []
+        self.wall_x = None
+        self.blocked = lambda: False
         ctx.curtain_points = lambda: self.pts
         ctx.drive = self.drive
         ctx.stop = lambda: self.cmds.append('stop')
 
-    def drive(self, vx, wz):
+    def drive(self, vx, wz, vy=0.0):
         self.cmds.append((vx, wz))
         p = self.ctx.pose_
         dt = 1.0
+        c, s = math.cos(p[2]), math.sin(p[2])
+        nx = p[0] + (vx * c - vy * s) * dt
+        ny = p[1] + (vx * s + vy * c) * dt
         p[2] += wz * dt
-        p[0] += vx * dt * math.cos(p[2])
-        p[1] += vx * dt * math.sin(p[2])
+        if (self.wall_x is None or nx < self.wall_x) and not self.blocked():   # a wall stops it (bumped)
+            p[0], p[1] = nx, ny
 
 
 def build(pose_yaw):
@@ -107,6 +112,46 @@ def test_curtain_on_the_edge_is_aligned_with_and_walked_through():
     assert turns and walks                                        # turned in place first, then walked with vx
     assert all(abs(w[1]) <= 0.3 for w in walks) and d.cmds[-1] == 'stop' or 'stop' in d.cmds
     assert (1, 0) in m.curtains_tried
+
+
+def run_until(ctx, m, stop, n=120):
+    for _ in range(n):
+        ctx.t += 1.0
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        if stop():
+            return True
+    return False
+
+
+def test_curtain_mode_goes_to_the_tile_centre_before_walking_through():
+    ctx, m, d = build(pose_yaw=1.0)
+    ctx.pose_[:] = [0.62, 0.28, 1.0]                             # off the line through the middle of the edge
+    at_align = []
+    orig = ctx.on_mode_change
+
+    def spy(mode, phase):
+        if mode == 'curtain' and phase == 'align':
+            at_align.append(list(ctx.pose_))
+        return orig(mode, phase)
+    ctx.on_mode_change = spy
+    assert run_until(ctx, m, lambda: 'curtain' in modes_seen(m) and ctx.pose_[0] >= 1.5)
+    assert at_align and math.hypot(at_align[0][0] - 0.5, at_align[0][1] - 0.5) <= 0.06 + 1e-6   # centred first
+    assert abs(ctx.pose_[1] - 0.5) < 0.05                        # and stayed on the centre line through the curtain
+
+
+def test_blocked_curtain_is_retried_then_hands_back_to_the_mode_before_it():
+    ctx, m, d = build(pose_yaw=0.0)
+    d.wall_x = 0.8                                               # a wall in front of the curtain: never gets through
+    assert run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=300)
+    retries = [dd for k, dd in ctx.events if k == 'curtain_retry']
+    failed = next(dd for k, dd in ctx.events if k == 'curtain_failed')
+    assert len(retries) == 2 and failed['attempts'] == 3 and failed['back_to'] == 'exploring'
+    ctx.t += 1.0
+    m.tick()
+    seen = modes_seen(m)
+    assert seen[seen.index('curtain') - 1] == 'exploring' and seen[seen.index('curtain') + 1] == 'exploring', seen
+    assert not ctx.tiles.curtain_edges                           # never got through: no curtain edge recorded
 
 
 def test_curtain_is_not_used_when_disabled():
@@ -279,3 +324,70 @@ def test_curtain_edges_are_left_out_of_the_virtual_walls_only_while_open():
     assert not near(tr.virtual_walls())                  # backtracking: lifted
     tr.open_curtains = False
     assert near(tr.virtual_walls())                      # and back afterwards (hysteresis kept it)
+
+
+def test_backtracking_carries_on_when_the_curtain_cannot_be_walked_through():
+    from test_mission import T, tee_world
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25},
+                  world=tee_world())
+    d = Drive(ctx, np.zeros((0, 4)))
+    branch = None
+    for _ in range(200):
+        ctx.t += 1.0
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        trail = [T.tile_label(t) for t in ctx.tiles.trail]
+        if '1,0' in trail and trail[-1] in ('1,1', '2,0'):
+            branch = tuple(int(v) for v in trail[-1].split(','))
+            break
+    assert branch
+    ctx.tiles.add_curtain_edge((1, 0), branch)
+    d.blocked = lambda: m.current.name == 'curtain' and m.current.phase == 'cross'   # something behind the curtain
+    for _ in range(600):
+        ctx.t += 1.0
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        if ctx.complete:
+            break
+    seen = modes_seen(m)
+    i = seen.index('curtain')
+    assert seen[i - 1:i + 2] == ['backtracking', 'curtain', 'backtracking'], seen
+    failed = next(dd for k, dd in ctx.events if k == 'curtain_failed')
+    assert failed['back_to'] == 'backtracking' and failed['attempts'] == 3
+    assert sum(1 for k, _ in ctx.events if k == 'curtain_retry') == 2
+    assert not any('could not walk through the curtain' in r for _, _, _, r in m.transitions)
+    assert any('looking for another way' in msg for _, msg in ctx.logs)
+    other = '1,1' if branch == (2, 0) else '2,0'
+    assert any(k == 'backtracked' and dd['tile'] == other for k, dd in ctx.events)   # got there the other way
+    assert ctx.complete
+
+
+# ---------------------------------------------------------------------------------------- curtain left for later
+def test_curtain_at_a_split_is_left_for_later_and_walked_through_when_backtracking():
+    from test_mission import T, tee_world
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.exploring.curtains': True,
+                   'modes.curtain.speed_mps': 0.25}, world=tee_world())
+    Drive(ctx, spots(2.05, 0.1, 0.9))                     # a curtain on the east edge of split tile 1,0 (tile 2,0 behind)
+    for _ in range(800):
+        ctx.t += 1.0
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        if ctx.complete:
+            break
+    deferred = [dd for k, dd in ctx.events if k == 'curtain_deferred']
+    assert deferred and deferred[0]['tile'] == '1,0' and deferred[0]['neighbour'] == '2,0' and deferred[0]['first'] == '1,1'
+    splits = [dd for k, dd in ctx.events if k == 'split']
+    assert splits and splits[0]['tile'] == '1,0' and splits[0]['options'] == ['1,1', '2,0']
+    trail = [T.tile_label(t) for t in ctx.tiles.trail]
+    assert '1,2' in trail and trail.index('1,2') < trail.index('2,0'), trail   # the branch without the curtain first
+    seen = modes_seen(m)
+    i = seen.index('curtain')
+    assert seen[i - 1] == 'backtracking', seen            # back at the split, then through the curtain
+    assert ctx.tiles.curtain_edges and ctx.complete
+    assert not ctx.tiles.curtains_left()
+
+
+def test_curtain_is_walked_through_at_once_without_another_way():
+    ctx, m, d = build(pose_yaw=0.0)                       # corridor: the curtain is the only way on
+    assert run_until(ctx, m, lambda: 'curtain' in modes_seen(m))
+    assert not any(k == 'curtain_deferred' for k, _ in ctx.events)

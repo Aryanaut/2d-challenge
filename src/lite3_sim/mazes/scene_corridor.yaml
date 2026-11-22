@@ -1,0 +1,10 @@
+# A corridor with a scene tile ('0') beside it: the robot should look at it from tile 2,0 (scene mode), never enter it,
+# and count it as explored.
+name: scene_corridor
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+
+  |       | 0 |       |
+  +---+---+   +---+---+
+  | >                 |
+  +---+---+---+---+---+

@@ -164,6 +164,8 @@ DEFAULTS: Dict[str, Any] = {
             'curtain_mode': 'curtain',
             'curtain_edge_tol_m': 0.30,   # curtain spots within this of the tile edge line count as on the edge
             'curtain_min_span_m': 0.40,   # ... spread over at least this much of it
+            'curtain_last': True,         # another reachable tile beside the curtain's tile: go there first, the tile is the
+                                          # last split, backtracking walks through the curtain later (needs backtracking)
             'backtracking': True,         # two or more tiles to travel to -> the tile is the last split; no exploration
                                           # target left but tiles unexplored -> backtracking mode (else retry_wait)
             'backtracking_mode': 'backtracking',
@@ -232,7 +234,14 @@ DEFAULTS: Dict[str, Any] = {
         },
         'backtracking': {
             'type': 'backtracking',
-            'traversal': 'direct',        # NavigateToPose back to the split tile, then to its untravelled tile
+            'traversal': 'route',         # FollowWaypoints back to the split tile, then to its untravelled tile
+            'waypoints_per_tile': 3,      # waypoints on the straight line between each pair of tile centres on the way
+            'align_at_tiles': True,       # at each tile centre turn in place to face the next tile, then drive that hop
+            'align_tol_deg': 5.0,
+            'align_timeout_s': 15.0,      # not facing it by then: drive on anyway
+            'min_turn_rad_s': 0.2,
+            'max_turn_rad_s': 0.6,
+            'turn_gain': 1.0,
             'min_clearance_m': 0.25,      # goal point in a tile: this far from walls
             'path_check_timeout_s': 10.0,
             'goal_timeout_s': 120.0,

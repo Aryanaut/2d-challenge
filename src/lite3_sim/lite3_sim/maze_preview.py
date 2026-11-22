@@ -27,7 +27,8 @@ def render(maze) -> str:
         top = '    +' + ''.join(H[maze.edge((i, j), 'N')] + '+' for i in range(maze.cols))
         row = f'{j:3d} ' + V[maze.edge((0, j), 'W')]
         for i in range(maze.cols):
-            cell = '#' if (i, j) in maze.solid else arrow if (i, j) == start else maze.labels.get((i, j), '')
+            cell = ('#' if (i, j) in maze.solid else '0' if (i, j) in maze.scenes else arrow if (i, j) == start
+                    else maze.labels.get((i, j), ''))
             row += f'{cell:^3s}' + V[maze.edge((i, j), 'E')]
         lines += [top, row]
     lines.append('    +' + ''.join(H[maze.edge((i, 0), 'S')] + '+' for i in range(maze.cols)))
@@ -46,6 +47,10 @@ def save_png(maze, path):
     for t in maze.solid:
         ax.add_patch(plt.Rectangle((t[0] * maze.tile_size, t[1] * maze.tile_size), maze.tile_size, maze.tile_size,
                                    color='0.7'))
+    for t in maze.scenes:
+        ax.add_patch(plt.Rectangle((t[0] * maze.tile_size + 0.15, t[1] * maze.tile_size + 0.15),
+                                   maze.tile_size - 0.3, maze.tile_size - 0.3, color='orange', alpha=0.5))
+        ax.text(*maze.tile_centre(t), 'scene', ha='center', va='center', fontsize=8)
     for t, text in maze.labels.items():
         ax.text(*maze.tile_centre(t), text, ha='center', va='center')
     sx, sy, syaw = maze.start
@@ -56,7 +61,7 @@ def save_png(maze, path):
     ax.set_aspect('equal')
     ax.set_xlim(-0.2, w + 0.2)
     ax.set_ylim(-0.2, h + 0.2)
-    ax.set_title(f'{maze.name}: walls (grey), slit panels (blue), curtains (cyan dashed)')
+    ax.set_title(f'{maze.name}: walls (grey), slit panels (blue), curtains (cyan dashed), scene tiles (orange)')
     fig.savefig(path, dpi=120, bbox_inches='tight')
 
 

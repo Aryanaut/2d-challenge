@@ -149,3 +149,39 @@ def test_virtual_wall_survives_a_thinned_map_but_not_a_cleared_one():
     gone[:, 19:21] = 0                                         # really gone
     assert not walls(gone)
     assert not walls(thin)                                     # and 45% alone does not bring it back
+
+
+def _start_room(robot_xy=(0.0, 0.0), back_wall=True, clutter=True, size=1.02):
+    """Start tile centred on the origin (walls N and S, a back wall W, open E) and, two tiles east, a tile full of
+    scattered clutter (a scene tile) that outnumbers the wall cells."""
+    g = np.full((200, 200), 0, np.int16)
+    cols, rows = np.meshgrid(np.arange(200), np.arange(200))
+    x = INFO.origin_x + (cols + 0.5) * RES
+    y = INFO.origin_y + (rows + 0.5) * RES
+    h = size / 2
+    g[(np.abs(y - h) < RES / 2 + 1e-9) & (x > -h) & (x < 3 * size)] = 100            # north wall
+    g[(np.abs(y + h) < RES / 2 + 1e-9) & (x > -h) & (x < 3 * size)] = 100            # south wall
+    if back_wall:
+        g[(np.abs(x + h) < RES / 2 + 1e-9) & (np.abs(y) < h)] = 100                   # back (west) wall
+    if clutter:
+        rng = np.random.default_rng(1)
+        box = (x > 1.5 * size + 0.15) & (x < 2.5 * size - 0.15) & (np.abs(y) < h - 0.15)
+        g[box & (rng.random(g.shape) < 0.6)] = 100
+    return g, (robot_xy[0], robot_xy[1], 0.0)
+
+
+def test_start_tile_sits_on_the_back_wall_and_ignores_clutter():
+    g, robot = _start_room(robot_xy=(0.08, 0.05))          # robot a bit off the tile centre
+    a = T.initial_candidates(g, INFO, robot, size=1.02)[0]
+    assert '(back)' in a['kind'] and a['back'] == '-u'
+    x0, y0 = a['grid'].corners((0, 0))[0]
+    assert abs(x0 - (-0.51)) < 0.04                         # back edge on the back wall, not the robot centred
+    assert abs(y0 - (-0.51)) < 0.04                         # between the side walls
+    assert a['grid'].tile_of(*robot[:2]) == (0, 0)
+
+
+def test_start_tile_without_walls_nearby_is_centred_on_the_robot():
+    g, robot = _start_room(robot_xy=(0.0, 0.0), back_wall=False)
+    a = T.initial_candidates(g, INFO, robot, size=1.02)[0]
+    cx, cy = a['grid'].center((0, 0))
+    assert abs(cx) < 0.04 and abs(cy) < 0.04               # no back wall: centred along the heading

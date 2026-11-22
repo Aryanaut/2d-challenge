@@ -106,3 +106,30 @@ def test_curtain_camera_confirms_spots_in_front():
 def test_pose_helpers():
     a = (1.0, 2.0, 0.7)
     assert compose(a, invert(a)) == pytest.approx((0.0, 0.0, 0.0), abs=1e-12)
+
+
+def test_scene_tile_is_mapped_as_clutter_and_blocks_the_robot():
+    maze = load_maze_dict({'layout': '+---+---+\n| >   0 |\n+---+---+\n'})
+    w = World(maze, {"map_origin": "maze", "lidar": {"noise_m": 0.0}})
+    w.scan()
+    g = w.mapper.grid()
+    info = w.info
+    cells = [info.world_to_cell(1.02 + (a + 0.5) * 0.05, (b + 0.5) * 0.05) for a in range(20) for b in range(20)]
+    vals = np.array([g[r, c] for r, c in cells])
+    assert (vals >= 0).mean() > 0.95                                           # scanned through
+    assert 0.15 < (vals == 100).mean() < 0.5                                   # but cluttered: not traversable
+    assert w.geometry.collides(1.53, 0.51, 0.0, w.length, w.width)            # the robot bumps into the clutter
+    assert not w.geometry.collides(0.51, 0.51, 0.0, w.length, w.width)
+
+
+def test_a_wall_on_a_scene_tile_edge_stays_in_the_map():
+    def wall_row(cell):
+        maze = load_maze_dict({'layout': '+---+\n| > |\n+---+\n| %s |\n+---+\n' % cell})
+        w = World(maze, {"map_origin": "maze"})
+        for _ in range(10):
+            w.scan()
+        g, info = w.mapper.grid(), w.info
+        r, _ = info.world_to_cell(0.51, 1.03)
+        return [int(g[r, c]) for c in range(info.world_to_cell(0.1, 1.03)[1], info.world_to_cell(0.92, 1.03)[1])]
+    plain, scene = wall_row(' '), wall_row('0')
+    assert scene == plain and plain.count(100) >= 0.8 * len(plain)          # the shared wall panel is still mapped

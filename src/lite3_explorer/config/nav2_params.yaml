@@ -33,8 +33,8 @@ controller_server:
       # A tile counts as reached when the robot is within tile_reach_radius_m (reporter.yaml, 0.30 m) of its
       # centre, and the tile goal is the centre, so Nav2 must stop closer than that. Keep this below
       # tile_reach_radius_m (it was 0.45 m, which can end up 0.45 m from the centre: not reached).
-      xy_goal_tolerance: 0.4
-      yaw_goal_tolerance: 0.60
+      xy_goal_tolerance: 0.3
+      yaw_goal_tolerance: 0.3
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       desired_linear_vel: 0.35

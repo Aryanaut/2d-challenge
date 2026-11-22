@@ -16,6 +16,10 @@ What stands in for what:
   waypoint_follower     WaypointsTask: one NavTask per pose, missed_waypoints, stop_on_failure false
   behavior_server spin  SpinTask: relative yaw, aborts on collision or after the time allowance
   curtain_detector      curtain camera: curtain points in the depth camera's view -> CurtainMap
+  scene tiles ('0')     clutter: every SLAM cell of the tile's cluttered square (scene.margin_m in from its edges) a
+                        lidar ray crosses is mapped from a fixed per-tile pattern (scene.fill of them occupied, the
+                        rest free; the margin is mapped as usual, so walls on the tile's edges stay); the rays go on
+                        (the lidar sees past the clutter), the robot collides with the cluttered square
 Not simulated: terrain, stairs, gaits, the AI. The robot collides with wall panels and slit panels, not curtains.
 """
 from __future__ import annotations
@@ -64,6 +68,9 @@ DEFAULTS = {
     'curtain_camera': {'enabled': True, 'rate_hz': 2.0, 'hfov_deg': 81.4, 'range_min': 0.30, 'range_max': 3.5,
                        'x_offset_m': 0.30, 'min_columns': 0.30, 'point_step_m': 0.05, 'noise_m': 0.015,
                        'cell_m': 0.05, 'confirm_hits': 3},
+    # scene tiles ('0' in the layout): clutter mapped as fill share of occupied cells inside margin_m of the tile edges
+    # (with the defaults about a third of the tile is occupied: the mission manager's scene_max_free is 0.85)
+    'scene': {'margin_m': 0.15, 'fill': 0.6, 'seed': 0},
 }
 
 
@@ -93,7 +100,7 @@ def invert(a):
 class Geometry:
     """Maze segments in the map frame: what the lidar sees, what the robot bumps into, where the curtains are."""
 
-    def __init__(self, maze: Maze, map_T_maze):
+    def __init__(self, maze: Maze, map_T_maze, scene_margin_m: float = 0.15):
         def tf(x, y):
             return compose(map_T_maze, (x, y, 0.0))[:2]
         segs, kinds = [], []
@@ -113,6 +120,20 @@ class Geometry:
             n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / 0.02)))
             t = np.linspace(0.0, 1.0, n + 1)
             pts.append(np.stack([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t], axis=1))
+        # scene tiles: the robot bumps into the cluttered square (the tile minus scene_margin_m along each edge)
+        size, m = maze.tile_size, scene_margin_m
+        for i, j in sorted(maze.scenes):
+            corners = [(i * size + m, j * size + m), ((i + 1) * size - m, j * size + m),
+                       ((i + 1) * size - m, (j + 1) * size - m), (i * size + m, (j + 1) * size - m)]
+            corners = [tf(*c) for c in corners]
+            for (x0, y0), (x1, y1) in zip(corners, corners[1:] + corners[:1]):
+                n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / 0.02)))
+                t = np.linspace(0.0, 1.0, n + 1)
+                pts.append(np.stack([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t], axis=1))
+            k = max(2, int(math.ceil((size - 2 * m) / 0.1)))          # and inside it (the body fits in the square)
+            gu, gv = np.meshgrid(np.linspace(i * size + m, (i + 1) * size - m, k),
+                                 np.linspace(j * size + m, (j + 1) * size - m, k))
+            pts.append(np.array([tf(u, v) for u, v in zip(gu.ravel(), gv.ravel())], float))
         self.solid_pts = np.concatenate(pts) if pts else np.zeros((0, 2))
         cpts, cseg = [], []
         for k in np.flatnonzero(self.is_curtain):
@@ -425,7 +446,7 @@ class World:
             self.map_T_maze = (0.0, 0.0, 0.0)
         else:
             raise ValueError(f"map_origin must be 'start' or 'maze', not {cfg['map_origin']!r}")
-        self.geometry = Geometry(maze, self.map_T_maze)
+        self.geometry = Geometry(maze, self.map_T_maze, float(cfg['scene']['margin_m']))
         self.pose = list(compose(self.map_T_maze, start_maze))
         self.vel = [0.0, 0.0, 0.0]                           # body vx, vy, wz
         if self.geometry.collides(*self.pose, self.length, self.width):
@@ -444,6 +465,7 @@ class World:
         x0, y0 = math.floor((x0 - m) / res) * res, math.floor((y0 - m) / res) * res
         self.info = GridInfo(int(math.ceil((x1 + m - x0) / res)), int(math.ceil((y1 + m - y0) / res)), res, x0, y0)
         self.mapper = OccupancyMapper(self.info)
+        self.scene_idx, self.scene_occ = self._scene_cells()
         self.map_grid = self.mapper.grid()
         self.map_version = 0
         self.virtual_pts = np.zeros((0, 2))
@@ -461,6 +483,45 @@ class World:
         self.curtain_seen_now = np.zeros((0, 2))
         self.rng = np.random.default_rng(0)
         self.events: List[str] = []
+
+    def _scene_cells(self):
+        """SLAM cells of the cluttered square of each scene tile: (flat indices, occupied?) from a fixed pattern per tile
+        (seeded), in the maze frame so a rotated map frame does not change it."""
+        mz, info, sc = self.maze, self.info, self.cfg['scene']
+        if not mz.scenes:
+            return np.zeros(0, np.int64), np.zeros(0, bool)
+        res, size, margin, fill = info.resolution, mz.tile_size, float(sc['margin_m']), float(sc['fill'])
+        rows, cols = np.mgrid[0:info.height, 0:info.width]
+        mx = info.origin_x + (cols.ravel() + 0.5) * res
+        my = info.origin_y + (rows.ravel() + 0.5) * res
+        tx, ty, th = invert(self.map_T_maze)
+        c, s = math.cos(th), math.sin(th)
+        xm, ym = tx + c * mx - s * my, ty + s * mx + c * my
+        ti, tj = np.floor(xm / size).astype(int), np.floor(ym / size).astype(int)
+        n = int(math.ceil(size / res))
+        idx, occ = [], []
+        for i, j in sorted(mz.scenes):
+            inside = np.flatnonzero((ti == i) & (tj == j))
+            u, v = xm[inside] - i * size, ym[inside] - j * size
+            pattern = np.random.default_rng((int(sc['seed']), i, j)).random((n, n)) < fill
+            ku = np.clip((u / res).astype(int), 0, n - 1)
+            kv = np.clip((v / res).astype(int), 0, n - 1)
+            # only the cluttered square: the margin along the edges is mapped by the lidar as usual (a wall panel on
+            # the scene tile's edge must stay a wall)
+            inner = (u >= margin) & (u <= size - margin) & (v >= margin) & (v <= size - margin)
+            idx.append(inside[inner])
+            occ.append(pattern[ku, kv][inner])
+        return np.concatenate(idx), np.concatenate(occ)
+
+    def _map_scenes(self):
+        """Scene tile cells a ray has crossed: occupied or free from the tile's clutter pattern."""
+        if not len(self.scene_idx):
+            return
+        seen = self.mapper.touched.reshape(-1)[self.scene_idx]
+        flat = self.mapper.logodds.reshape(-1)
+        lo, hi = self.mapper.clamp
+        flat[self.scene_idx[seen & self.scene_occ]] = hi
+        flat[self.scene_idx[seen & ~self.scene_occ]] = lo
 
     def log(self, msg):
         self.events.append(msg)
@@ -595,6 +656,7 @@ class World:
         use = ~blind
         self.mapper.integrate(ox, oy, (rel + yaw)[use], np.where(hit, rng, np.inf)[use], hit[use],
                               float(lc['range_max']))
+        self._map_scenes()
         self.last_scan = (rel, np.where(hit, rng, np.inf), self.time)
         return self.last_scan
 

@@ -119,8 +119,10 @@ class TileExploration(Exploration):
         clearance = float(self.cfg.get('min_clearance_m', 0.30))
         raw = tiles.targets(pose[:2], limit=10 ** 6, min_clearance_m=clearance)
         # Identified tiles with no goal point clear of the walls: nothing could drive there. Eliminate them.
+        # (Scene tiles are never driven to: they are looked at from a neighbour, see _scene_viewpoints.)
         with_point = {t['tile'] for t in raw}
-        unclear = [lab for lab in tiles.unexplored() if lab not in with_point]
+        unclear = [lab for lab in tiles.unexplored() if lab not in with_point
+                   and not tiles.is_scene(tuple(int(v) for v in lab.split(',')))]
         for label in unclear:
             tiles.mark_unreachable(label, 'no goal point clear of the walls')
         if unclear:
@@ -131,6 +133,7 @@ class TileExploration(Exploration):
             others = [t for t in raw if t['tile'] not in self.avoid]
             if others:
                 raw = others
+        raw = raw + self._scene_viewpoints(pose, clearance, {t['tile'] for t in raw})
         raw = self._neighbours_only(raw)
         visited, current = set(tiles.trail), tiles.current
         max_level = int(self.cfg.get('max_adjacency', T.ADJ_WALL))
@@ -151,6 +154,36 @@ class TileExploration(Exploration):
             self.ctx.log('info', f'{len(beyond)} unexplored tile(s), none within adjacency level {max_level}.')
         out.sort(key=lambda t: (self._level_key(t['adjacency']), t['distance_m']))
         return out[:int(self.cfg.get('candidate_limit', 12))]
+
+    def _scene_viewpoints(self, pose, clearance, already):
+        """Scene tiles still to look at: their neighbours the robot already visited become targets too (a neighbour
+        still to visit is a target anyway). Arriving there, the exploring mode hands over to the scene mode. A scene tile
+        with no neighbour to look from is given up on."""
+        tiles = self.ctx.tiles
+        if not tiles.skip_scene:
+            return []
+        out, here = [], tuple(tiles.current) if tiles.current else None
+        for scene in tiles.pending_scenes():
+            label = T.tile_label(scene)
+            views = [v for v in tiles.scene_viewpoints(scene) if T.tile_label(v) not in tiles.unreachable]
+            if not views:
+                tiles.mark_unreachable(label, 'scene tile with no open neighbour to look at it from')
+                self.ctx.log('warn', f'Scene tile {label}: no open neighbour to look at it from; giving up on it.')
+                self.ctx.event('eliminated', tiles=[label], why='scene tile without a viewpoint')
+                continue
+            for v in views:
+                vl = T.tile_label(v)
+                if v == here or vl in already or tiles.tiles[v]['status'] != 'visited':
+                    continue
+                goal = tiles.goal_point(v, clearance)
+                if goal is None:
+                    continue
+                already.add(vl)
+                cx, cy = tiles.grid.center(v)
+                out.append({'tile': vl, 'goal_xy': goal, 'centre_xy': [round(cx, 3), round(cy, 3)],
+                            'distance_m': round(math.dist(goal, pose[:2]), 2), 'clearance_m': clearance,
+                            'scene': label, 'steps': 0, 'path': [], 'has_frontier': False})
+        return out
 
     def _neighbours_only(self, raw):
         """Keep the tiles that share a side with the current tile; mark the unexplored rest irrelevant."""
@@ -202,6 +235,8 @@ class TileExploration(Exploration):
             for t in reachable:
                 goal = tuple(int(v) for v in t['tile'].split(','))
                 crossed = T.tiles_crossed(tiles.grid, t['path_xy'], tol) - here - {goal}
+                if t.get('scene'):
+                    crossed = set()          # going back to look at a scene tile: through explored tiles is fine
                 (via if crossed else direct).append((t, crossed))
             if via:
                 self.ctx.log('info', 'Not chosen (path runs through other tiles): ' + ', '.join(
@@ -209,7 +244,7 @@ class TileExploration(Exploration):
                 self.ctx.event('via_other_tiles', tiles=[t['tile'] for t, _ in via])
             reachable = [t for t, _ in direct]
         if reachable and self.cfg.get('direct_path_only', True) and tiles.grid is not None and tiles.current:
-            direct = [t for t in reachable if T.direct_path_through_shared_side(
+            direct = [t for t in reachable if t.get('scene') or T.direct_path_through_shared_side(
                 tiles.grid, tiles.current, tuple(int(v) for v in t['tile'].split(',')), t['path_xy'])]
             if direct:
                 reachable = direct

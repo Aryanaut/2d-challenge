@@ -127,7 +127,7 @@ mission_manager:
         wz_max: 0.3
         block_cost: 100                      # fail when a global-costmap cell this costly (lethal: wall / virtual wall) ...
         lookahead_m: 0.30                    # ... lies this far ahead on the way
-        timeout_s: 30.0
+        timeout_s: 15.0
         stall_s: 6.0                         # fail when not min_progress_m closer within this long
         min_progress_m: 0.05
       # stairs:                              # example slot for a future stair traversal
@@ -151,7 +151,7 @@ mission_manager:
         use_crawl: true                      # crawl gait while turning (gait_switcher)
         settle_s: 1.0
         check_room: true                     # skip the turn where the body would hit the local costmap
-        map_wait_s: 30.0
+        map_wait_s: 10.0
         next_mode: exploring
       exploring:
         type: exploring
@@ -160,13 +160,15 @@ mission_manager:
         kind_traversals: ['']                # per target kind "kind:profile", e.g. ["frontier:direct"]
         tile_traversals: ['']                # per-tile overrides "i,j:profile", e.g. ["3,1:stairs"]
         path_check_timeout_s: 10.0
-        goal_timeout_s: 120.0
-        scan_after_reach: true
+        goal_timeout_s: 30.0
+        scan_after_reach: false
         scenes: true                         # a scene tile shares a side with the current tile -> scene mode (face it, AI describes it, mark explored; never entered)
         scene_mode: scene
         curtains: false                      # use_curtains:=true (launch / explorer.sh --curtains): a curtain on the current tile's edge -> curtain mode
         curtain_edge_tol_m: 0.30             # curtain spots within this of the tile edge line count as on the edge
         curtain_min_span_m: 0.40             # ... spread over at least this much of it
+        curtain_last: true                   # another reachable tile beside the curtain's tile: explore it first (the tile becomes the
+                                             # last split); backtracking returns and walks through the curtain afterwards
         backtracking: true                   # a tile with two or more tiles to travel to is the 'last split'; when no exploration
         backtracking_mode: backtracking      # target is left but tiles are unexplored, go back there and take the other way (else retry_wait)
         classify_target: true                # terrain-classify the target tile as soon as the robot points at it; floor not visible -> choose another tile
@@ -214,8 +216,18 @@ mission_manager:
         max_travel_m: 1.0
         timeout_s: 20.0
       curtain:
-        type: curtain                        # a curtain along the current tile's edge: square up to it, walk through with vx, go back to exploring
-        next_mode: exploring
+        type: curtain                        # a curtain along the current tile's edge: go to the tile centre, square up, walk through with vx, go back to exploring
+        next_mode: exploring                 # through it (backtracking: back to backtracking); given up: back to the mode that was running before
+        center_tol_m: 0.06                   # first drive (vx / vy) to within this of the centre of the tile in front of the curtain
+        center_speed_mps: 0.15
+        center_min_speed_mps: 0.05
+        center_gain: 1.0
+        center_timeout_s: 15.0               # not there by then: align from where it is
+        lateral_gain: 1.0                    # vy that keeps the robot on the line from the tile centre through the edge
+        lateral_max_mps: 0.1
+        stall_m: 0.05                        # walking through: less progress than this ...
+        stall_s: 3.0                         # ... in this long = blocked (a wall): a failed try
+        max_attempts: 3                      # tries (back to the centre, square up, walk) before giving up
         speed_mps: 0.25                      # forward speed (vx) through the curtain
         align_tol_deg: 5.0                   # square to the edge within this before walking
         align_timeout_s: 15.0
@@ -227,10 +239,17 @@ mission_manager:
         cross_timeout_s: 20.0
       backtracking:                          # no target left: back to the last split tile, on to its untravelled tile, then exploring
         type: backtracking
-        traversal: direct                    # NavigateToPose (the way back crosses several tiles)
+        traversal: route                     # FollowWaypoints through the tile centres of the way back (a nav2_route profile)
+        waypoints_per_tile: 3                # per tile-to-tile hop: waypoints evenly spaced on the straight line between the two centres
+        align_at_tiles: true                 # yaw setpoint per tile: at each tile centre turn in place to face the next tile, then drive that hop
+        align_tol_deg: 5.0
+        align_timeout_s: 15.0                # not facing it by then: drive on anyway
+        min_turn_rad_s: 0.2
+        max_turn_rad_s: 0.6
+        turn_gain: 1.0
         min_clearance_m: 0.25
         path_check_timeout_s: 10.0
-        goal_timeout_s: 120.0
+        goal_timeout_s: 30.0
         face_away_from_walls: true
         scan_after_reach: true               # scan on the new tile (scanning hands over to exploring)
         scan_mode: scanning

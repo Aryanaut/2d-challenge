@@ -117,10 +117,10 @@ class ModeMachine:
         for mode in self.modes.values():          # fail at start-up on a bad exploration profile, not mid-mission
             for name in getattr(mode, 'exploration_profiles', []):
                 self.exploration(name)
-        self.scene_checked = set()         # (trail length, tile): arrivals already checked for a scene tile beside them
         self.scenes_done = set()           # scene tiles already looked at (never twice)
         self.curtains_tried = set()        # tiles behind a curtain that was already walked into (never twice)
         self.current: Optional[Mode] = None
+        self.previous: Optional[str] = None
         self.started_at: Optional[float] = None
         self.finished_reason: Optional[str] = None
         self.recoveries = 0                       # consecutive recoveries without reaching a new tile
@@ -200,7 +200,7 @@ class ModeMachine:
         if not tiles.ready or not getattr(self.ctx, 'opening_done', True):
             return MissionSnapshot({}, 0, elapsed_s=elapsed, tiles_ready=False)
         tiles.update()
-        return MissionSnapshot(tiles.counts(), tiles.visited_count(), tiles.unexplored(),
+        return MissionSnapshot(tiles.counts(), tiles.visited_count(), sorted(set(tiles.unexplored()) | set(tiles.curtains_left())),
                                sorted(tiles.unreachable), elapsed, map=tiles.map)
 
     def check_end(self) -> Optional[str]:
@@ -226,6 +226,7 @@ class ModeMachine:
         self.ctx.log('info', f'MODE {prev.name if prev else "-"} -> {t.mode}: {t.reason}')
         self.transitions.append((self.ctx.now(), prev.name if prev else None, t.mode, t.reason))
         self.ctx.event('mode', previous=prev.name if prev else None, mode=t.mode, reason=t.reason)
+        self.previous = prev.name if prev else None    # the mode that handed over (e.g. the curtain mode returns there)
         self.current = nxt
         nxt.reason, nxt.entered_at = t.reason, self.ctx.now()
         nxt.phase = ''

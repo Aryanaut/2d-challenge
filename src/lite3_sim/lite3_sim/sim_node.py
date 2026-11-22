@@ -16,7 +16,8 @@ Provides (what the mission manager uses)
 
 For RViz / debugging
   pub /scan (sensor_msgs/LaserScan), /odom, /plan (the path being followed)
-  pub /sim/maze        MarkerArray (latched): ground-truth walls (grey), slit panels (blue), curtains (cyan), tile
+  pub /sim/maze        MarkerArray (latched): ground-truth walls (grey), slit panels (blue), curtains (cyan), scene
+                       tiles (orange), tile
                        labels, the maze's own tile grid (thin white), the start pose
   pub /sim/robot       MarkerArray: body footprint, heading, mission mode, depth-camera view, curtain spots
   pub /sim/status      std_msgs/String JSON (1 Hz): sim time, pose, maze tile, Nav2 task, ground-truth coverage
@@ -473,6 +474,15 @@ class Lite3Sim(Node):
             b.pose.orientation = quat(self.world.map_T_maze[2])
             b.scale.x = b.scale.y = s * 0.98
             b.scale.z = 0.5
+            markers.append(b)
+        margin = float(self.world.cfg['scene']['margin_m'])
+        for n, tile in enumerate(sorted(mz.scenes)):        # scene tiles: the cluttered square, low and orange
+            px, py, _ = self.world.maze_to_map(*mz.tile_centre(tile))
+            b = self._marker('maze_scene', n, Marker.CUBE, stamp, (1.0, 0.55, 0.1, 0.45))
+            b.pose.position.x, b.pose.position.y, b.pose.position.z = px, py, 0.15
+            b.pose.orientation = quat(self.world.map_T_maze[2])
+            b.scale.x = b.scale.y = s - 2 * margin
+            b.scale.z = 0.3
             markers.append(b)
         sx, sy, syaw = self.world.maze_to_map(*mz.start)
         a = self._marker('maze_start', 0, Marker.ARROW, stamp, (0.2, 1.0, 0.2, 0.6))

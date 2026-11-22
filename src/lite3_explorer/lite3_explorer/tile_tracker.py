@@ -49,6 +49,9 @@ class TileTracker:
         # a wall, so these edges become virtual walls; with open_curtains (backtracking) they are left out.
         self.curtain_edges: Dict[tuple, tuple] = {}
         self.open_curtains = False
+        # curtains left for later: a curtain on an edge of a split tile whose other way was taken first.
+        # {tile behind the curtain: {'tile': split tile, 'side': edge side}}. Backtracking walks through them.
+        self.deferred_curtains: Dict[tuple, dict] = {}
         self._map = None                              # (grid array, GridInfo)
         self._map_version = 0
         self._classified_version = -1
@@ -95,6 +98,7 @@ class TileTracker:
         self.described = set()
         self.splits = []
         self.curtain_edges = {}
+        self.deferred_curtains = {}
         self._visit(start, pose, 'start')
         self.update(force=True)
         return start
@@ -230,10 +234,14 @@ class TileTracker:
         return self.current is not None and abs(tile[0] - self.current[0]) + abs(tile[1] - self.current[1]) == 1
 
     def scene_tiles(self) -> List[tuple]:
-        """Scene tiles that count: completely scanned but less than scene_max_free traversable, AND sharing a side with the
-        current tile (the scene detection is not used anywhere else), plus the ones already looked at."""
-        return [t for t, d in sorted(self.tiles.items())
-                if t in self.described or (d.get('scene') and self._beside_current(t))]
+        """Scene tiles: completely scanned but less than scene_max_free traversable (never entered: the robot looks at
+        them from a neighbouring tile), plus the ones already looked at."""
+        return [t for t, d in sorted(self.tiles.items()) if t in self.described or self._scene_flag(t)]
+
+    def _scene_flag(self, tile) -> bool:
+        """Looks like a scene tile and the robot has never stood on it (a tile it walked through stays a tile)."""
+        d = self.tiles.get(tuple(tile), {})
+        return bool(d.get('scene')) and tuple(tile) not in set(self.trail)
 
     def mark_described(self, tile):
         """A scene tile was looked at from a neighbouring tile: it counts as explored (status visited) although the robot
@@ -244,13 +252,35 @@ class TileTracker:
 
     def is_scene(self, tile) -> bool:
         tile = tuple(tile)
-        return tile in self.described or (bool(self.tiles.get(tile, {}).get('scene')) and self._beside_current(tile))
+        return tile in self.described or self._scene_flag(tile)
+
+    def _open_between(self, a, b) -> bool:
+        """Tiles a and b share a side the robot can look across: not a wall panel. Stricter than the tile sides
+        (wall_fraction 0.4): clutter standing against the edge of a scene tile does not make the side a wall, only an
+        edge that is (almost) entirely occupied does."""
+        side = T.side_towards(tuple(a), tuple(b))
+        if side is None or self.grid is None or self._map is None:
+            return False
+        grid, info = self._map
+        return T.tile_sides(grid, info, self.grid, tuple(a), wall_fraction=0.9).get(side) != 'wall'
 
     def scene_neighbours(self, tile) -> List[tuple]:
-        """Scene tiles that share a side with `tile` and have not been described yet."""
+        """Scene tiles not looked at yet that share an open side with `tile` (call with the current tile)."""
         i, j = tile
         return [n for n in ((i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1))
-                if n not in self.described and self.tiles.get(n, {}).get('scene')]    # (call with the current tile)
+                if n not in self.described and self._scene_flag(n) and self._open_between(tile, n)]
+
+    def pending_scenes(self) -> List[tuple]:
+        """Scene tiles not looked at yet (and not given up on)."""
+        return [t for t in self.scene_tiles() if t not in self.described and T.tile_label(t) not in self.unreachable]
+
+    def scene_viewpoints(self, scene) -> List[tuple]:
+        """Tiles to look at a scene tile from: neighbours across an open side that the robot can stand on (visited or
+        to_visit, not a scene tile themselves)."""
+        i, j = scene
+        return [n for n in ((i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1))
+                if self.tiles.get(n, {}).get('status') in ('visited', 'to_visit') and not self.is_scene(n)
+                and self._open_between(scene, n)]
 
     def _drivable(self, label: str) -> bool:
         return not (self.skip_scene and self.is_scene(tuple(int(v) for v in label.split(','))))
@@ -308,6 +338,21 @@ class TileTracker:
         side = T.side_towards(tuple(a), tuple(b))
         return self.grid is not None and side is not None and T.edge_key(self.grid, tuple(a), side) in self.curtain_edges
 
+    def defer_curtain(self, tile, neighbour, side: str):
+        """A curtain on `side` of `tile` (with `neighbour` behind it) is left for later: another way is taken first."""
+        self.deferred_curtains[tuple(neighbour)] = {'tile': tuple(tile), 'side': side}
+        self.version += 1
+
+    def curtains_left(self) -> List[str]:
+        """Tiles behind a deferred curtain that have not been visited yet (still to explore)."""
+        visited = set(self.trail)
+        return [T.tile_label(t) for t in sorted(self.deferred_curtains) if t not in visited]
+
+    def deferred_curtain(self, label: str) -> Optional[dict]:
+        """The deferred curtain in front of tile `label` (not visited yet), or None."""
+        tile = tuple(int(v) for v in label.split(','))
+        return self.deferred_curtains.get(tile) if tile not in set(self.trail) else None
+
     def known_route(self, start, goal) -> Optional[List[tuple]]:
         """Tiles from start to goal along moves the robot has already made (consecutive trail entries, either way),
         fewest steps first; None when the trail does not link them."""
@@ -353,7 +398,10 @@ class TileTracker:
         out = []
         for label in split['options']:
             tile = tuple(int(v) for v in label.split(','))
-            if self.tiles.get(tile, {}).get('status') in ok and self._drivable(label):
+            behind = self.deferred_curtain(label)
+            if behind is not None and behind['tile'] == split['tile']:
+                out.append(label)                   # behind a curtain left for later (often unmapped: lidar sees a wall)
+            elif self.tiles.get(tile, {}).get('status') in ok and self._drivable(label):
                 out.append(label)
         return out
 

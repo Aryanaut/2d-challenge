@@ -89,6 +89,13 @@ for t in /tf_static /map /tile_map /mission_manager/mode /mission_manager/curren
 done
 
 mkdir -p "$OUT_DIR"
+# ros2 bag record refuses an existing folder: never overwrite an earlier bag, take the next free name instead
+if [[ -e "$OUT_DIR/$NAME" ]]; then
+    n=2
+    while [[ -e "$OUT_DIR/${NAME}_$n" ]]; do n=$((n + 1)); done
+    echo "$OUT_DIR/$NAME already exists: recording to ${NAME}_$n instead."
+    NAME="${NAME}_$n"
+fi
 ARGS=(-o "$OUT_DIR/$NAME" -s "$STORAGE" --qos-profile-overrides-path "$QOS_FILE" --include-hidden-topics)
 [[ "$MAX_SIZE_MB" != 0 ]] && ARGS+=(-b "$((MAX_SIZE_MB * 1024 * 1024))")
 

@@ -149,6 +149,13 @@ class SimTraversal(Traversal):
         self.ctx.world.cancel(self.task)
 
 
+class _NoAiCall:
+    done, ok, result = True, False, {}
+
+    def failure(self):
+        return 'AI disabled (simulation)'
+
+
 # ------------------------------------------------------------------------------------------ context
 class HeadlessCtx:
     """The mission_manager's context API on top of a World."""
@@ -157,7 +164,11 @@ class HeadlessCtx:
         self.world, self.cfg, self.verbose = world, cfg, verbose
         tcfg = cfg['tiles']
         self.tiles = TileTracker(float(tcfg['size_m']), float(tcfg['reach_radius_m']), int(tcfg['max_failures']),
-                                 min_known=float(tcfg.get('min_known', 0.5)))
+                                 min_known=float(tcfg.get('min_known', 0.5)),
+                                 scene_min_known=float(tcfg.get('scene_min_known', 0.95)),
+                                 scene_max_free=float(tcfg.get('scene_max_free', 0.80)))
+        self.tiles.skip_scene = bool(cfg['modes'].get('exploring', {}).get('scenes', False))   # like the node
+        self.scenes_described = []                     # (label, pose) the scene mode asked the (absent) AI about
         self.scanner, self.paths = _Scanner(self), _Paths(self)
         self.opening_done, self.initial_heading = False, None
         self.events, self.logs = [], []
@@ -179,6 +190,14 @@ class HeadlessCtx:
         self.events.append((round(self.world.time, 1), kind, data))
 
     def on_mode_change(self, mode, phase):
+        pass
+
+    # scene mode: no AI in the simulation -> a call that has already failed (as mission_manager with use_ai false)
+    def describe_scene(self, label, pose):
+        self.scenes_described.append((label, list(pose) if pose else None))
+        return _NoAiCall()
+
+    def record_scene(self, label, pose, call):
         pass
 
     def on_complete(self, reason):
@@ -334,6 +353,8 @@ class HeadlessRun:
             'truth_tiles_visited': len(self.truth_visited & reach),
             'truth_tiles_missed': sorted(reach - self.truth_visited),
             'curtain_events': [e for e in self.ctx.events if e[1] == 'curtain'],
+            'scene_events': [e for e in self.ctx.events if e[1] in ('scene', 'scene_done')],
+            'truth_scenes': sorted(self.maze.scenes),
         }
 
 

@@ -34,7 +34,7 @@ def _resolve_maze(value, share):
 def _setup(context):
     share = get_package_share_directory(PKG)
     lc = lambda name: LaunchConfiguration(name).perform(context)  # noqa: E731
-    maze = _resolve_maze(lc('maze'), share)
+    maze = _resolve_maze(lc('map') or lc('maze'), share)          # map:= is accepted as another name for maze:=
     with open(maze, encoding='utf-8') as fh:
         tile_size = float((yaml.safe_load(fh) or {}).get('tile_size', 1.02))
 
@@ -66,6 +66,7 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('maze', default_value='arena_example',
                               description='path to a maze YAML, or the name of a bundled one (mazes/)'),
+        DeclareLaunchArgument('map', default_value='', description='same as maze (wins when given)'),
         DeclareLaunchArgument('use_curtains', default_value='true', description='mission curtain mode'),
         DeclareLaunchArgument('controller', default_value='rpp', description='rpp (vx, wz) | omni (vx, vy, wz)'),
         DeclareLaunchArgument('map_origin', default_value='start',

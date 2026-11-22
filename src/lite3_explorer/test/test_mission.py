@@ -115,6 +115,7 @@ class FakeCtx:
         self.truth, self.info = world if world is not None else corridor(length_m)
         self.reveal_m = reveal_m              # None: the whole map is known from the start
         self.tiles = TileTracker(max_failures=cfg['tiles']['max_failures'])
+        self.tiles.skip_scene = bool(cfg['modes']['exploring'].get('scenes', False))   # as mission_manager does
         if reveal_m is None:
             self.tiles.set_map(self.truth, self.info)
         else:
@@ -122,6 +123,7 @@ class FakeCtx:
             self.reveal()
         self.scanner, self.paths = FakeScanner(self), FakePaths(self)
         self.events, self.logs, self.drives = [], [], []
+        self.phases = []
         self.complete, self.cost, self.cleared = None, 0, 0
         self.stuck_tiles, self.fail_tiles, self.no_path = set(), set(), set()
         self.nav_up = True
@@ -197,7 +199,7 @@ class FakeCtx:
         self.events.append((kind, data))
 
     def on_mode_change(self, mode, phase):
-        pass
+        self.phases.append((mode, phase))
 
     # scene mode: the robot turns in place (drive) and a fake AI answers describe_scene
     def drive(self, vx, wz, vy=0.0):
@@ -688,17 +690,16 @@ def test_scene_turn_does_not_flip_direction_when_the_scene_tile_is_behind():
     assert turns and len({w > 0 for w in turns}) == 1                         # one direction all the way round
 
 
-def test_scene_tiles_only_count_beside_the_current_tile_and_are_checked_once_per_arrival():
+def test_scene_tiles_count_wherever_they_are_seen_and_are_never_driven_to():
     ctx, m = make(world=scene_world())
     ctx.nav_up = False
     run(ctx, m, steps=30, until_complete=False)               # grid placed, robot on tile 0,0; the scene tile 2,0 is two tiles away
     assert ctx.tiles.tiles[(2, 0)]['scene'] is True and ctx.tiles.current == (0, 0)
-    assert ctx.tiles.scene_tiles() == [] and not ctx.tiles.is_scene((2, 0))     # not beside the current tile: ordinary tile
-    assert ctx.tiles._drivable('2,0') or not ctx.tiles.skip_scene
-    ctx.tiles.trail.append((1, 0))                            # now it is next to 1,0
-    assert ctx.tiles.scene_tiles() == [(2, 0)] and ctx.tiles.is_scene((2, 0))
-    ctx.tiles.trail.append((0, 0))                            # and away again
-    assert ctx.tiles.scene_tiles() == []
+    assert ctx.tiles.scene_tiles() == [(2, 0)] and ctx.tiles.is_scene((2, 0))   # a scene tile from afar too
+    assert ctx.tiles.skip_scene and not ctx.tiles._drivable('2,0')              # so it is never a target
+    assert ctx.tiles.scene_neighbours((0, 0)) == []                             # not beside 0,0: nothing to look at
+    assert ctx.tiles.scene_neighbours((1, 0)) == [(2, 0)]                       # from 1,0 the scene mode takes it
+    assert ctx.tiles.scene_viewpoints((2, 0)) == [(1, 0)]
 
 
 # ------------------------------------------------------------------------------------------------ backtracking
@@ -762,6 +763,37 @@ def test_unreachable_split_option_is_retried_by_backtracking():
     assert 'backtracking' in modes_seen(m)
     assert any(k == 'backtracked' and d['tile'] == other for k, d in ctx.events)
     assert ctx.complete and ctx.tiles.unexplored() == []
+
+
+def test_backtracking_drives_through_tile_centres_with_three_waypoints_per_hop():
+    # the fake turns 0.2 s worth per 1 s tick: give the in-place turns time to finish
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.backtracking.align_timeout_s': 120.0},
+                  world=tee_world())
+    run(ctx, m, steps=400)
+    routes = [d for k, d in ctx.events if k == 'backtracking_route']
+    assert routes and all(r['route'] for r in routes)
+    g = ctx.tiles.grid
+    for r in routes:
+        via = [tuple(int(v) for v in lab.split(',')) for lab in r['via']]
+        poses = [(p['x'], p['y']) for p in r['route']]
+        assert len(poses) == 4 * (len(via) - 1)                   # per hop: 3 waypoints, then the next centre
+        for h, (a, b) in enumerate(zip(via, via[1:])):
+            (ax, ay), (bx, by) = g.center(a), g.center(b)
+            for i in range(4):                                   # 1/4, 1/2, 3/4 and the centre: on the straight line
+                x, y = poses[4 * h + i]
+                f = (i + 1) / 4
+                assert math.hypot(x - (ax + f * (bx - ax)), y - (ay + f * (by - ay))) < 0.01
+            hop_yaw = math.degrees(math.atan2(by - ay, bx - ax))
+            yaws = [p['yaw_deg'] for p in r['route'][4 * h:4 * h + 4]]
+            assert all(abs(y - hop_yaw) < 0.2 for y in yaws[:3])     # the waypoints face the tile the hop goes to
+            if h + 2 < len(via):                                   # a tile centre on the way faces the NEXT tile
+                (cx, cy) = g.center(via[h + 2])
+                assert abs(yaws[3] - math.degrees(math.atan2(cy - by, cx - bx))) < 0.2
+    assert any(r['phase'] == 'to_split' for r in routes) and any(r['phase'] == 'to_option' for r in routes)
+    phases = [ph for md, ph in ctx.phases if md == 'backtracking']
+    assert 'align' in phases                                      # turned in place at a tile centre before a hop
+    assert not any('could not turn' in msg for _, msg in ctx.logs)  # ... until it faced the next tile
+    assert ctx.complete
 
 
 # ------------------------------------------------------------------------------------------------ recovery: mppi + omni
@@ -857,3 +889,25 @@ def test_omni_traversal_stops_at_a_wall_in_the_costmap():
     res = tr.poll()
     assert res.state == FAILED and 'wall' in res.reason
     assert r.p[1] < 1.0                                 # never drove into it
+
+
+def test_scene_tile_is_never_a_target_and_is_looked_at_from_a_visited_neighbour():
+    ctx, m = make()                                     # corridor tiles 0,0 .. 3,0
+    ctx.nav_up = False                                  # scan and place the grid, but never drive
+    run(ctx, m, steps=30, until_complete=False)
+    tiles = ctx.tiles
+    tiles.skip_scene = True
+    for t in [(1, 0), (2, 0), (1, 0)]:                   # been to 2,0, now back on 1,0
+        tiles._visit(t, list(tiles.grid.center(t)) + [0.0], 'test')
+    tiles.update(force=True)
+    tiles.tiles[(3, 0)]['scene'] = True                  # 3,0 turned out to be a scene tile after the robot left 2,0
+    assert tiles.is_scene((3, 0)) and not tiles._drivable('3,0')
+    assert '3,0' not in [t['tile'] for t in tiles.targets(ctx.pose_[:2])]           # never driven into
+    strat = m.exploration('tiles')
+    cands = strat.candidates(list(tiles.grid.center((1, 0))) + [0.0])
+    view = [c for c in cands if c.get('scene') == '3,0']
+    assert [c['tile'] for c in view] == ['2,0']          # go back to the visited neighbour to look at it
+    assert '3,0' not in tiles.unreachable                # not eliminated for having no clear goal point
+    assert tiles.scene_neighbours((2, 0)) == [(3, 0)]    # standing there, the scene mode takes it
+    tiles.mark_described((3, 0))
+    assert not tiles.pending_scenes() and not [c for c in strat.candidates(ctx.pose_) if c.get('scene')]

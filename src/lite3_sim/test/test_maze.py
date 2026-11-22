@@ -67,3 +67,14 @@ def test_preview_round_trip():
     m = load_maze_dict({'layout': layout})
     drawn = render(m).splitlines()[1:]
     assert [ln[4:].rstrip() for ln in drawn] == [ln.rstrip() for ln in layout.strip().splitlines()]
+
+
+def test_zero_marks_a_scene_tile():
+    m = load_maze_dict({'layout': '+---+---+\n| > | 0 |\n+---+---+\n'})
+    assert m.scenes == {(1, 0)} and (1, 0) not in m.labels
+    assert (1, 0) not in m.reachable_tiles()                                   # never entered
+
+
+def test_the_start_cannot_be_a_scene_tile():
+    with pytest.raises(MazeError):
+        load_maze_dict({'layout': '+---+\n| 0 |\n+---+\n', 'start': {'tile': [0, 0]}})

@@ -70,6 +70,11 @@ class TileGrid:
 
 
 # --------------------------------------------------------------- alignment
+def wrap(a: float) -> float:
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+
 def _occupied_points(grid: np.ndarray, info: GridInfo, center: Sequence[float], radius_m: float,
                      occupied_threshold: int) -> np.ndarray:
     rows, cols = np.nonzero(grid >= occupied_threshold)
@@ -98,21 +103,61 @@ def estimate_wall_angle(points: np.ndarray, bin_m: float = 0.05) -> Optional[Tup
     return math.radians(best), float(scores[best] / max(1e-9, np.median(scores)))
 
 
-def best_offset(w: np.ndarray, size: float = 1.0, band_m: float = 0.08, step_m: float = 0.05) -> Tuple[float, int]:
-    """Offset o in [0, size) putting the most wall points on the lines w = o + k * size."""
-    best = (0.0, -1)
-    for o in np.arange(0.0, size, step_m):
-        d = np.mod(w - o, size)
-        hits = int(((d < band_m) | (d > size - band_m)).sum())
-        if hits > best[1]:
-            best = (float(o), hits)
-    return best
+def find_wall(along: np.ndarray, across: np.ndarray, *, d_min: float, d_max: float, half_span: float = 0.30,
+              band_m: float = 0.03, slot_m: float = 0.05, min_coverage: float = 0.8,
+              step_m: float = 0.01) -> Optional[float]:
+    """Nearest straight wall in one direction: points given as (along = distance in that direction, across =
+    sideways offset), both relative to the robot. A wall is a line `along = d` (d_min <= d <= d_max) whose points
+    cover at least min_coverage of the slot_m slots over |across| <= half_span, within band_m of the line: continuous,
+    so scattered clutter (objects, a scene tile) is not taken for a wall. Returns d (the best-covered line of the
+    nearest such wall) or None."""
+    keep = (np.abs(across) <= half_span) & (along >= d_min - band_m) & (along <= d_max + band_m)
+    along, across = along[keep], across[keep]
+    if len(along) == 0:
+        return None
+    n_slots = max(1, int(round(2 * half_span / slot_m)))
+    slot = np.clip(((across + half_span) / slot_m).astype(int), 0, n_slots - 1)
+    found = None
+    for d in np.arange(d_min, d_max + 1e-9, step_m):
+        on = np.abs(along - d) <= band_m
+        cover = len(np.unique(slot[on])) / n_slots
+        if cover >= min_coverage:
+            if found is None:
+                found = (d, cover, int(on.sum()))
+            elif d - found[0] > 2 * band_m:
+                break                                  # past the nearest wall
+            elif (cover, int(on.sum())) > (found[1], found[2]):
+                found = (d, cover, int(on.sum()))
+        elif found is not None and d - found[0] > 2 * band_m:
+            break
+    return None if found is None else float(np.median(along[np.abs(along - found[0]) <= band_m]))
+
+
+def start_tile_walls(pts: np.ndarray, robot_xy: Sequence[float], yaw: float, size: float) -> dict:
+    """Walls of the robot's own tile in the grid frame turned by yaw: {'+u', '-u', '+v', '-v'} -> distance from the
+    robot (m) or missing. Searched from a quarter to 0.7 of a tile away (a robot standing near the tile centre)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    dx, dy = pts[:, 0] - robot_xy[0], pts[:, 1] - robot_xy[1]
+    u, v = c * dx + s * dy, -s * dx + c * dy
+    out = {}
+    for key, along, across in (('+u', u, v), ('-u', -u, v), ('+v', v, u), ('-v', -v, u)):
+        d = find_wall(along, across, d_min=0.25 * size, d_max=0.7 * size)
+        if d is not None:
+            out[key] = d
+    return out
 
 
 def initial_candidates(grid: np.ndarray, info: GridInfo, robot_pose: Sequence[float], *,
                        size: float = 1.0, radius_m: float = 2.5, occupied_threshold: int = 65) -> List[dict]:
-    """Placements for the initial tile (always containing the robot), best guess first."""
+    """Placements for the initial tile (always containing the robot), best guess first.
+
+    A: turned to match the walls (estimate_wall_angle), with the edges on the walls of the robot's OWN tile: per axis
+    the wall behind the robot (opposite its heading, robot_pose[2]) if there is one, else the walls found on that
+    axis (two opposite walls: averaged), else centred on the robot. Only continuous walls next to the robot count
+    (start_tile_walls), so clutter further away (objects, a scene tile) does not move the grid.
+    Then the alternatives: centred on the robot (turned to the walls) and along the map axes."""
     rx, ry = robot_pose[0], robot_pose[1]
+    heading = robot_pose[2] if len(robot_pose) > 2 else None
 
     def centred(yaw):
         c, s = math.cos(yaw), math.sin(yaw)
@@ -125,20 +170,31 @@ def initial_candidates(grid: np.ndarray, info: GridInfo, robot_pose: Sequence[fl
     if est is not None:
         yaw, quality = est
         c, s = math.cos(yaw), math.sin(yaw)
-        u = c * pts[:, 0] + s * pts[:, 1]
-        v = -s * pts[:, 0] + c * pts[:, 1]
-        ou, hu = best_offset(u, size)
-        ov, hv = best_offset(v, size)
+        walls = start_tile_walls(pts, (rx, ry), yaw, size)
+        back = None
+        if heading is not None:                         # the grid direction pointing away from the heading
+            k = round(wrap(heading + math.pi - yaw) / (math.pi / 2)) % 4
+            back = ['+u', '+v', '-u', '-v'][k]
+        lows, used = [], []
+        for axis in ('u', 'v'):
+            keys = [k for k in ('+' + axis, '-' + axis) if k in walls]
+            if back in keys:
+                keys = [back]                            # the back wall wins on its axis
+            # edge of the tile on a wall: + side at d -> the tile starts at d - size; - side at d -> at -d
+            implied = [walls[k] - size if k[0] == '+' else -walls[k] for k in keys]
+            lows.append(sum(implied) / len(implied) if implied else -size / 2.0)
+            used += [f'{k} {walls[k]:.2f} m' + (' (back)' if k == back else '') for k in keys]
         ru, rv = c * rx + s * ry, -s * rx + c * ry
-        cu = ou + math.floor((ru - ou) / size) * size       # tile containing the robot
-        cv = ov + math.floor((rv - ov) / size) * size
+        cu, cv = ru + lows[0], rv + lows[1]
         aligned = TileGrid(c * cu - s * cv, s * cu + c * cv, yaw, size)
-        cands.append({'grid': aligned, 'kind': 'snapped to the nearby walls',
-                      'wall_points_on_edges': hu + hv, 'alignment_quality': round(quality, 2)})
+        cands.append({'grid': aligned, 'kind': 'turned to the walls, edges on the start tile\'s walls'
+                      + (f' ({", ".join(used)})' if used else ' (none found: centred on the robot)'),
+                      'walls': {k: round(d, 3) for k, d in walls.items()}, 'back': back,
+                      'alignment_quality': round(quality, 2)})
         centre = centred(yaw)
-        du = abs(((centre.to_local(rx, ry)[0]) - (aligned.to_local(rx, ry)[0])))
-        dv = abs(((centre.to_local(rx, ry)[1]) - (aligned.to_local(rx, ry)[1])))
-        if du > 0.15 or dv > 0.15:
+        du = abs(centre.to_local(rx, ry)[0] - aligned.to_local(rx, ry)[0])
+        dv = abs(centre.to_local(rx, ry)[1] - aligned.to_local(rx, ry)[1])
+        if du > 0.05 or dv > 0.05:
             cands.append({'grid': centre, 'kind': 'centred on the robot, turned to match the walls'})
     if est is None or abs(math.degrees(est[0]) % 90) > 3:
         cands.append({'grid': centred(0.0), 'kind': 'centred on the robot, along the map axes'})
