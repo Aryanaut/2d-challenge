@@ -198,7 +198,9 @@ mission_manager:
         type: scene
         next_mode: exploring
         rest_s: 1.5                          # stand still first (a scan spin just before is still coasting)
-        commit_deg: 150.0                    # target further round than this: keep the turn's direction (no flip at 180 deg)
+        center_tol_m: 0.06                   # then drive (vx / vy, heading held) to within this of the current tile's centre ...
+        center_timeout_s: 15.0               # (not there by then: face it from where it is) ...
+        commit_deg: 150.0                    # ... and only then turn to face the scene tile; target further round than this: keep the turn's direction
         align_tol_deg: 6.0
         align_timeout_s: 15.0
         min_turn_rad_s: 0.2

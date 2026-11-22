@@ -4,10 +4,11 @@
   ros2 launch lite3_sim sim.launch.py maze:=dead_ends                   # a bundled maze by name
   ros2 launch lite3_sim sim.launch.py maze:=/home/me/my_maze.yaml       # your own maze
   ros2 launch lite3_sim sim.launch.py use_curtains:=false controller:=omni speed_scale:=2.0
+  ros2 launch lite3_sim sim.launch.py maze:=stairs_loop                 # staircase ('M') climbed in AI mode
   ros2 launch lite3_sim sim.launch.py use_mission:=false                # sim + RViz only; run mission_manager yourself
 
 The mission manager gets lite3_explorer's config/mission.yaml (mission_params:=...), then config/sim_mission.yaml
-(no AI, no terrain classifier, no animations, curtains on), then tiles.size_m from the maze file.
+(no AI, no terrain classifier, no animations, curtains and stairs on), then tiles.size_m from the maze file.
 """
 import os
 
@@ -51,6 +52,7 @@ def _setup(context):
         mission = [lc('mission_params'), lc('sim_mission_params'),
                    {'tiles.size_m': tile_size,
                     'modes.exploring.curtains': lc('use_curtains').lower() == 'true',
+                    'modes.exploring.stairs': lc('use_stairs').lower() == 'true',
                     'modes.idle.auto_start': lc('auto_start').lower() == 'true'}]
         actions.append(Node(package='lite3_explorer', executable='mission_manager', name='mission_manager',
                             output='screen', parameters=mission))
@@ -68,6 +70,8 @@ def generate_launch_description():
                               description='path to a maze YAML, or the name of a bundled one (mazes/)'),
         DeclareLaunchArgument('map', default_value='', description='same as maze (wins when given)'),
         DeclareLaunchArgument('use_curtains', default_value='true', description='mission curtain mode'),
+        DeclareLaunchArgument('use_stairs', default_value='true',
+                              description="mission stairs mode: climb over 'M' staircase tiles in AI mode"),
         DeclareLaunchArgument('controller', default_value='rpp', description='rpp (vx, wz) | omni (vx, vy, wz)'),
         DeclareLaunchArgument('map_origin', default_value='start',
                               description='start: map frame at the start pose (like SLAM) | maze: at the maze corner'),

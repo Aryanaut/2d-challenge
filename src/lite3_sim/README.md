@@ -1,8 +1,8 @@
 # lite3_sim: maze simulator for lite3_explorer
 
-Tests **exploration, the tile grid and curtain mode** of `lite3_explorer` in mazes you draw yourself, and shows
-everything in RViz. It does **not** simulate gaits / gait switching, terrain, stairs, pose / scene animations
-(quickscan) or the AI.
+Tests **exploration, the tile grid, curtain mode and stairs mode** of `lite3_explorer` in mazes you draw yourself, and
+shows everything in RViz. It does **not** simulate gaits / gait switching, terrain, the climb itself (no pitch or
+height), pose / scene animations (quickscan) or the AI.
 
 `lite3_sim` stands in for everything *around* the mission manager: the robot, the lidar, slam_toolbox and Nav2.
 Your **unmodified** `mission_manager` runs against it. It gets the same topics, TF, actions and services it uses on
@@ -19,6 +19,8 @@ the dog, so what you debug here is the real node.
 | bt_navigator default tree | on a planner / controller failure: clear costmaps → spin 90° → wait 5 s → back up 0.3 m (round robin), 6 retries, then abort |
 | behavior_server `spin` | relative turn at ≤ 1 rad/s, aborts on collision / time allowance |
 | `curtain_detector` (depth camera) | curtain points in the camera's 81° view, line of sight, ≥ 30 % of the image width → `/curtain/points` |
+| `stair_detector` (depth camera) | tread and floor points in the camera's 81° view (2.5 m, past walls) run through lite3_explorer's real `stairs_core` → `/stairs/points`; paused in AI mode |
+| Lite3 AI mode (`/simple_cmd` `0x21010528` / `0x2101052B`) | the robot gets over stair risers only in AI mode (`/ai_mode` when `transfer_interfaces` is not installed) |
 
 ## Build and run
 
@@ -35,8 +37,9 @@ Launch arguments:
 
 | Argument | Default | |
 |---|---|---|
-| `maze` | `arena_example` | path to a maze YAML, or a bundled name: `corridor`, `curtain_corridor`, `curtain_loop`, `dead_ends`, `arena_example` |
+| `maze` | `arena_example` | path to a maze YAML, or a bundled name: `corridor`, `curtain_corridor`, `curtain_loop`, `dead_ends`, `stairs_loop`, `arena_example` |
 | `use_curtains` | `true` | the mission's curtain mode (`modes.exploring.curtains`) |
+| `use_stairs` | `true` | the mission's stairs mode (`modes.exploring.stairs`) |
 | `controller` | `rpp` | `rpp` (vx, wz) or `omni` (vx, vy, wz, like `controller:=mppi` on the robot) |
 | `map_origin` | `start` | `start`: map frame at the start pose, like SLAM. `maze`: at the maze's south-west corner |
 | `speed_scale` | `1.0` | robot speed multiplier. The mission's timeouts are wall-clock time, so stay ≤ ~3 |
@@ -92,12 +95,17 @@ extra:                   # optional free geometry, metres, origin = SW corner of
 |---|---|
 | horizontal edge (between `+`) | `---` wall panel, `~~~` curtain, `===` slit panel, spaces = open |
 | vertical edge | `\|` wall panel, `~` curtain, `!` slit panel, space = open |
-| inside a tile | `>` `<` `^` `v` start facing E W N S (or `S` + `start.heading`), `#` solid (not floor), anything else = label shown in RViz (`R1`, `ST`...) |
+| inside a tile | `>` `<` `^` `v` start facing E W N S (or `S` + `start.heading`), `#` solid (not floor), `0` scene tile, `M` staircase, anything else = label shown in RViz (`R1`...) |
 
 - **wall panel**: blocks the lidar and the robot.
 - **curtain**: the lidar sees a wall (it hangs in the scan band); the robot walks through. The simulated depth camera
   reports it on `/curtain/points` for curtain mode.
 - **slit panel**: the aluminium-frame panels. They block the robot, but the lidar sees through the slit at each end.
+- **staircase** (`M`): steps go up from every open side of the tile to a landing (`stairs: {steps: 2, rise_m: 0.13,
+  run_m: 0.20}` in the maze file). The risers on those sides look like walls to the lidar and block the robot unless it
+  is in AI mode; the simulated depth camera reports the treads on `/stairs/points`. The mission's stairs mode squares
+  up to it, turns AI mode on, climbs over it into the tile beyond, turns AI mode off and walls it off. Since it is
+  walled off afterwards, give the tiles beyond it another way back (see `mazes/stairs_loop.yaml`), or they are cut off.
 
 Check a layout before running it:
 ```bash

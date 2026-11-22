@@ -20,7 +20,12 @@ What stands in for what:
                         lidar ray crosses is mapped from a fixed per-tile pattern (scene.fill of them occupied, the
                         rest free; the margin is mapped as usual, so walls on the tile's edges stay); the rays go on
                         (the lidar sees past the clutter), the robot collides with the cluttered square
-Not simulated: terrain, stairs, gaits, the AI. The robot collides with wall panels and slit panels, not curtains.
+  staircases ('M')      risers on the tile's open sides: the lidar sees a wall; the robot collides with them unless
+                        it is in AI mode (/simple_cmd AI_ON / AI_OFF codes). stair_detector: the stair camera builds the
+                        treads and the floor in the depth camera's view as 3D points and runs lite3_explorer's
+                        stairs_core detector on them (paused in AI mode, like the real node) -> StairMap
+Not simulated: terrain, gaits (other /simple_cmd codes), the AI, the climb itself (the robot walks over the stairs
+like over the floor). The robot collides with wall panels, slit panels and (outside AI mode) stair risers.
 """
 from __future__ import annotations
 
@@ -31,12 +36,18 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from lite3_sim.costmap import (INSCRIBED, GridInfo, GridPlanner, OccupancyMapper, inflate, path_length)
-from lite3_sim.maze import CURTAIN, Maze
+from lite3_sim.maze import CURTAIN, STAIRS, Maze
 
 try:
     from lite3_explorer.curtain_core import CurtainMap
 except ImportError:                                     # pragma: no cover
     CurtainMap = None
+try:
+    from lite3_explorer import stairs_core as SC
+except ImportError:                                     # pragma: no cover
+    SC = None
+
+AI_ON, AI_OFF = 0x21010528, 0x2101052B                  # /simple_cmd MotionSimpleCMD cmd_code: robot AI mode on / off
 
 RUNNING, SUCCEEDED, FAILED, CANCELLED = 'running', 'succeeded', 'failed', 'cancelled'
 
@@ -68,6 +79,11 @@ DEFAULTS = {
     'curtain_camera': {'enabled': True, 'rate_hz': 2.0, 'hfov_deg': 81.4, 'range_min': 0.30, 'range_max': 3.5,
                        'x_offset_m': 0.30, 'min_columns': 0.30, 'point_step_m': 0.05, 'noise_m': 0.015,
                        'cell_m': 0.05, 'confirm_hits': 3},
+    # stands in for stair_detector (config/stairs.yaml): a depth camera height_m above the floor, its treads and floor
+    # points every point_step_m in view (range, hfov, line of sight past walls) -> stairs_core -> StairMap
+    'stair_camera': {'enabled': True, 'rate_hz': 2.0, 'hfov_deg': 81.4, 'range_min': 0.30, 'range_max': 2.5,
+                     'x_offset_m': 0.30, 'height_m': 0.40, 'point_step_m': 0.02, 'noise_m': 0.004,
+                     'map_cell_m': 0.10, 'confirm_hits': 3},
     # scene tiles ('0' in the layout): clutter mapped as fill share of occupied cells inside margin_m of the tile edges
     # (with the defaults about a third of the tile is occupied: the mission manager's scene_max_free is 0.85)
     'scene': {'margin_m': 0.15, 'fill': 0.6, 'seed': 0},
@@ -111,10 +127,16 @@ class Geometry:
         self.segs = np.array(segs, float).reshape(-1, 4)
         self.kinds = np.array(kinds, object)
         self.is_curtain = self.kinds == CURTAIN
+        self.is_stairs = self.kinds == STAIRS
         self.half_thickness = 0.5 * maze.wall_thickness
-        # collision points along every wall / slit panel (curtains are walked through)
-        pts = []
-        for (x0, y0, x1, y1), curtain in zip(self.segs, self.is_curtain):
+        # collision points along every wall / slit panel (curtains are walked through, stair risers climbed in AI mode)
+        pts, risers = [], []
+        for (x0, y0, x1, y1), curtain, stairs in zip(self.segs, self.is_curtain, self.is_stairs):
+            if stairs:
+                n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / 0.02)))
+                t = np.linspace(0.0, 1.0, n + 1)
+                risers.append(np.stack([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t], axis=1))
+                continue
             if curtain:
                 continue
             n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / 0.02)))
@@ -135,6 +157,7 @@ class Geometry:
                                  np.linspace(j * size + m, (j + 1) * size - m, k))
             pts.append(np.array([tf(u, v) for u, v in zip(gu.ravel(), gv.ravel())], float))
         self.solid_pts = np.concatenate(pts) if pts else np.zeros((0, 2))
+        self.riser_pts = np.concatenate(risers) if risers else np.zeros((0, 2))
         cpts, cseg = [], []
         for k in np.flatnonzero(self.is_curtain):
             x0, y0, x1, y1 = self.segs[k]
@@ -171,11 +194,13 @@ class Geometry:
         rng = t[np.arange(len(angles)), idx]
         return rng, np.where(np.isfinite(rng), idx, -1)
 
-    def collides(self, x, y, yaw, length, width) -> bool:
-        if len(self.solid_pts) == 0:
+    def collides(self, x, y, yaw, length, width, climb: bool = False) -> bool:
+        """The body at (x, y, yaw) touches a wall / slit panel / clutter, or a stair riser unless `climb` (AI mode)."""
+        pts = self.solid_pts if climb or len(self.riser_pts) == 0 else np.concatenate([self.solid_pts, self.riser_pts])
+        if len(pts) == 0:
             return False
         hl, hw = 0.5 * length + self.half_thickness, 0.5 * width + self.half_thickness
-        d = self.solid_pts - (x, y)
+        d = pts - (x, y)
         near = np.abs(d).max(axis=1) <= math.hypot(hl, hw)
         if not near.any():
             return False
@@ -476,11 +501,19 @@ class World:
                                    tolerance_m=float(cfg['planner']['tolerance_m']),
                                    allow_unknown=bool(cfg['planner']['allow_unknown']))
         self.last_scan = None                                # (angles_robot, ranges, stamp)
-        self._next = {'scan': 0.0, 'map': 0.0, 'global': 0.0, 'local': 0.0, 'curtain': 0.0}
+        self._next = {'scan': 0.0, 'map': 0.0, 'global': 0.0, 'local': 0.0, 'curtain': 0.0, 'stairs': 0.0}
         cc = cfg['curtain_camera']
         self.curtains = CurtainMap(float(cc['cell_m']), int(cc['confirm_hits'])) if CurtainMap else None
         self.curtain_version = 0
         self.curtain_seen_now = np.zeros((0, 2))
+        self.ai_mode = False                                 # robot AI mode (stairs): stair risers are climbed
+        sc_cfg = cfg['stair_camera']
+        self.stairs = SC.StairMap(float(sc_cfg['map_cell_m']), int(sc_cfg['confirm_hits'])) if SC and maze.stairs \
+            else None
+        self.stair_floor = SC.FloorEstimate() if SC else None
+        self.stair_version, self.stair_frame = 0, 0
+        self.stair_seen_now = np.zeros((0, 2))
+        self._stair_pts_maze = self._stair_surface() if self.stairs is not None else np.zeros((0, 3))
         self.rng = np.random.default_rng(0)
         self.events: List[str] = []
 
@@ -562,6 +595,13 @@ class World:
     def set_cmd_vel(self, vx, vy, wz):
         self.cmd_vel = (float(vx), float(vy), float(wz), self.time)
 
+    def simple_cmd(self, cmd_code: int):
+        """A /simple_cmd MotionSimpleCMD: the AI mode codes switch AI mode; other codes (gaits) are not simulated."""
+        code = int(cmd_code)
+        if code in (AI_ON, AI_OFF) and (code == AI_ON) != self.ai_mode:
+            self.ai_mode = code == AI_ON
+            self.log(f'AI mode {"ON: stair risers are climbed" if self.ai_mode else "OFF"} (0x{code:08X})')
+
     def set_virtual_walls(self, pts):
         self.virtual_pts = np.asarray(pts, float).reshape(-1, 2)
 
@@ -612,7 +652,7 @@ class World:
         g = self.geometry
         self.bumped = False
         for cand in ((nx, ny, nyaw), (x, y, nyaw), (nx, ny, yaw)):
-            if not g.collides(*cand, self.length, self.width):
+            if not g.collides(*cand, self.length, self.width, climb=self.ai_mode):
                 if cand != (nx, ny, nyaw):
                     self.bumped = True
                 self.pose = list(cand)
@@ -639,6 +679,9 @@ class World:
             self.update_local_costmap()
         if cfg['curtain_camera']['enabled'] and self._due('curtain', cfg['curtain_camera']['rate_hz']):
             self.sense_curtains()
+        if self.stairs is not None and cfg['stair_camera']['enabled'] and \
+                self._due('stairs', cfg['stair_camera']['rate_hz']):
+            self.sense_stairs()
 
     # -------------------------------------------------------------------- sensors
     def scan(self):
@@ -736,6 +779,82 @@ class World:
 
     def curtain_points(self) -> np.ndarray:
         return self.curtains.confirmed() if self.curtains is not None else np.zeros((0, 4))
+
+    def _stair_surface(self) -> np.ndarray:
+        """Tread / landing points of every staircase tile, maze frame (x, y, z), every point_step_m."""
+        mz, step = self.maze, float(self.cfg['stair_camera']['point_step_m'])
+        out = []
+        for i, j in sorted(mz.stairs):
+            u = (np.arange(0.5 * step, mz.tile_size, step))
+            gu, gv = np.meshgrid(i * mz.tile_size + u, j * mz.tile_size + u)
+            gz = np.array([mz.stair_height(a, b) for a, b in zip(gu.ravel(), gv.ravel())])
+            out.append(np.stack([gu.ravel(), gv.ravel(), gz], axis=1))
+        return np.concatenate(out) if out else np.zeros((0, 3))
+
+    def sense_stairs(self):
+        """Depth camera -> stair detector: the treads and the floor in view (range, field of view, not behind a wall)
+        as 3D points in the map frame, run through lite3_explorer's stairs_core like the real stair_detector node
+        (FloorEstimate, chain of levels, StairMap). Paused in AI mode, like the real node. True if stairs were seen."""
+        self.stair_seen_now = np.zeros((0, 2))
+        if self.ai_mode:
+            return False
+        sc_cfg, mz = self.cfg['stair_camera'], self.maze
+        x, y, yaw = self.pose
+        cx, cy = x + math.cos(yaw) * sc_cfg['x_offset_m'], y + math.sin(yaw) * sc_cfg['x_offset_m']
+        rmin, rmax, half = float(sc_cfg['range_min']), float(sc_cfg['range_max']), math.radians(sc_cfg['hfov_deg']) / 2
+        step = float(sc_cfg['point_step_m'])
+        # floor in the field of view (polar grid), minus staircases / solid tiles / scene clutter
+        rs = np.arange(rmin, rmax, step)
+        angs = np.arange(-half, half, step / rmax)
+        rr, aa = np.meshgrid(rs, angs)
+        keep = np.random.default_rng(self.stair_frame).random(rr.shape) < (rr / rmax)   # even density on the floor
+        fx, fy = cx + rr[keep] * np.cos(yaw + aa[keep]), cy + rr[keep] * np.sin(yaw + aa[keep])
+        inv = invert(self.map_T_maze)
+        c, s = math.cos(inv[2]), math.sin(inv[2])
+        mx, my = inv[0] + c * fx - s * fy, inv[1] + s * fx + c * fy
+        ti, tj = np.floor(mx / mz.tile_size).astype(int), np.floor(my / mz.tile_size).astype(int)
+        blocked = set(mz.stairs) | mz.solid | mz.scenes
+        on_floor = np.array([(a, b) not in blocked for a, b in zip(ti, tj)], bool) & \
+            (ti >= 0) & (tj >= 0) & (ti < mz.cols) & (tj < mz.rows)
+        floor = np.stack([fx[on_floor], fy[on_floor], np.zeros(int(on_floor.sum()))], axis=1)
+        # treads, maze -> map frame
+        st = self._stair_pts_maze
+        c2, s2 = math.cos(self.map_T_maze[2]), math.sin(self.map_T_maze[2])
+        tx = self.map_T_maze[0] + c2 * st[:, 0] - s2 * st[:, 1]
+        ty = self.map_T_maze[1] + s2 * st[:, 0] + c2 * st[:, 1]
+        treads = np.stack([tx, ty, st[:, 2]], axis=1)
+        pts = np.vstack([floor, treads])
+        d = pts[:, :2] - (cx, cy)
+        dist = np.hypot(d[:, 0], d[:, 1])
+        bearing = np.arctan2(np.sin(np.arctan2(d[:, 1], d[:, 0]) - yaw), np.cos(np.arctan2(d[:, 1], d[:, 0]) - yaw))
+        view = (dist >= rmin) & (dist <= rmax) & (np.abs(bearing) <= half)
+        pts, dist, bearing = pts[view], dist[view], bearing[view]
+        if len(pts) == 0:
+            return False
+        # line of sight past walls (not the risers: the camera looks down over them): one ray per half degree
+        bins = np.linspace(-half, half, int(math.degrees(2 * half) * 2) + 1)
+        wall, _ = self.geometry.raycast(cx, cy, bins + yaw, rmax + 0.1, skip=self.geometry.is_stairs)
+        k = np.clip(np.searchsorted(bins, bearing), 0, len(bins) - 1)
+        pts = pts[dist < wall[k] - 0.02]
+        if len(pts) == 0:
+            return False
+        pts = pts + self.rng.normal(0.0, float(sc_cfg['noise_m']), pts.shape) * np.array([0.3, 0.3, 1.0])
+        levels = SC.find_levels(pts, (cx, cy))
+        det = SC.chain_stairs(levels, SC.StairParams(), self.stair_floor.update(levels))
+        if det is None:
+            return False
+        self.stair_frame += 1
+        self.stair_seen_now = det.xy
+        before = len(self.stairs)
+        if self.stairs.add(det, self.stair_frame):
+            self.stair_version += 1
+            if before == 0:
+                self.log(f'stair camera: staircase confirmed, {det.steps} steps of {det.rise_m * 100:.0f} cm')
+        return True
+
+    def stair_points(self) -> np.ndarray:
+        """Confirmed stair cells, Nx4 (x, y, ux, uy) like /stairs/points."""
+        return self.stairs.confirmed() if self.stairs is not None else np.zeros((0, 4))
 
     # -------------------------------------------------------------------- lookups
     def cost_at(self, grid_info_pair, x, y):

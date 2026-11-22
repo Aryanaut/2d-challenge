@@ -882,9 +882,11 @@ class MppiMode(Mode):
 class SceneMode(Mode):
     """A scene tile shares a side with the tile the robot stands on: look at it, never enter it.
 
-    Phases: rest (stand still: a spin just before, e.g. the scan, is still coasting) -> align (turn in place to face the
-    scene tile's centre by the shorter way, and keep that direction while it is almost behind the robot: right at 180 deg
-    the shorter way flips with every bit of coasting) -> settle (stand still) -> describe (the AI is asked
+    Phases: rest (stand still: a spin just before, e.g. the scan, is still coasting) -> center (drive with vx / vy, the
+    heading held, to the centre of the tile the robot stands on, within center_tol_m; not there after center_timeout_s:
+    go on from where it is) -> align (only now: turn in place to face the scene tile's centre by the shorter way, and
+    keep that direction while it is almost behind the robot: right at 180 deg the shorter way flips with every bit of
+    coasting) -> settle (stand still) -> describe (the AI is asked
     what is on the tile; retried llm_attempts times) -> next_mode (exploring), with the scene tile marked explored
     whatever the AI said (machine.scenes_done: never twice). The robot does not leave its tile."""
 
@@ -892,6 +894,7 @@ class SceneMode(Mode):
         super().__init__(name, machine, cfg)
         self.label, self.tile, self.yaw, self.call, self.attempt, self.pose0 = None, None, 0.0, None, 0, None
         self.turn_dir = 0                                  # +1 / -1: the direction the turn started in
+        self.centre, self.hold_yaw = None, None            # the current tile's centre; heading held driving there
 
     def targets(self):
         return [self.cfg.get('next_mode', 'exploring')]
@@ -906,10 +909,22 @@ class SceneMode(Mode):
             return
         self.tile = tuple(int(v) for v in tile.split(','))
         self.machine.scenes_done.add(tile)
-        cx, cy = tiles.grid.center(self.tile)
-        self.yaw = math.atan2(cy - pose[1], cx - pose[0])
-        self.ctx.event('scene', tile=tile, yaw_deg=round(math.degrees(self.yaw), 1))
+        here = tiles.current if tiles.current is not None else tiles.grid.tile_of(pose[0], pose[1])
+        self.centre = tuple(tiles.grid.center(tuple(here)))
+        self.yaw = self._facing(self.centre)
+        self.ctx.event('scene', tile=tile, from_tile=T.tile_label(here), yaw_deg=round(math.degrees(self.yaw), 1))
         self.set_phase('rest')
+
+    def _facing(self, xy):
+        """Heading from xy to the scene tile's centre."""
+        cx, cy = self.ctx.tiles.grid.center(self.tile)
+        return math.atan2(cy - xy[1], cx - xy[0])
+
+    def _start_align(self, pose):
+        self.ctx.stop()
+        self.yaw = self._facing(pose)                      # from where the robot really is (the centre, or near it)
+        self.turn_dir = 0
+        self.set_phase('align')
 
     def _finish(self, why):
         self.ctx.stop()
@@ -935,7 +950,27 @@ class SceneMode(Mode):
         if self.phase == 'rest':
             self.ctx.stop()
             if self.in_phase_s() >= float(c.get('rest_s', 1.5)):
-                self.set_phase('align')
+                self.hold_yaw = pose[2]
+                self.set_phase('center')
+            return None
+        if self.phase == 'center':
+            dx, dy = self.centre[0] - pose[0], self.centre[1] - pose[1]
+            dist = math.hypot(dx, dy)
+            if dist <= float(c.get('center_tol_m', 0.06)):
+                self._start_align(pose)
+                return None
+            if self.in_phase_s() > float(c.get('center_timeout_s', 15.0)):
+                self.ctx.log('warn', f'Scene tile {self.label}: could not reach the tile centre ({dist:.2f} m off); '
+                                     f'facing it from here.')
+                self._start_align(pose)
+                return None
+            v = max(float(c.get('center_min_speed_mps', 0.05)),
+                    min(float(c.get('center_speed_mps', 0.15)), float(c.get('center_gain', 1.0)) * dist))
+            ux, uy = v * dx / dist, v * dy / dist                   # map frame -> robot frame vx / vy
+            cs, sn = math.cos(pose[2]), math.sin(pose[2])
+            herr = math.atan2(math.sin(self.hold_yaw - pose[2]), math.cos(self.hold_yaw - pose[2]))
+            wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * herr))
+            self.ctx.drive(ux * cs + uy * sn, wz, -ux * sn + uy * cs)
             return None
         if self.phase == 'align':
             err = math.atan2(math.sin(self.yaw - pose[2]), math.cos(self.yaw - pose[2]))

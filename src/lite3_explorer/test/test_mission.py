@@ -917,3 +917,35 @@ def test_scene_tile_is_looked_at_from_a_visited_neighbour():
     assert tiles.scene_neighbours((2, 0)) == [(3, 0)]    # standing there, the scene mode takes it
     tiles.mark_described((3, 0))
     assert not tiles.pending_scenes() and not [c for c in strat.candidates(ctx.pose_) if c.get('scene')]
+
+
+def test_scene_mode_reaches_the_tile_centre_before_turning_to_the_scene():
+    ctx, m = make(world=scene_world())
+    cmds = []
+
+    def drive(vx, wz, vy=0.0):                   # a robot that slides with vx / vy and turns with wz (1 tick = 1 s)
+        cmds.append((vx, vy, wz))
+        p = ctx.pose_
+        c, s = math.cos(p[2]), math.sin(p[2])
+        p[0], p[1], p[2] = p[0] + vx * c - vy * s, p[1] + vx * s + vy * c, p[2] + wz
+    ctx.drive = drive
+    at_align = []
+    spy = ctx.on_mode_change
+
+    def phases(mode, phase):
+        if mode == 'scene' and phase == 'rest':
+            ctx.pose_[:] = [1.32, 0.31, math.pi / 2]           # nudged off the centre of tile 1,0, facing away
+        if mode == 'scene' and phase == 'align':
+            at_align.append((list(ctx.pose_), len(cmds)))
+        return spy(mode, phase)
+    ctx.on_mode_change = phases
+    run(ctx, m, 300)
+    assert ctx.asked and ctx.asked[0][0] == '2,0'
+    pose, n = at_align[0]
+    assert math.hypot(pose[0] - 1.5, pose[1] - 0.5) <= 0.06 + 1e-6            # centred first ...
+    centring, turning = cmds[:n], cmds[n:]
+    assert centring and all(abs(vx) + abs(vy) > 0 for vx, vy, _ in centring)  # ... sliding, heading held ...
+    assert abs(pose[2] - math.pi / 2) < 0.05
+    assert turning and all(vx == 0 and vy == 0 for vx, vy, _ in turning)      # ... then only turned in place
+    looked = ctx.asked[0][1]
+    assert abs(math.atan2(math.sin(looked[2]), math.cos(looked[2]))) <= math.radians(6) + 1e-6   # facing east, at it

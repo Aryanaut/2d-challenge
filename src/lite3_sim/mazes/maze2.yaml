@@ -1,0 +1,11 @@
+# Branches and dead ends: tests backtracking (direct_fallback) and recovery.
+name: 
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+---+
+  | 0           0 |       |
+  |---+       +---+   +---+
+  | 0           0 | M |   
+  |---+       +---+   +
+  | >                 |   
+  +---+---+---+---+---+

@@ -12,7 +12,7 @@ import argparse
 import math
 import sys
 
-from lite3_sim.maze import CURTAIN, SLIT, WALL, MazeError, load_maze
+from lite3_sim.maze import CURTAIN, SLIT, STAIRS, WALL, MazeError, load_maze
 
 H = {WALL: '---', CURTAIN: '~~~', SLIT: '===', None: '   '}
 V = {WALL: '|', CURTAIN: '~', SLIT: '!', None: ' '}
@@ -27,7 +27,8 @@ def render(maze) -> str:
         top = '    +' + ''.join(H[maze.edge((i, j), 'N')] + '+' for i in range(maze.cols))
         row = f'{j:3d} ' + V[maze.edge((0, j), 'W')]
         for i in range(maze.cols):
-            cell = ('#' if (i, j) in maze.solid else '0' if (i, j) in maze.scenes else arrow if (i, j) == start
+            cell = ('#' if (i, j) in maze.solid else '0' if (i, j) in maze.scenes else 'M' if (i, j) in maze.stairs
+                    else arrow if (i, j) == start
                     else maze.labels.get((i, j), ''))
             row += f'{cell:^3s}' + V[maze.edge((i, j), 'E')]
         lines += [top, row]
@@ -41,7 +42,8 @@ def save_png(maze, path):
     import matplotlib.pyplot as plt
     w, h = maze.size_m
     fig, ax = plt.subplots(figsize=(max(4, w * 1.2), max(3, h * 1.2)))
-    style = {WALL: dict(color='0.25', lw=3), SLIT: dict(color='tab:blue', lw=3), CURTAIN: dict(color='c', lw=3, ls='--')}
+    style = {WALL: dict(color='0.25', lw=3), SLIT: dict(color='tab:blue', lw=3), CURTAIN: dict(color='c', lw=3, ls='--'),
+             STAIRS: dict(color='gold', lw=3, ls=':')}
     for s in maze.segments:
         ax.plot([s.x0, s.x1], [s.y0, s.y1], **style[s.kind])
     for t in maze.solid:
@@ -51,6 +53,10 @@ def save_png(maze, path):
         ax.add_patch(plt.Rectangle((t[0] * maze.tile_size + 0.15, t[1] * maze.tile_size + 0.15),
                                    maze.tile_size - 0.3, maze.tile_size - 0.3, color='orange', alpha=0.5))
         ax.text(*maze.tile_centre(t), 'scene', ha='center', va='center', fontsize=8)
+    for t, sides in maze.stairs.items():
+        ax.add_patch(plt.Rectangle((t[0] * maze.tile_size, t[1] * maze.tile_size), maze.tile_size, maze.tile_size,
+                                   color='gold', alpha=0.35))
+        ax.text(*maze.tile_centre(t), 'stairs\n(' + '/'.join(sides) + ')', ha='center', va='center', fontsize=8)
     for t, text in maze.labels.items():
         ax.text(*maze.tile_centre(t), text, ha='center', va='center')
     sx, sy, syaw = maze.start
@@ -61,7 +67,8 @@ def save_png(maze, path):
     ax.set_aspect('equal')
     ax.set_xlim(-0.2, w + 0.2)
     ax.set_ylim(-0.2, h + 0.2)
-    ax.set_title(f'{maze.name}: walls (grey), slit panels (blue), curtains (cyan dashed), scene tiles (orange)')
+    ax.set_title(f'{maze.name}: walls (grey), slit panels (blue), curtains (cyan dashed), scene tiles (orange), '
+                 f'staircases (gold, risers dotted)')
     fig.savefig(path, dpi=120, bbox_inches='tight')
 
 
@@ -77,9 +84,15 @@ def main(argv=None):
         return 1
     print(maze.summary())
     print(render(maze))
-    unreachable = sorted(set(maze.floor_tiles()) - maze.reachable_tiles())
+    unreachable = sorted(set(maze.floor_tiles()) - maze.reachable_tiles() - set(maze.stairs))
     if unreachable:
         print(f'Floor tiles the dog can never reach (closed off): {unreachable}')
+    for t, sides in sorted(maze.stairs.items()):
+        print(f'Staircase on tile {t[0]},{t[1]}: climbed from {", ".join(sides)} ({maze.stair_steps} steps of '
+              f'{maze.stair_rise_m * 100:.0f} cm up to the landing); the stairs mode crosses it')
+    beyond = sorted(maze.reachable_tiles() - maze.reachable_tiles(through_stairs=False))
+    if beyond:
+        print(f'Only reachable over a staircase: {beyond}')
     if a.png:
         save_png(maze, a.png)
         print(f'saved {a.png}')

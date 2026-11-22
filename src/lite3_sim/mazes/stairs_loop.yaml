@@ -1,0 +1,18 @@
+# A loop with a staircase ('M', tile 2,0) in its south corridor, climbed from the west or the east (its north side is a
+# wall). The lidar sees the staircase's risers as walls, so Nav2 never drives onto it; the simulated depth camera sees
+# the treads and reports them on /stairs/points. The mission's stairs mode (modes.exploring.stairs: true, on by default
+# in lite3_sim) squares up to it from tile 1,0 or 3,0, turns AI mode on (the sim robot only gets over the risers in AI
+# mode), climbs over it into the tile on the far side, turns AI mode off and walls the staircase off. The north
+# corridor joins both ends, so the tiles on the far side are never cut off by that virtual wall.
+name: stairs_loop
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+
+  |                   |
+  +   +---+---+---+   +
+  | >       M         |
+  +---+---+---+---+---+
+stairs:
+  steps: 2          # per side, up to the landing in the middle of the tile
+  rise_m: 0.13
+  run_m: 0.20

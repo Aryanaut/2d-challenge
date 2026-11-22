@@ -29,18 +29,20 @@ from lite3_explorer.mission.config import DEFAULTS as MISSION_DEFAULTS, merge_fl
 from lite3_explorer.mission.core import ModeMachine
 from lite3_explorer.mission.traversal import FAILED, RUNNING, SUCCEEDED, Traversal, TraversalResult
 from lite3_explorer.tile_tracker import TileTracker
+from lite3_explorer.tiles import tile_label as T_label
 
 from lite3_sim import world as W
 from lite3_sim.maze import load_maze
 
 # Mission settings the simulation always uses (on top of the mission YAML): no AI, no terrain classifier, no
-# animation player, curtain mode on.
+# animation player, curtain and stairs modes on.
 SIM_MISSION = {
     'use_ai': False,
     'terrain_classify_service': '',
     'modes.exploring.classify_target': False,
     'modes.exploring.quickscan_on_edge': False,
     'modes.exploring.curtains': True,
+    'modes.exploring.stairs': True,
     'modes.idle.start_wait_s': 5.0,
 }
 
@@ -168,6 +170,9 @@ class HeadlessCtx:
                                  scene_min_known=float(tcfg.get('scene_min_known', 0.95)),
                                  scene_max_free=float(tcfg.get('scene_max_free', 0.80)))
         self.tiles.skip_scene = bool(cfg['modes'].get('exploring', {}).get('scenes', False))   # like the node
+        self.tiles.stair_min_points = int(tcfg.get('stair_min_points', 4))
+        self.ai_commands = []                          # (time, on, cmd_code) the stairs mode sent
+        self._stair_version = -1
         self.scenes_described = []                     # (label, pose) the scene mode asked the (absent) AI about
         self.scanner, self.paths = _Scanner(self), _Paths(self)
         self.opening_done, self.initial_heading = False, None
@@ -278,6 +283,12 @@ class HeadlessCtx:
     def stop(self):
         self.world.set_cmd_vel(0.0, 0.0, 0.0)
 
+    # stairs mode: /simple_cmd straight to the simulated robot
+    def ai_mode(self, on, cmd_code):
+        self.ai_commands.append((round(self.world.time, 1), bool(on), int(cmd_code)))
+        self.world.simple_cmd(cmd_code)
+        return True
+
     # what the node's timers do
     def sync_map(self):
         w = self.world
@@ -285,6 +296,14 @@ class HeadlessCtx:
             self._map_version = w.map_version
             i = w.info
             self.tiles.set_map(w.map_grid.copy(), G.GridInfo(i.width, i.height, i.resolution, i.origin_x, i.origin_y))
+
+    def sync_stairs(self):
+        """The node's /stairs/points subscription: new confirmed stair cells -> staircase tiles."""
+        w = self.world
+        if w.stair_version != self._stair_version:
+            self._stair_version = w.stair_version
+            if self.tiles.set_stair_points(w.stair_points()):
+                self.tiles.update()
 
     def virtual_walls(self):
         if not (self.tiles.ready and self.opening_done):
@@ -319,6 +338,7 @@ class HeadlessRun:
         while w.time < max_time_s and not ctx.complete:
             w.step(dt)
             ctx.sync_map()
+            ctx.sync_stairs()
             if w.time >= next_tick:
                 next_tick += tick
                 m.tick()
@@ -354,6 +374,10 @@ class HeadlessRun:
             'truth_tiles_missed': sorted(reach - self.truth_visited),
             'curtain_events': [e for e in self.ctx.events if e[1] == 'curtain'],
             'scene_events': [e for e in self.ctx.events if e[1] in ('scene', 'scene_done')],
+            'stairs_events': [e for e in self.ctx.events if e[1] in ('stairs', 'stairs_crossed', 'stairs_failed')],
+            'ai_commands': [(t, on, f'0x{code:08X}') for t, on, code in self.ctx.ai_commands],
+            'staircase_tiles': sorted(T_label(t) for t in self.ctx.tiles.stairs),
+            'truth_stairs': sorted(self.maze.stairs),
             'truth_scenes': sorted(self.maze.scenes),
         }
 

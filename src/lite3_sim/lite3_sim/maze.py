@@ -12,7 +12,8 @@ A maze file is YAML. The layout is ASCII art, one tile = 4 characters wide and 2
                                               'S' start (facing start.heading), or '>' '<' '^' 'v' start facing E W N S
                                               '#' solid (not floor: boxed in by walls)
                                               '0' scene tile (clutter on the floor: looked at, never entered)
-                                              anything else: a label drawn in RViz (e.g. R1, ST for stairs)
+                                              'M' staircase tile (climbed in the robot's AI mode)
+                                              anything else: a label drawn in RViz (e.g. R1)
 
 The top line is north (+y), the left column west. Tile (i, j): i counts east from the west column, j north from
 the south row, both from 0. The maze frame has its origin at the south-west corner of tile (0, 0).
@@ -26,6 +27,11 @@ the south row, both from 0. The maze frame has its origin at the south-west corn
                pattern of occupied and free cells (world.py, `scene` settings), so the mission manager sees a scanned,
                mostly non-traversable tile = a scene tile, and its scene mode looks at it from a neighbouring tile.
                The robot collides with the cluttered part (the tile minus a margin along its edges).
+  staircase    'M': steps go up from every OPEN side of the tile (not a wall panel) to a landing, like the metal
+               staircase in bags/data/stairs. Its risers on those sides block the lidar (the 2D scan sees a wall) and
+               block the robot unless it is in AI mode (/simple_cmd 0x21010528 on, 0x2101052B off); the simulated depth
+               camera sees the treads and reports them on /stairs/points for the mission's stairs mode. Open sides
+               towards another 'M' tile are no risers (a deeper staircase).
 
 Everything else is optional:
 
@@ -44,6 +50,10 @@ Everything else is optional:
       walls:    [[x0, y0, x1, y1], ...]
       curtains: [[x0, y0, x1, y1], ...]
       boxes:    [[x, y, w, h], ...]        # solid obstacles: x, y = south-west corner
+    stairs:                    # the 'M' tiles' steps
+      steps: 2                 # per open side, up to the landing
+      rise_m: 0.13
+      run_m: 0.20              # tread depth
 """
 from __future__ import annotations
 
@@ -54,7 +64,7 @@ from typing import Dict, List, Optional, Tuple
 
 import yaml
 
-WALL, CURTAIN, SLIT = 'wall', 'curtain', 'slit'
+WALL, CURTAIN, SLIT, STAIRS = 'wall', 'curtain', 'slit', 'stairs'
 HEADINGS = {'E': 0.0, 'N': 90.0, 'W': 180.0, 'S': -90.0}
 ARROWS = {'>': 'E', '<': 'W', '^': 'N', 'v': 'S', 'V': 'S'}
 H_CHARS = {'-': WALL, '~': CURTAIN, '=': SLIT}
@@ -87,6 +97,10 @@ class Maze:
     labels: Dict[Tile, str] = field(default_factory=dict)
     solid: set = field(default_factory=set)
     scenes: set = field(default_factory=set)                 # scene tiles ('0'): clutter, never entered
+    stairs: Dict[Tile, List[str]] = field(default_factory=dict)   # staircase tiles ('M') -> sides they are climbed from
+    stair_steps: int = 2
+    stair_rise_m: float = 0.13
+    stair_run_m: float = 0.20
     wall_thickness: float = 0.02
     slit_m: float = 0.04
 
@@ -104,8 +118,9 @@ class Maze:
     def floor_tiles(self) -> List[Tile]:
         return [(i, j) for i in range(self.cols) for j in range(self.rows) if (i, j) not in self.solid]
 
-    def reachable_tiles(self, through_curtains: bool = True) -> set:
-        """Floor tiles connected to the start tile through open edges (and curtains)."""
+    def reachable_tiles(self, through_curtains: bool = True, through_stairs: bool = True) -> set:
+        """Floor tiles connected to the start tile through open edges (and curtains, and over staircases). The
+        staircase tiles themselves are not counted: the robot climbs over them, it does not explore them."""
         start = (int(self.start[0] // self.tile_size), int(self.start[1] // self.tile_size))
         passable = {None, CURTAIN} if through_curtains else {None}
         seen, todo = {start}, [start]
@@ -115,10 +130,23 @@ class Maze:
             for side, (di, dj) in steps.items():
                 n = (t[0] + di, t[1] + dj)
                 if (0 <= n[0] < self.cols and 0 <= n[1] < self.rows and n not in seen and n not in self.solid
-                        and n not in self.scenes and self.edge(t, side) in passable):
+                        and n not in self.scenes and (through_stairs or n not in self.stairs)
+                        and self.edge(t, side) in passable):
                     seen.add(n)
                     todo.append(n)
-        return seen
+        return seen - set(self.stairs)
+
+    def stair_height(self, x: float, y: float) -> float:
+        """Height of the floor at maze point (x, y): 0, or the tread / landing of a staircase tile. The steps go up
+        from every side the staircase is climbed from (the lowest of those profiles: a hump with a landing between)."""
+        size = self.tile_size
+        tile = (int(math.floor(x / size)), int(math.floor(y / size)))
+        sides = self.stairs.get(tile)
+        if not sides:
+            return 0.0
+        u, v = x - tile[0] * size, y - tile[1] * size
+        dist = {'W': u, 'E': size - u, 'S': v, 'N': size - v}
+        return min(self.stair_rise_m * min(self.stair_steps, int(dist[s] // self.stair_run_m) + 1) for s in sides)
 
     def summary(self) -> str:
         kinds = {}
@@ -129,7 +157,8 @@ class Maze:
         return (f'maze {self.name!r}: {self.cols} x {self.rows} tiles of {self.tile_size:g} m ({w:.2f} x {h:.2f} m), '
                 f'{len(self.floor_tiles())} floor tiles ({len(reach)} reachable from the start, '
                 f'{len(self.reachable_tiles(False))} without crossing a curtain'
-                + (f', {len(self.scenes)} scene tile(s)' if self.scenes else '') + '), segments: '
+                + (f', {len(self.scenes)} scene tile(s)' if self.scenes else '')
+            + (f', staircase(s) on {sorted(self.stairs)}' if self.stairs else '') + '), segments: '
                 + ', '.join(f'{n} {k}' for k, n in sorted(kinds.items()))
                 + f'; start ({self.start[0]:.2f}, {self.start[1]:.2f}) heading {math.degrees(self.start[2]):.0f} deg')
 
@@ -152,7 +181,7 @@ def _heading_deg(value) -> float:
 
 def parse_layout(text: str):
     """ASCII layout -> (cols, rows, edges {(i, j, side): kind}, labels, solid, start (tile, heading or None),
-    scenes)."""
+    scenes, stairs (set of 'M' tiles))."""
     lines = textwrap.dedent(text.expandtabs(4)).splitlines()
     while lines and not lines[0].strip():
         lines.pop(0)
@@ -168,7 +197,7 @@ def parse_layout(text: str):
         raise MazeError('the layout is narrower than one tile ("+---+")')
     edges: Dict[Tuple[int, int, str], str] = {}
     labels: Dict[Tile, str] = {}
-    solid, scenes, start = set(), set(), None
+    solid, scenes, stairs, start = set(), set(), set(), None
 
     def set_edge(i, j, side, kind):
         edges[(i, j, side)] = kind
@@ -203,6 +232,8 @@ def parse_layout(text: str):
                     solid.add((i, j))
                 elif cell == '0':
                     scenes.add((i, j))
+                elif cell == 'M':
+                    stairs.add((i, j))
                 elif cell == 'S' or cell in ARROWS:
                     if start is not None:
                         raise MazeError(f'two start tiles in the layout: {start[0]} and {(i, j)}')
@@ -218,7 +249,7 @@ def parse_layout(text: str):
                  'E': (t[0] + 1, t[1], 'W'), 'W': (t[0] - 1, t[1], 'E')}[side]
             if 0 <= n[0] < cols and 0 <= n[1] < rows:
                 edges.setdefault(n, WALL)
-    return cols, rows, edges, labels, solid, start, scenes
+    return cols, rows, edges, labels, solid, start, scenes, stairs
 
 
 def _edge_segments(cols, rows, edges, size, slit_m) -> List[Segment]:
@@ -253,8 +284,25 @@ def load_maze_dict(data: dict, name: str = 'maze') -> Maze:
         raise MazeError('a maze file needs a "layout:" block (ASCII art)')
     size = float(data.get('tile_size', 1.02))
     slit_m = float(data.get('slit_m', 0.04))
-    cols, rows, edges, labels, solid, start, scenes = parse_layout(str(data['layout']))
+    cols, rows, edges, labels, solid, start, scenes, stair_tiles = parse_layout(str(data['layout']))
     segments = _edge_segments(cols, rows, edges, size, slit_m)
+    # staircases: climbed from every open side; a riser (STAIRS segment) on each of those sides, except towards
+    # another staircase tile (one deeper staircase)
+    steps = {'E': (1, 0), 'W': (-1, 0), 'N': (0, 1), 'S': (0, -1)}
+    stairs = {}
+    for t in sorted(stair_tiles):
+        sides = [sd for sd in 'NESW' if edges.get((t[0], t[1], sd)) is None
+                 and 0 <= t[0] + steps[sd][0] < cols and 0 <= t[1] + steps[sd][1] < rows]
+        outer = [sd for sd in sides if (t[0] + steps[sd][0], t[1] + steps[sd][1]) not in stair_tiles]
+        if not outer:
+            raise MazeError(f'staircase tile {t} ("M") has no open side to climb it from')
+        stairs[t] = outer
+        for sd in outer:
+            (x0, y0), (x1, y1) = {'S': ((0, 0), (1, 0)), 'N': ((0, 1), (1, 1)), 'W': ((0, 0), (0, 1)),
+                                  'E': ((1, 0), (1, 1))}[sd]
+            segments.append(Segment((t[0] + x0) * size, (t[1] + y0) * size, (t[0] + x1) * size, (t[1] + y1) * size,
+                                    STAIRS))
+    st = data.get('stairs') or {}
 
     extra = data.get('extra') or {}
     for key, kind in (('walls', WALL), ('curtains', CURTAIN), ('slits', SLIT)):
@@ -278,12 +326,16 @@ def load_maze_dict(data: dict, name: str = 'maze') -> Maze:
         raise MazeError(f'start tile {tile} is not a floor tile of the {cols} x {rows} maze')
     if tile in scenes:
         raise MazeError(f'start tile {tile} is a scene tile ("0"): the robot never stands on one')
+    if tile in stairs:
+        raise MazeError(f'start tile {tile} is a staircase tile ("M")')
     heading = sc.get('heading', (start[1] if start and start[1] else None) or 'E')
     yaw = math.radians(_heading_deg(heading) + float(sc.get('yaw_offset_deg', 0.0)))
     off = [float(v) for v in sc.get('offset_m', [0.0, 0.0])]
     x, y = (tile[0] + 0.5) * size + off[0], (tile[1] + 0.5) * size + off[1]
     return Maze(name=str(data.get('name') or name), tile_size=size, cols=cols, rows=rows, segments=segments,
-                start=(x, y, yaw), edges=edges, labels=labels, solid=solid, scenes=scenes,
+                start=(x, y, yaw), edges=edges, labels=labels, solid=solid, scenes=scenes, stairs=stairs,
+                stair_steps=int(st.get('steps', 2)), stair_rise_m=float(st.get('rise_m', 0.13)),
+                stair_run_m=float(st.get('run_m', 0.20)),
                 wall_thickness=float(data.get('wall_thickness', 0.02)), slit_m=slit_m)
 
 

@@ -200,7 +200,13 @@ DEFAULTS: Dict[str, Any] = {
             'type': 'scene',
             'next_mode': 'exploring',     # the scene tile is marked explored (looked at, not entered), then exploration goes on
             'rest_s': 1.5,                # stand still first (a scan spin just before is still coasting)
-            'align_tol_deg': 6.0,         # turn in place until facing the scene tile's centre within this
+            'center_tol_m': 0.06,         # then drive (vx / vy, heading held) to within this of the current tile's centre
+            'center_speed_mps': 0.15,
+            'center_min_speed_mps': 0.05,
+            'center_gain': 1.0,
+            'heading_gain': 1.0,          # wz that holds the heading while centring
+            'center_timeout_s': 15.0,     # not there by then: turn to face the scene tile from where it is
+            'align_tol_deg': 6.0,         # only then turn in place until facing the scene tile's centre within this
             'commit_deg': 150.0,          # target further round than this: keep the direction the turn started in (no flip at 180 deg)
             'align_timeout_s': 15.0,
             'min_turn_rad_s': 0.2,

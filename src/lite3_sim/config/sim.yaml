@@ -78,6 +78,18 @@ lite3_sim:
 
     cmd_vel_timeout_s: 0.5
 
+    stair_camera:                  # stands in for stair_detector (config/stairs.yaml): runs stairs_core on simulated points
+      enabled: true
+      rate_hz: 2.0
+      hfov_deg: 81.4
+      range_min: 0.30
+      range_max: 2.5
+      x_offset_m: 0.30
+      height_m: 0.40
+      point_step_m: 0.02           # tread / floor points this far apart
+      noise_m: 0.004               # depth noise (height)
+      map_cell_m: 0.10
+      confirm_hits: 3
     curtain_camera:                # stands in for curtain_detector (config/curtain.yaml)
       enabled: true
       rate_hz: 2.0

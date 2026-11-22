@@ -2,7 +2,7 @@
 # Start the Lite3 tile explorer (lite3_explorer) in tmux, with live status panes and an RViz debug view.
 #
 #   window 1 "explorer": the full launch (SLAM, Nav2, mission manager, AI client)
-#   window 2 "status"  : mission mode | mission events (decisions, stuck, recovery)
+#   window 2 "status"  : mission mode / controller driving now | mission events (decisions, stuck, recovery)
 #                        tile report for every tile reached | chosen tile (what it is driving to)
 #                        last AI answer | velocity sent to the dog / current gait
 #   window 3 "health"  : /scan rate | /map rate | odom->base_link TF | rviz2 (Ctrl-C it to get a shell)
@@ -53,7 +53,7 @@ LATCHED="--qos-durability transient_local --qos-reliability reliable"
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
 /exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /ai_mode /simple_cmd /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
 
 BAG=0
 BAG_NAME=""
@@ -217,6 +217,10 @@ run "$SESSION:status.4" "VELOCITY TO DOG (/cmd_vel)" \
 GAIT_PANE=$(tmux split-window -t "$SESSION:status.4" -v -l 30% -P -F '#{pane_id}')
 run "$GAIT_PANE" "CURRENT GAIT (gait_switcher)" \
     "ros2 topic echo /gait_switcher/gait std_msgs/msg/String --field data $LATCHED"
+
+# controller in charge (Nav2 FollowPath RPP / MPPI, RecoveryMPPI, Spin, or the mission's own /cmd_vel): under the mode pane
+CTRL_PANE=$(tmux split-window -t "$SESSION:status.0" -v -l 60% -P -F '#{pane_id}')
+run "$CTRL_PANE" "CONTROLLER (who drives the dog now)" "ros2 run lite3_explorer controller_monitor"
 
 # ---- window 3: health + rviz ----------------------------------------------
 tmux new-window -t "$SESSION:" -n health

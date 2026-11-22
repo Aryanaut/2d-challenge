@@ -9,6 +9,9 @@ Provides (what the mission manager uses)
   pub /global_costmap/costmap            nav_msgs/OccupancyGrid   static map + /virtual_walls + inflation (latched)
   pub /local_costmap/costmap             nav_msgs/OccupancyGrid   4 m rolling window, odom frame (latched)
   pub /curtain/points                    std_msgs/String          confirmed curtain spots, curtain_detector format
+  pub /stairs/points                     std_msgs/String          confirmed stair cells, stair_detector format
+  sub /simple_cmd                        transfer_interfaces/MotionSimpleCMD   AI mode on / off (stairs mode); without
+                                         transfer_interfaces installed: /ai_mode (std_msgs/Bool) instead
   act spin, compute_path_to_pose, navigate_to_pose, follow_waypoints          (nav2_msgs)
   srv /behavior_server/get_state                                   lifecycle_msgs/GetState (always active)
   srv /global_costmap/clear_entirely_global_costmap, /local_costmap/clear_entirely_local_costmap
@@ -23,7 +26,9 @@ For RViz / debugging
   pub /sim/status      std_msgs/String JSON (1 Hz): sim time, pose, maze tile, Nav2 task, ground-truth coverage
   srv ~/reset_curtains std_srvs/Trigger   forget the detected curtain spots
 
-Not simulated: terrain, stairs, gaits, scene / pose animations, the AI. Parameters: config/sim.yaml.
+Staircases ('M'): the risers block the lidar, and the robot unless it is in AI mode; the stair camera runs
+lite3_explorer's stairs_core on simulated tread / floor points. The climb itself is not simulated (no pitch, no
+height). Not simulated: terrain, gaits, scene / pose animations, the AI. Parameters: config/sim.yaml.
 """
 from __future__ import annotations
 
@@ -57,7 +62,7 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
 from lite3_sim import world as W
-from lite3_sim.maze import CURTAIN, SLIT, load_maze
+from lite3_sim.maze import CURTAIN, SLIT, STAIRS, load_maze
 
 LATCHED = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
 
@@ -115,6 +120,7 @@ class Lite3Sim(Node):
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.plan_pub = self.create_publisher(Path, '/plan', 10)
         self.curtain_pub = self.create_publisher(String, '/curtain/points', LATCHED)
+        self.stairs_pub = self.create_publisher(String, '/stairs/points', LATCHED)
         self.maze_pub = self.create_publisher(MarkerArray, '/sim/maze', LATCHED)
         self.robot_pub = self.create_publisher(MarkerArray, '/sim/robot', 10)
         self.status_pub = self.create_publisher(String, '/sim/status', 10)
@@ -128,6 +134,16 @@ class Lite3Sim(Node):
                                  callback_group=self.timer_group)
         self.create_subscription(Bool, '/exploration_complete', self._on_complete, LATCHED,
                                  callback_group=self.timer_group)
+        # robot AI mode (stairs mode): the real /simple_cmd codes; /ai_mode when transfer_interfaces is not installed
+        try:
+            from transfer_interfaces.msg import MotionSimpleCMD
+            self.create_subscription(MotionSimpleCMD, '/simple_cmd', self._on_simple_cmd, QoSProfile(
+                depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE),
+                callback_group=self.timer_group)
+        except ImportError:
+            self.get_logger().warning('transfer_interfaces not installed: AI mode follows /ai_mode instead of '
+                                      '/simple_cmd')
+            self.create_subscription(Bool, '/ai_mode', self._on_ai_mode, LATCHED, callback_group=self.timer_group)
 
         # Nav2 stand-ins
         accept = lambda _g: GoalResponse.ACCEPT       # noqa: E731
@@ -146,7 +162,7 @@ class Lite3Sim(Node):
         self.create_service(Trigger, '~/reset_curtains', self._on_reset_curtains, callback_group=self.action_group)
 
         # state for publishing
-        self._last = {'scan': None, 'map': -1, 'global': -1, 'local': None, 'curtain': -1}
+        self._last = {'scan': None, 'map': -1, 'global': -1, 'local': None, 'curtain': -1, 'stairs': -1}
         self._task_path_id = None
         self.truth_visited = set()
         self.reachable = self.maze.reachable_tiles()
@@ -174,6 +190,7 @@ class Lite3Sim(Node):
             scan = self.world.last_scan
             map_v, glob_v, loc = self.world.map_version, self.world.global_version, self.world.local_costmap
             curt_v = self.world.curtain_version
+            stair_v = self.world.stair_version
             task = self.world.task
             path = getattr(task, 'path', None) if task is not None else None
         stamp = self.get_clock().now().to_msg()
@@ -200,6 +217,12 @@ class Lite3Sim(Node):
                 pts = self.world.curtain_points()
             self.curtain_pub.publish(String(data=json.dumps(
                 {'points': [[round(float(v), 3) for v in r] for r in pts]})))
+        if stair_v != self._last['stairs']:
+            self._last['stairs'] = stair_v
+            with self.lock:
+                pts = self.world.stair_points()
+            self.stairs_pub.publish(String(data=json.dumps(
+                {'points': [[round(float(v), 3) for v in r] for r in pts]})))
         if path is not None and id(path) != self._task_path_id:
             self._task_path_id = id(path)
             self.plan_pub.publish(self._path_msg(path, stamp))
@@ -215,6 +238,14 @@ class Lite3Sim(Node):
     def _on_cmd_vel(self, msg):
         with self.lock:
             self.world.set_cmd_vel(msg.linear.x, msg.linear.y, msg.angular.z)
+
+    def _on_simple_cmd(self, msg):
+        with self.lock:
+            self.world.simple_cmd(msg.cmd_code)
+
+    def _on_ai_mode(self, msg):
+        with self.lock:
+            self.world.simple_cmd(W.AI_ON if msg.data else W.AI_OFF)
 
     def _on_virtual_walls(self, msg):
         pts = np.array([(p[0], p[1]) for p in point_cloud2.read_points(msg, field_names=('x', 'y'), skip_nans=True)],
@@ -437,11 +468,13 @@ class Lite3Sim(Node):
         stamp = self.get_clock().now().to_msg()
         g = self.world.geometry
         markers = []
-        colours = {'wall': (0.55, 0.55, 0.55, 0.9), SLIT: (0.45, 0.55, 0.85, 0.9), CURTAIN: (0.0, 0.85, 0.95, 0.35)}
+        colours = {'wall': (0.55, 0.55, 0.55, 0.9), SLIT: (0.45, 0.55, 0.85, 0.9), CURTAIN: (0.0, 0.85, 0.95, 0.35),
+                   STAIRS: (1.0, 0.8, 0.0, 0.9)}
         for k, ((x0, y0, x1, y1), kind) in enumerate(zip(g.segs, g.kinds)):
             m = self._marker('maze_' + kind, k, Marker.CUBE, stamp, colours.get(kind, colours['wall']))
             length = math.hypot(x1 - x0, y1 - y0)
-            low, high = (0.15, 0.55) if kind == CURTAIN else (0.0, 0.5)
+            low, high = (0.15, 0.55) if kind == CURTAIN else (0.0, self.maze.stair_rise_m) if kind == STAIRS \
+                else (0.0, 0.5)
             m.pose.position.x, m.pose.position.y, m.pose.position.z = (x0 + x1) / 2, (y0 + y1) / 2, (low + high) / 2
             m.pose.orientation = quat(math.atan2(y1 - y0, x1 - x0))
             m.scale.x, m.scale.y, m.scale.z = max(length, 0.01), max(2 * g.half_thickness, 0.02), high - low
@@ -484,6 +517,21 @@ class Lite3Sim(Node):
             b.scale.x = b.scale.y = s - 2 * margin
             b.scale.z = 0.3
             markers.append(b)
+        n = 0                                              # staircases: every tread / the landing as a gold slab
+        for tile in sorted(mz.stairs):
+            k = 6
+            for a in range(k):
+                for b in range(k):
+                    u, v = tile[0] * s + (a + 0.5) * s / k, tile[1] * s + (b + 0.5) * s / k
+                    h = mz.stair_height(u, v)
+                    px, py, _ = self.world.maze_to_map(u, v)
+                    c = self._marker('maze_stairs', n, Marker.CUBE, stamp, (1.0, 0.8, 0.0, 0.35 + 0.5 * h))
+                    c.pose.position.x, c.pose.position.y, c.pose.position.z = px, py, h / 2
+                    c.pose.orientation = quat(self.world.map_T_maze[2])
+                    c.scale.x = c.scale.y = s / k
+                    c.scale.z = max(h, 0.01)
+                    markers.append(c)
+                    n += 1
         sx, sy, syaw = self.world.maze_to_map(*mz.start)
         a = self._marker('maze_start', 0, Marker.ARROW, stamp, (0.2, 1.0, 0.2, 0.6))
         a.pose.position.x, a.pose.position.y = sx, sy
@@ -499,6 +547,9 @@ class Lite3Sim(Node):
             bumped = self.world.bumped
             seen = self.world.curtain_seen_now.copy()
             confirmed = self.world.curtain_points()
+            stairs_now = self.world.stair_seen_now.copy()
+            stairs_ok = self.world.stair_points()
+            ai = self.world.ai_mode
             task = self.world.task
         markers = []
         body = self._marker('robot', 0, Marker.CUBE, stamp, (1.0, 0.2, 0.2, 0.8) if bumped else (1.0, 0.55, 0.1, 0.6))
@@ -515,7 +566,7 @@ class Lite3Sim(Node):
         txt.pose.position.x, txt.pose.position.y, txt.pose.position.z = x, y, 0.8
         txt.scale.z = 0.2
         txt.text = (self.mode_text or '(no mission_manager)') + (f'\nnav2: {task.kind}' if task is not None else '') \
-            + ('\nBUMPED' if bumped else '')
+            + ('\nAI MODE' if ai else '') + ('\nBUMPED' if bumped else '')
         markers.append(txt)
         cc = self.cfg['curtain_camera']
         if cc['enabled']:
@@ -536,6 +587,14 @@ class Lite3Sim(Node):
             if not m.points:
                 m.action = Marker.DELETE
             markers.append(m)
+        for mid, pts, rgba, size in ((6, stairs_now, (1.0, 0.9, 0.3, 1.0), 0.04),
+                                     (7, stairs_ok[:, :2] if len(stairs_ok) else stairs_ok, (1.0, 0.5, 0.0, 1.0), 0.07)):
+            m = self._marker('stair_cells', mid, Marker.POINTS, stamp, rgba)
+            m.scale.x = m.scale.y = size
+            m.points = [Point(x=float(p[0]), y=float(p[1]), z=0.4) for p in pts]
+            if not m.points:
+                m.action = Marker.DELETE
+            markers.append(m)
         self.robot_pub.publish(MarkerArray(markers=markers))
 
     def _publish_status(self):
@@ -552,6 +611,8 @@ class Lite3Sim(Node):
                 'bumped': w.bumped,
                 'in_inscribed_zone': w.robot_in_inscribed(),
                 'curtain_spots': int(len(w.curtain_points())),
+                'stair_cells': int(len(w.stair_points())),
+                'ai_mode': w.ai_mode,
                 'truth_reached': len(self.truth_visited & self.reachable),
                 'truth_reachable': len(self.reachable),
                 'truth_not_yet': [list(t) for t in sorted(self.reachable - self.truth_visited)],

@@ -13,3 +13,4 @@ mission_manager:
         classify_target: false
         quickscan_on_edge: false           # no animation_player (pose / scene animations are not simulated)
         curtains: true                     # curtain mode on (launch arg use_curtains:=false turns it off)
+        stairs: true                       # stairs mode on for 'M' tiles (launch arg use_stairs:=false turns it off)

@@ -274,13 +274,17 @@ class StairMap:
 
 
 # ------------------------------------------------------------------------------------------ on the tile grid
-def stair_tiles(grid, points, min_points: int = 4) -> Dict[tuple, dict]:
-    """Tiles holding at least min_points confirmed stair cells: {tile: {'points': n, 'ascent': (ux, uy)}}."""
+def stair_tiles(grid, points, min_points: int = 4, edge_margin_m: float = 0.10) -> Dict[tuple, dict]:
+    """Tiles holding at least min_points confirmed stair cells: {tile: {'points': n, 'ascent': (ux, uy)}}. Cells within
+    edge_margin_m of a tile's edge do not count: the tile grid is snapped to the walls only to a few cm, and a
+    staircase filling its tile would otherwise spill a row of cells into the tile beside it."""
     pts = np.asarray(points, float).reshape(-1, 4)
     if grid is None or len(pts) == 0:
         return {}
     acc: Dict[tuple, List[float]] = {}
     for x, y, ux, uy in pts:
+        if grid.edge_distance(x, y) < edge_margin_m:
+            continue
         tile = tuple(grid.tile_of(x, y))
         e = acc.setdefault(tile, [0, 0.0, 0.0])
         e[0] += 1
