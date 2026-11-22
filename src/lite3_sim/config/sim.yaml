@@ -1,0 +1,92 @@
+# lite3_sim node parameters. Every key overrides lite3_sim/world.py DEFAULTS. Values copied from lite3_explorer's
+# config/nav2_params.yaml where Nav2 has an equivalent, so the simulated robot stops, turns and fails like the real stack.
+lite3_sim:
+  ros__parameters:
+    physics_hz: 50.0
+    map_origin: start              # start: map frame = the dog's start pose (like slam_toolbox) | maze: the maze's SW corner
+    speed_scale: 1.0               # >1: robot moves / turns faster (mission timeouts are wall time, so keep it <= ~3)
+
+    robot:                         # the real body: collides with walls and slit panels (not curtains)
+      length_m: 0.61
+      width_m: 0.37
+      max_lin_acc: 1.0
+      max_ang_acc: 2.5
+
+    lidar:                         # the /scan made from the Livox cloud (cloud_to_scan)
+      range_min: 0.35
+      range_max: 4.0               # effective range in the arena; lower it to see how tile identification copes
+      angle_increment: 0.0087
+      rate_hz: 10.0
+      noise_m: 0.005
+      x_offset_m: 0.0
+
+    slam:                          # slam_toolbox stand-in (perfect pose)
+      resolution: 0.05
+      margin_m: 2.0
+      update_hz: 2.0
+
+    global_costmap:                # nav2_params.yaml global_costmap
+      update_hz: 1.0
+      footprint_length_m: 0.68
+      footprint_width_m: 0.42
+      padding_m: 0.03
+      inflation_radius_m: 0.25
+      cost_scaling_factor: 1.0
+
+    local_costmap:                 # nav2_params.yaml local_costmap (used by the mission's turn-room check)
+      update_hz: 2.0
+      size_m: 4.0
+      inflation_radius_m: 0.10
+      cost_scaling_factor: 1.0
+
+    planner:                       # NavFn: tolerance, allow_unknown
+      tolerance_m: 0.4
+      allow_unknown: true
+      unknown_cost: 4.0
+
+    controller:
+      type: rpp                    # rpp: vx + wz (regulated pure pursuit) | omni: vx + vy + wz (MPPI Omni); launch arg controller:=
+      desired_linear_vel: 0.35
+      max_angular_vel: 0.6         # velocity_smoother max wz
+      lookahead_m: 0.6
+      rotate_to_heading_min_angle: 0.6
+      rotate_vel: 0.6
+      approach_dist_m: 0.6
+      min_approach_vel: 0.08
+      regulated_min_radius: 0.9    # use_regulated_linear_velocity_scaling: slower on curves tighter than this ...
+      regulated_min_speed: 0.12    # ... down to this
+      xy_goal_tolerance: 0.4       # general_goal_checker (NB: larger than tiles.reach_radius_m 0.30)
+      yaw_goal_tolerance: 0.6
+      replan_period_s: 1.0
+      max_plan_failures: 3
+      collision_detection: true    # RPP use_collision_detection: stop before the body would hit a wall ...
+      collision_horizon_s: 0.3     # max_allowed_time_to_collision_up_to_carrot
+      failure_tolerance_s: 3.0     # ... and fail the controller after this long (controller_server failure_tolerance)
+      bt_recoveries: true          # default bt_navigator tree: on failure clear / spin / wait / back up (round robin) and retry ...
+      number_of_retries: 6         # ... this many times before the goal is aborted
+      recovery_spin_rad: 1.57
+      recovery_wait_s: 5.0
+      backup_dist_m: 0.30
+      backup_speed: 0.05
+      progress_window_s: 30.0      # progress_checker movement_time_allowance
+      progress_min_m: 0.3          # progress_checker required_movement_radius
+
+    spin:                          # behavior_server spin
+      max_vel: 1.0
+      min_vel: 0.3
+      acc: 2.5
+
+    cmd_vel_timeout_s: 0.5
+
+    curtain_camera:                # stands in for curtain_detector (config/curtain.yaml)
+      enabled: true
+      rate_hz: 2.0
+      hfov_deg: 81.4
+      range_min: 0.30
+      range_max: 3.5
+      x_offset_m: 0.30
+      min_columns: 0.30            # the curtain must cover this share of the image width
+      point_step_m: 0.05
+      noise_m: 0.015
+      cell_m: 0.05
+      confirm_hits: 3

@@ -1,0 +1,19 @@
+# Example arena: corridors of 1.02 m tiles, a curtain, slit panels and labelled terrain tiles.
+# Copy this file and redraw the layout to test your own maze:  ros2 launch lite3_sim sim.launch.py maze:=/path/my_maze.yaml
+# Format: see the top of lite3_sim/maze.py (or README.md).   Preview:  ros2 run lite3_sim maze_preview /path/my_maze.yaml
+name: arena_example
+tile_size: 1.02          # m
+wall_thickness: 0.02     # m
+slit_m: 0.04             # '===' / '!' panels leave this gap at both ends (the lidar sees through it)
+layout: |
+  +---+---+---+---+---+
+  | > |       ~   | ST|
+  +   +   +---+   +   +
+  |   | R1    !   |   |
+  +   +===+   +---+   +
+  |       | R2  R3    |
+  +---+   +---+---+   +
+  | # |               |
+  +---+---+---+---+---+
+start:
+  yaw_offset_deg: 4.0    # the dog is never put down perfectly square to the walls

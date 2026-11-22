@@ -44,7 +44,8 @@ DEFAULTS: Dict[str, Any] = {
     'mission': {
         # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
         # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
-        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'scene', 'mppi', 'recovery', 'complete'],
+        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'scene', 'mppi', 'backtracking', 'recovery',
+                  'complete'],
         'initial_mode': 'idle',
         'start_mode': 'scanning',         # where set_active(true) / auto start goes
         'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
@@ -53,7 +54,7 @@ DEFAULTS: Dict[str, Any] = {
 
     'stuck': {
         'enabled': True,
-        'watch_modes': ['exploring'],     # modes the stuck supervisor watches
+        'watch_modes': ['exploring', 'backtracking'],     # modes the stuck supervisor watches
         'triggers': ['no_motion', 'costmap'],
         'window_s': 60.0,                 # no_motion: driving this long ...
         'min_motion_m': 0.15,             # ... without moving this far = stuck
@@ -157,6 +158,9 @@ DEFAULTS: Dict[str, Any] = {
             'curtain_mode': 'curtain',
             'curtain_edge_tol_m': 0.30,   # curtain spots within this of the tile edge line count as on the edge
             'curtain_min_span_m': 0.40,   # ... spread over at least this much of it
+            'backtracking': True,         # two or more tiles to travel to -> the tile is the last split; no exploration
+                                          # target left but tiles unexplored -> backtracking mode (else retry_wait)
+            'backtracking_mode': 'backtracking',
             'classify_target': True,      # ask the terrain classifier about the target tile once the robot points at it;
                                           # floor not visible -> choose another tile
             'classify_max_angle_deg': 20.0,   # "pointing at it": heading within this angle of the tile
@@ -219,6 +223,17 @@ DEFAULTS: Dict[str, Any] = {
             'heading_gain': 1.0,          # wz that holds the heading while walking
             'extra_m': 0.0,               # stop this much beyond the next tile's centre
             'cross_timeout_s': 20.0,
+        },
+        'backtracking': {
+            'type': 'backtracking',
+            'traversal': 'direct',        # NavigateToPose back to the split tile, then to its untravelled tile
+            'min_clearance_m': 0.25,      # goal point in a tile: this far from walls
+            'path_check_timeout_s': 10.0,
+            'goal_timeout_s': 120.0,
+            'face_away_from_walls': True,
+            'scan_after_reach': True,     # reached the untravelled tile: scan_mode (which hands over to exploring) ...
+            'scan_mode': 'scanning',
+            'next_mode': 'exploring',     # ... else straight back to exploring (also after a failure)
         },
         'recovery': {
             'type': 'recovery',

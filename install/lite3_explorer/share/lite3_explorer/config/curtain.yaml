@@ -1,1 +1,20 @@
-/home/user/2d/build/lite3_explorer/config/curtain.yaml
+curtain_detector:
+  ros__parameters:
+    # Finds hanging curtains in the depth image: a near vertical surface, then the depth jumps farther at the hem (the floor
+    # behind it). Optional: use_curtains:=true on exploration.launch.py. The mission manager's 'curtain' mode aligns with a
+    # curtain on the current tile's edge and walks through it (config/mission.yaml: modes.curtain).
+    depth_topic: /camera/depth/image_raw
+    camera_info_topic: /camera/depth/camera_info
+    depth_hfov_deg: 81.4        # only until camera_info arrives
+    depth_scale: 0.001          # 16UC1 millimetres -> metres
+    global_frame: map
+    process_hz: 2.0             # LOW rate: depth frames processed per second
+    stride: 4                   # use every 4th pixel
+    run_rows: 6                 # rows (after the stride) of smooth curtain above the hem
+    max_step_m: 0.03            # depth change between neighbouring rows on the curtain (it may slant, not jump)
+    min_jump_m: 0.25            # the floor behind the hem is at least this much farther
+    min_range_m: 0.30
+    max_range_m: 3.5
+    min_columns: 0.30           # fraction of the image width that must show the curtain
+    cell_m: 0.05
+    confirm_hits: 3             # a spot of curtain counts after this many sightings

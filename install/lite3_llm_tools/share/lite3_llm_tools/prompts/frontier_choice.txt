@@ -1,1 +1,77 @@
-/home/user/2d/build/lite3_llm_tools/prompts/frontier_choice.txt
+Analyze the attached image for this mission.
+
+COMPETITION CONTEXT:
+A legged robot dog (about 0.6 m long and 0.4 m wide) is exploring an unknown
+maze in an indoor robotics competition. The maze is made of chipboard wall
+panels forming corridors, with terrain sections on the corridor floors: block
+fields, ramps, raised beams or slats, and a staircase. The robot walks across
+all of these terrain sections; they are part of the route, not obstacles.
+The attached image is NOT a camera photo: it is a top-down map the robot built
+with its lidar.
+
+HOW TO READ THE MAP:
+- black = maze wall panels. Terrain sections (blocks, ramps, beams) are not
+  drawn as walls: they appear as white walkable floor. Isolated single black
+  specks inside an open corridor are usually sensor noise, not walls
+- light red = floor too close to a wall for the robot to walk safely
+- white = explored, open floor
+- grey = unexplored
+- blue dot with arrow = the robot and the direction it faces
+- magenta numbered circles = candidate frontiers (edges of unexplored space the
+  robot can walk to)
+- thin grey grid = 1 m x 1 m tiles. Blue-tinted tiles are tiles the robot has
+  already visited, numbered in visit order and joined by the dark-blue trail
+  line. Tiles with a green inner box are tiles with open floor that the robot
+  has NOT visited yet
+- orange dots = places where the robot already stopped
+- red bar in the corner = 1 metre; up in the image is the map's +y direction
+The robot's current surroundings were described as: $environment
+Stops made so far: $stops
+Tiles: $tiles
+
+CANDIDATES (also numbered on the map):
+$candidates
+
+MISSION: The goal is to visit every unexplored tile that the robot can reach
+(accessible), so the whole maze gets mapped. Choose the ONE frontier that leads
+the robot best toward those tiles. A frontier is only a route, not a goal in
+itself. Avoid walls:
+- Pick a frontier with open white floor around it, at least $min_clearance m from
+  any black wall, and reachable from the robot through open white floor along a
+  corridor, without crossing a black line.
+- Do not pick a frontier that is a thin gap along a wall, squeezed between walls,
+  in a light red area, on the far side of a wall panel, or outside the maze's
+  outer walls.
+- Small gaps in a wall line are usually lidar gaps or handle cut-outs in a panel,
+  not doorways; only treat an opening as a corridor if it is at least as wide as
+  the robot (about 0.5 m) with white floor on both sides.
+- Maze strategy: prefer a frontier at the open end of the current corridor or at
+  an unexplored branch of a junction; prefer openings that lead into a large grey
+  unexplored area; avoid frontiers next to orange dots (already explored) and
+  avoid going back the way the robot came while nearer unexplored branches exist.
+- Use the tiles: the goal is to visit every unexplored, accessible tile. Prefer a
+  frontier in a tile that is NOT yet visited (tile status "to visit" or "unknown" in the table)
+  and next to other green-box tiles, so the robot covers new tiles; avoid routes
+  that walk back along the blue trail through already visited tiles while
+  unvisited tiles are reachable nearby. Among safe frontiers, choose the one whose
+  tile is closest to the robot through unvisited tiles, so no accessible tile is left behind.
+- When candidates are otherwise similar, prefer the nearer one.
+- If no candidate is safe, choose none.
+Valid choices: $ids, or none.
+
+Return exactly one JSON object containing exactly these four keys:
+"scene_description", "relevant_to_mission", "evidence", "confidence".
+
+Definitions:
+- scene_description: the choice, written as "frontier <id>: <short reason>",
+  for example "frontier 2: open end of the corridor, far from wall panels".
+  Write "none: <short reason>" if no candidate is safe.
+- relevant_to_mission: true if you chose a frontier; false if you chose none.
+- evidence: an array of at most three short strings describing what in the map
+  supports the choice, especially where the walls are.
+- confidence: a number from 0.0 to 1.0 expressing your confidence that the
+  chosen frontier is safe and useful to explore.
+
+Output valid JSON only. Do not include additional keys, Markdown, code fences,
+explanations, or text outside the JSON. Use JSON booleans and numeric confidence.
+Do not include trailing commas. Do not invent robot localisation coordinates.

@@ -1,1 +1,54 @@
-/home/user/2d/build/lite3_llm_tools/prompts/tile_init.txt
+Analyze the attached image for this mission.
+
+COMPETITION CONTEXT:
+A legged robot dog (about 0.6 m long and 0.4 m wide) is about to explore an
+unknown maze in an indoor robotics competition. The maze is made of chipboard
+wall panels forming corridors, with terrain sections on the corridor floors
+(block fields, ramps, raised beams or slats, a staircase) that the robot walks
+across. The robot will track its exploration on a grid of $size m x $size m tiles,
+recording which tiles it has visited and which are still to visit. Before it
+starts, the first tile must be placed around the robot.
+
+The attached image is NOT a camera photo. It shows the lidar map around the
+robot's start position, once per proposed placement of the first tile, side by
+side. In each panel:
+- black = maze wall panels; light red = floor too close to a wall
+- white = explored, open floor; grey = unexplored (frontiers are where white
+  floor meets grey)
+- blue dot with arrow = the robot and the direction it faces
+- thick orange square = the proposed first tile; thin grey lines = the
+  neighbouring tiles of the same grid
+- N, E, S, W = the four sides of the proposed tile
+- red bar in the corner = 1 metre; up in each panel is the map's +y direction
+
+PROPOSED PLACEMENTS:
+$candidates
+
+MISSION: Choose the placement that best fits the robot's immediate walls and
+frontiers, so that the whole tile grid follows the maze:
+- Prefer a tile whose sides run parallel to the nearby wall panels.
+- Prefer a grid whose lines fall on the wall panels, so that walls lie on tile
+  edges and corridors run through the middle of tiles.
+- The robot must be inside the tile.
+Then classify each side of the chosen tile: wall (a black wall panel runs
+along that side), open (white floor continues past that side), frontier (the
+floor beyond that side runs into grey, unexplored space), or unknown.
+Valid choices: $ids.
+
+Return exactly one JSON object containing exactly these four keys:
+"scene_description", "relevant_to_mission", "evidence", "confidence".
+
+Definitions:
+- scene_description: the choice, written as "tile <id>: <short reason>", for
+  example "tile A: grid lines follow the corridor walls".
+- relevant_to_mission: true if a placement fits the walls; false if none fits well.
+- evidence: an array of at most three short strings. The FIRST string must list
+  the chosen tile's sides exactly in this form:
+  "sides: N=<wall|open|frontier|unknown>, E=<...>, S=<...>, W=<...>".
+  Use the other strings for the visible walls and frontiers that support the choice.
+- confidence: a number from 0.0 to 1.0 expressing your confidence in the chosen
+  placement and side classification.
+
+Output valid JSON only. Do not include additional keys, Markdown, code fences,
+explanations, or text outside the JSON. Use JSON booleans and numeric confidence.
+Do not include trailing commas. Do not invent robot localisation coordinates.

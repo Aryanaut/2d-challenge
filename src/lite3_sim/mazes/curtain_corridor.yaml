@@ -1,0 +1,12 @@
+# Corridor with a curtain straight ahead (east edge of tile 2,0) and a short spur north of that tile. The lidar sees
+# the curtain as a wall, so tiles 3,0 and 4,0 are only reached through curtain mode (modes.exploring.curtains: true,
+# on by default in lite3_sim). The spur keeps a tile to visit when the dog reaches the curtain: without it the end
+# condition is met first and the curtain is never tried (exploring checks the end condition before curtains).
+name: curtain_corridor
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+
+  | # | # |   | # | # |
+  +---+---+   +---+---+
+  | >         ~       |
+  +---+---+---+---+---+

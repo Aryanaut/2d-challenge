@@ -174,6 +174,20 @@ def tile_sides(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, *, fr
     return result
 
 
+def edge_key(tg: TileGrid, tile: Tile, side: str) -> tuple:
+    """The same key for a shared edge from either tile (rounded, sorted end points)."""
+    (x0, y0), (x1, y1) = tg.edge(tile, side)
+    return tuple(sorted(((round(x0, 2), round(y0, 2)), (round(x1, 2), round(y1, 2)))))
+
+
+def side_towards(a: Tile, b: Tile) -> Optional[str]:
+    """The side of tile a that it shares with tile b (None: they share no side)."""
+    for side, (di, dj, _) in _STEPS.items():
+        if (a[0] + di, a[1] + dj) == tuple(b):
+            return side
+    return None
+
+
 def edge_coverage(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, occupied_threshold: int = 65,
                   samples: int = 20) -> List[Tuple[tuple, Tuple[Tuple[float, float], Tuple[float, float]], float]]:
     """Every tile edge (each shared edge once) as (key, world segment, share of it that lies on mapped wall)."""
@@ -183,7 +197,7 @@ def edge_coverage(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, occu
             continue
         for side in SIDES:
             (x0, y0), (x1, y1) = tg.edge(tile, side)
-            key = tuple(sorted(((round(x0, 2), round(y0, 2)), (round(x1, 2), round(y1, 2)))))
+            key = edge_key(tg, tile, side)
             if key in seen:
                 continue
             seen.add(key)

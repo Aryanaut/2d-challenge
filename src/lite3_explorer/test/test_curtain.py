@@ -220,3 +220,62 @@ def test_mppi_mode_holds_the_heading_it_entered_with():
     ctx.t += 0.5
     m.tick()
     assert wzs[-1] > 0
+
+
+# ---------------------------------------------------------------------------------------- backtracking through a curtain
+def test_backtracking_walks_back_through_a_curtain_with_its_virtual_wall_lifted():
+    from test_mission import T, tee_world
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25},
+                  world=tee_world())
+    d = Drive(ctx, np.zeros((0, 4)))
+    branch = None
+    for _ in range(200):                       # until the robot has gone from the split tile into a branch
+        ctx.t += 1.0
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        trail = [T.tile_label(t) for t in ctx.tiles.trail]
+        if '1,0' in trail and trail[-1] in ('1,1', '2,0'):
+            branch = tuple(int(v) for v in trail[-1].split(','))
+            break
+    assert branch
+    ctx.tiles.add_curtain_edge((1, 0), branch)           # it came through a curtain on that edge
+    key = next(iter(ctx.tiles.curtain_edges))
+    walls_open = []
+    for _ in range(400):
+        ctx.t += 1.0
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        if m.current.type_name in ('backtracking', 'curtain'):
+            ctx.tiles.virtual_walls()
+            walls_open.append(ctx.tiles.open_curtains)
+        if ctx.complete:
+            break
+    seen = modes_seen(m)
+    i = seen.index('backtracking')
+    assert seen[i:i + 3] == ['backtracking', 'curtain', 'backtracking'], seen
+    assert walls_open and all(walls_open)                 # curtain edges stay open the whole way back
+    assert not ctx.tiles.open_curtains                    # ... and close again afterwards
+    assert key in ctx.tiles.curtain_edges
+    other = '1,1' if branch == (2, 0) else '2,0'
+    assert any(k == 'backtracked' and dd['tile'] == other for k, dd in ctx.events)
+    assert [c for c in d.cmds if isinstance(c, tuple) and c[0] > 0]   # walked through it with vx
+    assert ctx.complete
+
+
+def test_curtain_edges_are_left_out_of_the_virtual_walls_only_while_open():
+    from test_mission import corridor
+    from lite3_explorer.tile_tracker import TileTracker
+    tr = TileTracker()
+    tr.set_map(*corridor(4.0))
+    tr.establish([0.5, 0.5, 0.0])
+    tr.start_wall = None
+    seg = tr.grid.edge((1, 0), 'N')                      # the corridor's north wall above tile 1,0
+    near = lambda segs: any(abs(a[0] - seg[0][0]) + abs(a[1] - seg[0][1]) + abs(b[0] - seg[1][0]) + abs(b[1] - seg[1][1])
+                            < 0.05 for a, b in segs)
+    assert near(tr.virtual_walls())
+    tr.add_curtain_edge((1, 0), (1, 1))
+    assert near(tr.virtual_walls())                      # closed: still a wall for Nav2
+    tr.open_curtains = True
+    assert not near(tr.virtual_walls())                  # backtracking: lifted
+    tr.open_curtains = False
+    assert near(tr.virtual_walls())                      # and back afterwards (hysteresis kept it)

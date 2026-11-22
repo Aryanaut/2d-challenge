@@ -28,7 +28,7 @@ mission_manager:
 
     # ---------------------------------------------------------------- mission manager
     mission:
-      modes: [idle, scanning, exploring, quickscan, curtain, scene, mppi, recovery, complete]   # instances to build (configured under modes.<name>)
+      modes: [idle, scanning, exploring, quickscan, curtain, scene, mppi, backtracking, recovery, complete]   # instances to build (configured under modes.<name>)
       initial_mode: idle
       start_mode: scanning                   # set_active(true) / auto start goes here
       recovery_mode: recovery                # the stuck supervisor sends the robot here
@@ -38,7 +38,7 @@ mission_manager:
     # Stuck while unexplored tiles remain -> recovery_mode (drive to the nearest tile centre, then rescan).
     stuck:
       enabled: true
-      watch_modes: [exploring]
+      watch_modes: [exploring, backtracking]
       triggers: [no_motion, costmap]
       window_s: 60.0                         # no_motion: driving this long (only a long unresponsive spell counts) ...
       min_motion_m: 0.15                     # ... and moving less than this
@@ -151,6 +151,8 @@ mission_manager:
         curtains: false                      # use_curtains:=true (launch / explorer.sh --curtains): a curtain on the current tile's edge -> curtain mode
         curtain_edge_tol_m: 0.30             # curtain spots within this of the tile edge line count as on the edge
         curtain_min_span_m: 0.40             # ... spread over at least this much of it
+        backtracking: true                   # a tile with two or more tiles to travel to is the 'last split'; when no exploration
+        backtracking_mode: backtracking      # target is left but tiles are unexplored, go back there and take the other way (else retry_wait)
         classify_target: true                # terrain-classify the target tile as soon as the robot points at it; floor not visible -> choose another tile
         classify_max_angle_deg: 20.0         # "points at it": heading within this angle of the tile
         retry_period_s: 15.0                 # nothing reachable but tiles are left: wait this long, then give every tile another chance
@@ -207,6 +209,16 @@ mission_manager:
         heading_gain: 1.0                    # wz that holds the heading while walking
         extra_m: 0.0                         # stop this much beyond the next tile's centre
         cross_timeout_s: 20.0
+      backtracking:                          # no target left: back to the last split tile, on to its untravelled tile, then exploring
+        type: backtracking
+        traversal: direct                    # NavigateToPose (the way back crosses several tiles)
+        min_clearance_m: 0.25
+        path_check_timeout_s: 10.0
+        goal_timeout_s: 120.0
+        face_away_from_walls: true
+        scan_after_reach: true               # scan on the new tile (scanning hands over to exploring)
+        scan_mode: scanning
+        next_mode: exploring
       recovery:
         type: recovery
         traversal: direct

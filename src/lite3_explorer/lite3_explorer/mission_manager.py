@@ -9,6 +9,9 @@ Modes (mission/modes.py, configured in config/mission.yaml):
           Nav2-reachable; optionally a frontier) -> scanning -> ...
   recovery: when stuck (no motion while driving, or sitting in the global costmap's obstacle zone) while unexplored
             tiles remain, or when no unexplored tile has a Nav2 path: drive to the nearest tile centre, then rescan.
+  backtracking: a tile with two or more tiles to travel to is marked the 'last split'; when no exploration target is left
+            but tiles are still unexplored the robot drives
+            back to it and on to the tile it has not travelled to yet, then returns to exploring.
   complete: the end condition is met; /exploration_complete is published.
 
 When a NEW tile is reached, the AI client (lite3_llm_tools llm_client) is asked in the background what it looks like;
@@ -590,6 +593,13 @@ class MissionManager(Node):
         step = 0.05
         pts = []
         walls = self.tiles.virtual_walls()
+        opened = self.tiles.open_curtains and bool(self.tiles.curtain_edges)
+        if opened != getattr(self, '_curtains_opened', False):
+            # the obstacle layer keeps virtual-wall marks (clearing: false): wipe them so the curtain edges really open
+            # (and are re-marked from the next cloud once backtracking is over)
+            self._curtains_opened = opened
+            self.log('info', f'Curtain virtual walls {"lifted (backtracking)" if opened else "restored"}.')
+            self.clear_costmaps()
         sig = (tuple(sorted((round(a, 2), round(b, 2), round(c, 2), round(d, 2)) for (a, b), (c, d) in walls)),
                sum(1 for t in self.tiles.tiles.values() if t.get('status') != 'unknown'))   # new tiles re-trigger it
         if sig != self._walls_sig:
@@ -928,6 +938,7 @@ class MissionManager(Node):
             trail.action = Marker.DELETE
         markers.append(trail)
         markers.extend(self._scene_markers(stamp))
+        markers.extend(self._split_markers(stamp))
         markers.extend(self._free_label_markers(stamp))
         markers.extend(self._target_markers(stamp))
         self.tile_marker_pub.publish(MarkerArray(markers=markers))
@@ -965,6 +976,23 @@ class MissionManager(Node):
         return [self._hatch_marker(tg, tile, 100 + n, 'scene_tiles', stamp, z=0.05)
                 for n, tile in enumerate(self.tiles.scene_tiles())]
 
+    def _split_markers(self, stamp):
+        """The last split tile (two or more tiles to travel to; backtracking returns there) as a solid black tile."""
+        top = self.tiles.last_split()
+        if top is None:
+            return []
+        tg = self.tiles.grid
+        cx, cy = tg.center(top['tile'])
+        m = Marker()
+        m.header.frame_id, m.header.stamp = self.global_frame, stamp
+        m.ns, m.id, m.type, m.action = 'last_split', 0, Marker.CUBE, Marker.ADD
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = cx, cy, 0.04
+        m.pose.orientation.z, m.pose.orientation.w = math.sin(tg.yaw / 2), math.cos(tg.yaw / 2)
+        m.scale.x = m.scale.y = 0.94 * tg.size
+        m.scale.z = 0.03
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.0, 0.0, 0.0, 0.9
+        return [m]
+
     def _free_label_markers(self, stamp):
         """Per-tile text: traversable share (compare with scene_max_free) and scanned share (compare with scene_min_known)."""
         tg = self.tiles.grid
@@ -997,7 +1025,8 @@ class MissionManager(Node):
             if self.target:
                 label, goal = self.target
                 cx, cy = tg.center(tuple(int(v) for v in label.split(',')))
-                rgb = (1.0, 0.5, 0.0) if self.machine.current.type_name != 'recovery' else (0.9, 0.1, 0.9)
+                rgb = {'recovery': (0.9, 0.1, 0.9), 'backtracking': (0.0, 0.8, 0.9)}.get(
+                    self.machine.current.type_name, (1.0, 0.5, 0.0))
                 m.color.r, m.color.g, m.color.b, m.color.a = (*rgb, 0.6 if n == 0 else 1.0)
                 if n == 0:
                     m.pose.position.x, m.pose.position.y, m.pose.position.z = cx, cy, 0.03

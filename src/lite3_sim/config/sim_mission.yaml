@@ -1,0 +1,15 @@
+# Applied to lite3_explorer's mission_manager ON TOP of its mission.yaml when it runs in the simulator.
+# Only what the simulator can't provide is switched off; tiles.size_m is set from the maze file by the launch file.
+mission_manager:
+  ros__parameters:
+    use_ai: false                          # no AI tile descriptions
+    terrain_classify_service: ''           # no terrain classifier: every tile counts as seen
+    output_dir: "~/lite3_sim_runs"         # run_<time>/events.jsonl, tiles.json
+    reports_dir: "~/lite3_sim_runs/reports"
+    modes:
+      idle:
+        start_wait_s: 15.0
+      exploring:
+        classify_target: false
+        quickscan_on_edge: false           # no animation_player (pose / scene animations are not simulated)
+        curtains: true                     # curtain mode on (launch arg use_curtains:=false turns it off)

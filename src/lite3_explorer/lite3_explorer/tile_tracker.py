@@ -41,7 +41,15 @@ class TileTracker:
         self.trail_log: List[dict] = []
         self.failures: Dict[str, List[str]] = {}       # tile label -> reasons
         self.unreachable: Dict[str, str] = {}          # tile label -> why
-        self._map = None                               # (grid array, GridInfo)
+        # split tiles: a tile from which two or more tiles could be travelled to. A stack (most recent last) of
+        # {'tile': (i, j), 'options': [labels]}; the "last split" is the most recent one that still has an option
+        # the robot has not travelled to (see last_split()). Backtracking returns to it.
+        self.splits: List[dict] = []
+        # tile edges the robot has walked through a curtain on: {edge key: (tile, neighbour)}. The lidar sees a curtain as
+        # a wall, so these edges become virtual walls; with open_curtains (backtracking) they are left out.
+        self.curtain_edges: Dict[tuple, tuple] = {}
+        self.open_curtains = False
+        self._map = None                              # (grid array, GridInfo)
         self._map_version = 0
         self._classified_version = -1
         self.version = 0                               # bumped on every re-classification (for publishers)
@@ -85,6 +93,8 @@ class TileTracker:
         self.trail, self.trail_log = [], []
         self._wall_keys = set()
         self.described = set()
+        self.splits = []
+        self.curtain_edges = {}
         self._visit(start, pose, 'start')
         self.update(force=True)
         return start
@@ -106,12 +116,14 @@ class TileTracker:
                 t['sides'] = T.tile_sides(grid, info, self.grid, tile)
             if t['status'] == 'to_visit' and T.tile_label(tile) in self.unreachable:
                 t['status'] = 'unreachable'
+        self._flag_last_split()
         return True
 
     def virtual_walls(self, min_fraction: float = 0.5, start_wall: bool = True):
         """World segments to block in the planner: the wall behind the start pose and every tile edge more than
-        min_fraction covered by mapped wall."""
+        min_fraction covered by mapped wall. With open_curtains (backtracking) edges with a curtain are left out."""
         segs = []
+        skip = set(self.curtain_edges) if self.open_curtains else set()
         if start_wall and getattr(self, 'start_wall', None):
             segs.append(self.start_wall)
         if self.grid is not None and self._map is not None:
@@ -122,7 +134,8 @@ class TileTracker:
             for key, seg, share in T.edge_coverage(self._map[0], self._map[1], self.grid, self.tiles):
                 if share > min_fraction or (key in self._wall_keys and share >= self.wall_release_fraction):
                     keys.add(key)
-                    segs.append(seg)
+                    if key not in skip:
+                        segs.append(seg)
             self._wall_keys = keys
         return segs
 
@@ -274,11 +287,109 @@ class TileTracker:
     def tile_of(self, x, y):
         return self.grid.tile_of(x, y) if self.grid is not None else None
 
+    def goal_point(self, tile, min_clearance_m: float = 0.25) -> Optional[List[float]]:
+        """The point inside a tile the robot drives to: its centre, or the clear free point nearest it (None: none)."""
+        if self.grid is None or self._map is None:
+            return None
+        grid, info = self._map
+        p = T.tile_goal_point(info, self.grid, tuple(tile), (grid >= 0) & (grid <= 25),
+                              T.clearance_map(grid, info), min_clearance_m)
+        return [round(p[0], 3), round(p[1], 3)] if p else None
+
+    # ------------------------------------------------------------- curtains
+    def add_curtain_edge(self, tile, neighbour):
+        """The robot walked from `tile` through a curtain into `neighbour` (tiles sharing a side)."""
+        side = T.side_towards(tuple(tile), tuple(neighbour))
+        if self.grid is None or side is None:
+            return
+        self.curtain_edges[T.edge_key(self.grid, tuple(tile), side)] = (tuple(tile), tuple(neighbour))
+
+    def is_curtain_edge(self, a, b) -> bool:
+        side = T.side_towards(tuple(a), tuple(b))
+        return self.grid is not None and side is not None and T.edge_key(self.grid, tuple(a), side) in self.curtain_edges
+
+    def known_route(self, start, goal) -> Optional[List[tuple]]:
+        """Tiles from start to goal along moves the robot has already made (consecutive trail entries, either way),
+        fewest steps first; None when the trail does not link them."""
+        from collections import deque
+        start, goal = tuple(start), tuple(goal)
+        links: Dict[tuple, set] = {}
+        for a, b in zip(self.trail, self.trail[1:]):
+            links.setdefault(a, set()).add(b)
+            links.setdefault(b, set()).add(a)
+        prev = {start: None}
+        queue = deque([start])
+        while queue:
+            a = queue.popleft()
+            if a == goal:
+                route = []
+                while a is not None:
+                    route.append(a)
+                    a = prev[a]
+                return route[::-1]
+            for b in sorted(links.get(a, ())):
+                if b not in prev:
+                    prev[b] = a
+                    queue.append(b)
+        return None
+
+    # ------------------------------------------------------------- split tiles (backtracking)
+    def mark_split(self, tile, options: Sequence[str]) -> bool:
+        """The robot stands on `tile` with two or more tiles it could travel to: remember it as the last split.
+        True if this is a new split (or its options changed)."""
+        tile, options = tuple(tile), sorted(set(options))
+        old = next((s for s in self.splits if s['tile'] == tile), None)
+        if old is not None:
+            self.splits.remove(old)
+        self.splits.append({'tile': tile, 'options': options})      # most recent last
+        self._flag_last_split()
+        self.version += 1
+        return old is None or old['options'] != options
+
+    def split_remaining(self, split: dict, include_unreachable: bool = False) -> List[str]:
+        """Options of a split the robot has not travelled to yet (still to_visit, drivable; with include_unreachable
+        also the ones given up on)."""
+        ok = ('to_visit', 'unreachable') if include_unreachable else ('to_visit',)
+        out = []
+        for label in split['options']:
+            tile = tuple(int(v) for v in label.split(','))
+            if self.tiles.get(tile, {}).get('status') in ok and self._drivable(label):
+                out.append(label)
+        return out
+
+    def last_split(self, exclude=None, include_unreachable: bool = True) -> Optional[dict]:
+        """The most recent split tile that still has an untravelled option (exhausted splits are forgotten). Options
+        given up on (unreachable) count unless include_unreachable is False."""
+        self.splits = [s for s in self.splits if self.split_remaining(s, include_unreachable=True)]
+        for s in reversed(self.splits):
+            if not self.split_remaining(s, include_unreachable):
+                continue
+            if exclude is None or s['tile'] != tuple(exclude):
+                return s
+        return None
+
+    def drop_split(self, tile):
+        tile = tuple(tile)
+        self.splits = [s for s in self.splits if s['tile'] != tile]
+        self._flag_last_split()
+        self.version += 1
+
+    def _flag_last_split(self):
+        """tiles[t]['last_split'] = True on the last split tile only (published with the tile map)."""
+        for d in self.tiles.values():
+            d.pop('last_split', None)
+        top = self.last_split() if self.tiles else None
+        if top is not None and top['tile'] in self.tiles:
+            self.tiles[top['tile']]['last_split'] = True
+
     def as_dict(self, frame: str = 'map') -> dict:
+        top = self.last_split() if self.tiles else None
         return {'frame': frame, 'grid': self.grid.as_dict() if self.grid else None, 'initial_tile': self.init_info,
                 'current_tile': T.tile_label(self.current) if self.current else None,
                 'counts': self.counts(), 'trail': [T.tile_label(t) for t in self.trail],
                 'unreachable': dict(self.unreachable),
+                'last_split': ({'tile': T.tile_label(top['tile']), 'options': top['options'],
+                                'remaining': self.split_remaining(top)} if top else None),
                 'tiles': {T.tile_label(k): (dict(v, terrain=self.terrain[T.tile_label(k)])
                                        if T.tile_label(k) in self.terrain else v) for k, v in sorted(self.tiles.items())}}
 

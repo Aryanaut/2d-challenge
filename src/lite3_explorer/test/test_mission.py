@@ -4,6 +4,7 @@ import math
 import numpy as np
 import pytest
 
+from lite3_explorer import tiles as T
 from lite3_explorer.map_grid import GridInfo
 from lite3_explorer.mission.config import DEFAULTS, merge_flat
 from lite3_explorer.mission.core import ModeMachine
@@ -698,3 +699,66 @@ def test_scene_tiles_only_count_beside_the_current_tile_and_are_checked_once_per
     assert ctx.tiles.scene_tiles() == [(2, 0)] and ctx.tiles.is_scene((2, 0))
     ctx.tiles.trail.append((0, 0))                            # and away again
     assert ctx.tiles.scene_tiles() == []
+
+
+# ------------------------------------------------------------------------------------------------ backtracking
+def tee_world():
+    """Corridor tiles 0,0 .. 2,0 with a branch going north from tile 1,0 (tiles 1,1 and 1,2): tile 1,0 is a split."""
+    margin = 1.0
+    info = GridInfo(int((3.0 + 2 * margin) / RES), int((3.0 + 2 * margin) / RES), RES, -margin, -margin)
+    grid = np.full((info.height, info.width), -1, dtype=np.int16)
+    rects = [((0.0, 0.0), (3.0, 1.0)), ((1.0, 1.0), (2.0, 3.0))]
+    for (x0, y0), (x1, y1) in rects:
+        r0, c0 = info.world_to_cell(x0, y0)
+        r1, c1 = info.world_to_cell(x1, y1)
+        grid[r0 - 1:r1 + 1, c0 - 1:c1 + 1] = 100
+    for (x0, y0), (x1, y1) in rects:
+        r0, c0 = info.world_to_cell(x0, y0)
+        r1, c1 = info.world_to_cell(x1, y1)
+        grid[r0:r1, c0:c1] = 0
+    return grid, info
+
+
+def test_split_tile_is_marked_and_backtracking_takes_the_untravelled_way():
+    # neighbours_fallback off: at the end of a branch no exploration target is left -> backtracking (not retry_wait)
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False}, world=tee_world())
+    run(ctx, m, steps=400)
+    splits = [d for k, d in ctx.events if k == 'split']
+    assert splits and splits[0]['tile'] == '1,0' and splits[0]['options'] == ['1,1', '2,0']
+    seen = modes_seen(m)
+    assert 'backtracking' in seen and 'recovery' not in seen
+    bt = [d for k, d in ctx.events if k == 'backtracked']
+    assert bt and bt[0]['split'] == '1,0'
+    # the robot went back to the split tile, then on to the option it had not travelled to
+    i = seen.index('backtracking')
+    assert seen[i + 1] == 'scanning' and seen[i + 2] == 'exploring'
+    assert ctx.complete and ctx.tiles.unexplored() == []
+    trail = [T.tile_label(t) for t in ctx.tiles.trail]
+    first_branch = trail[trail.index('1,0') + 1]
+    other = '1,1' if first_branch == '2,0' else '2,0'
+    back = trail.index('1,0', trail.index(first_branch))       # returned to the split tile ...
+    assert trail[back + 1] == other                            # ... and took the untravelled way
+
+
+def test_no_backtracking_when_turned_off():
+    ctx, m = make({'modes.exploring.backtracking': False, 'explorations.tiles.neighbours_fallback': False},
+                  world=tee_world())
+    run(ctx, m, steps=60, until_complete=False)
+    assert 'backtracking' not in modes_seen(m)
+    assert not [d for k, d in ctx.events if k == 'split']
+    assert any('retrying for Nav2 paths' in msg for _, msg in ctx.logs)      # the old behaviour: wait and retry
+
+
+def test_unreachable_split_option_is_retried_by_backtracking():
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False}, world=tee_world())
+    for _ in range(200):                       # until the robot has left the split tile for one of its options
+        run(ctx, m, steps=1, until_complete=False)
+        trail = [T.tile_label(t) for t in ctx.tiles.trail]
+        if '1,0' in trail and trail[-1] in ('1,1', '2,0'):
+            break
+    other = '1,1' if trail[-1] == '2,0' else '2,0'
+    ctx.tiles.mark_unreachable(other, 'test: given up on')
+    run(ctx, m, steps=400)
+    assert 'backtracking' in modes_seen(m)
+    assert any(k == 'backtracked' and d['tile'] == other for k, d in ctx.events)
+    assert ctx.complete and ctx.tiles.unexplored() == []

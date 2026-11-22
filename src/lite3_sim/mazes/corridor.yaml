@@ -1,0 +1,7 @@
+# Simplest check: a straight 5-tile corridor.
+name: corridor
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+
+  | >                 |
+  +---+---+---+---+---+

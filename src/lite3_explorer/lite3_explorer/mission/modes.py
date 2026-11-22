@@ -8,6 +8,8 @@
              decision.
   scene      a scene tile (scanned, mostly not traversable) shares a side with the current tile: face it, ask the AI
              to describe it, mark it explored and go back to exploring. The robot never enters it.
+  backtracking  no exploration target left but tiles are still unexplored: drive back to the last split tile (a tile
+             that had two or more tiles to travel to), then on to its option not travelled to yet; then exploring again.
   recovery   the robot is stuck (or no target has a Nav2 path): drive to the nearest tile centre, then rescan.
   complete   the end condition is met. /exploration_complete is published.
 
@@ -23,7 +25,7 @@ from lite3_explorer import costmap_escape as CE
 from lite3_explorer import curtain_core as CC
 from lite3_explorer import tiles as T
 from lite3_explorer.mission.core import Mode
-from lite3_explorer.mission.traversal import FAILED, SUCCEEDED
+from lite3_explorer.mission.traversal import FAILED, SUCCEEDED, TraversalResult
 
 MODE_TYPES: Dict[str, Type[Mode]] = {}
 
@@ -294,6 +296,8 @@ class ExploringMode(Mode):
             out.append(c.get('scene_mode', 'scene'))
         if c.get('curtains', False):
             out.append(c.get('curtain_mode', 'curtain'))
+        if c.get('backtracking', False) and c.get('backtracking_mode', 'backtracking') in self.machine.modes:
+            out.append(c.get('backtracking_mode', 'backtracking'))     # optional: unused when not in mission.modes
         return out
 
     @property
@@ -376,6 +380,9 @@ class ExploringMode(Mode):
             return self.go(self.machine.complete_mode, end)
         tiles = self.ctx.tiles
         if tiles.ready and (tiles.unexplored() or tiles.unreachable):
+            hop = self._backtrack(why)
+            if hop is not None:
+                return hop
             # unexplored tiles are left: never finish, look for new Nav2 paths to them later
             self.ctx.log('warn', f'{why}, but {len(tiles.unexplored()) + len(tiles.unreachable)} tile(s) are still '
                                  f'unexplored: retrying for Nav2 paths in {self._retry_period():.0f} s.')
@@ -449,7 +456,41 @@ class ExploringMode(Mode):
             self.index += 1
             self.set_phase('decide')
             return None
+        self._note_split(reachable)
         return self._drive_to(strat, self.choose_target(reachable))
+
+    # -- split tiles and backtracking
+    def _note_split(self, reachable):
+        """Two or more reachable tiles sharing a side with the current tile: the current tile is the last split."""
+        tiles = self.ctx.tiles
+        if not self.cfg.get('backtracking', False) or not tiles.ready or tiles.current is None:
+            return
+        ci, cj = tiles.current
+        options = sorted({t['tile'] for t in reachable if t.get('kind') == 'tile' and t.get('tile')
+                          and sum(abs(a - b) for a, b in zip(map(int, t['tile'].split(',')), (ci, cj))) == 1})
+        if len(options) < 2:
+            return
+        if tiles.mark_split(tiles.current, options):
+            label = T.tile_label(tiles.current)
+            self.ctx.log('info', f'Tile {label} is the last split: {len(options)} tiles to travel to '
+                                 f'({", ".join(options)}).')
+            self.ctx.event('split', tile=label, options=options)
+
+    def _backtrack(self, why):
+        """No exploration target left but tiles are still unexplored -> backtracking mode, back to the last split tile
+        (instead of waiting retry_period_s for new Nav2 paths). Options given up on (unreachable) still count."""
+        tiles = self.ctx.tiles
+        mode = self.cfg.get('backtracking_mode', 'backtracking')
+        if not self.cfg.get('backtracking', False) or mode not in self.machine.modes or tiles.current is None:
+            return None
+        split = tiles.last_split(exclude=tiles.current, include_unreachable=True)
+        if split is None:
+            return None
+        label = T.tile_label(split['tile'])
+        left = len(tiles.unexplored()) + len(tiles.unreachable)
+        self.ctx.log('info', f'{why}, but {left} tile(s) are still unexplored: backtracking to the last split tile '
+                             f'{label} (untravelled: {", ".join(tiles.split_remaining(split, include_unreachable=True))}).')
+        return self.go(mode, f'{why}; {left} tile(s) still unexplored', split=label)
 
     def choose_target(self, reachable):
         """Hook for other selection strategies (e.g. an AI choice): default is the strategy's top-ranked target."""
@@ -877,7 +918,10 @@ class CurtainMode(Mode):
     Phases: align (turn in place until the heading is square to the edge) -> cross (vx forward, small wz to hold the
     heading) until the robot is `through_m` past the edge line (the centre of the next tile) -> exploring. The tile
     behind is never tried twice (machine.curtains_tried), whatever happened. Nav2 is idle meanwhile: the velocity goes
-    out through ctx.drive(vx, wz) (the mission manager publishes it on /cmd_vel), ctx.stop() ends it."""
+    out through ctx.drive(vx, wz) (the mission manager publishes it on /cmd_vel), ctx.stop() ends it.
+    Backtracking uses it too (then=<mode>): afterwards it hands back to that mode instead of next_mode."""
+
+    then, then_kwargs, from_tile = None, {}, None
 
     def targets(self):
         return [self.cfg.get('next_mode', 'exploring')]
@@ -886,8 +930,10 @@ class CurtainMode(Mode):
     def is_driving(self):
         return self.phase == 'cross'
 
-    def enter(self, reason, edge=None, **kw):
+    def enter(self, reason, edge=None, then=None, then_kwargs=None, **kw):
         self.edge = edge
+        self.then, self.then_kwargs = then, dict(then_kwargs or {})   # backtracking: hand back to it afterwards
+        self.from_tile = tuple(self.ctx.tiles.current) if self.ctx.tiles.current is not None else None
         self.machine.curtains_tried.add(tuple(edge['neighbour']))
         self.start_pose = self.ctx.pose()
         self.ctx.set_target(None, None, None)
@@ -905,9 +951,13 @@ class CurtainMode(Mode):
         nx, ny = self.edge['normal']
         return (pose[0] - cx) * nx + (pose[1] - cy) * ny
 
-    def _finish(self, why):
+    def _finish(self, why, through=False):
         self.ctx.stop()
         self.ctx.log('info', f'Curtain: {why}')
+        if through and self.from_tile is not None:
+            self.ctx.tiles.add_curtain_edge(self.from_tile, self.edge['neighbour'])   # backtracking may walk it again
+        if self.then:
+            return self.go(self.then, f'curtain: {why}', curtain_ok=through, **self.then_kwargs)
         return self.go(self.cfg.get('next_mode', 'exploring'), f'curtain: {why}')
 
     def tick(self):
@@ -931,7 +981,7 @@ class CurtainMode(Mode):
         if self.phase == 'cross':
             done = self._progress(pose) >= self.edge['through_m'] + float(c.get('extra_m', 0.0))
             if done:
-                return self._finish('through the curtain')
+                return self._finish('through the curtain', through=True)
             if self.in_phase_s() > float(c.get('cross_timeout_s', 20.0)):
                 return self._finish('timed out walking through it')
             wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * err))
@@ -940,6 +990,8 @@ class CurtainMode(Mode):
 
     def exit(self, next_mode, reason):
         self.ctx.stop()
+        if next_mode != self.then:
+            self.ctx.tiles.open_curtains = False
 
 
 # ----------------------------------------------------------------------------------------- quickscan
@@ -986,6 +1038,225 @@ class QuickscanMode(Mode):
     def exit(self, next_mode, reason):
         if self.phase == 'playing' and self.ctx.animation_state() != 'done':
             self.ctx.animation_cancel()           # leave pose mode if another mode takes over mid-animation
+
+
+# ----------------------------------------------------------------------------------------- backtracking
+@register_mode('backtracking')
+class BacktrackingMode(Mode):
+    """No exploration target left (tiles still unexplored): go back to the last split tile (a tile that had two or more tiles to travel to) and on to the option
+    the robot has not travelled to yet, then return to exploring.
+
+    Phases: to_split (drive back to the split tile) -> checking_paths (Nav2 path to each untravelled option) ->
+    to_option (drive to the nearest reachable one) -> scan_mode / next_mode. When the split tile cannot be reached or
+    none of its options has a path, the split is forgotten and exploring decides as usual.
+
+    Curtains: while backtracking the virtual walls on curtain edges (edges the robot walked through a curtain on) are
+    lifted (tiles.open_curtains). The way back follows moves the robot already made (tiles.known_route); when it crosses
+    a curtain edge, Nav2 (which sees the curtain as a wall) only drives to the tile before it (to_curtain), the curtain
+    mode walks through it and hands back here, and the rest of the way is planned from the far side."""
+
+    def __init__(self, name, machine, cfg):
+        super().__init__(name, machine, cfg)
+        self.split, self.target, self.traversal, self.options, self.why = None, None, None, [], ''
+        self.crossing = None                      # (tile before the curtain, tile behind it) on the way back
+
+    def targets(self):
+        out = [self.cfg.get('next_mode', 'exploring'), self.cfg.get('scan_mode', 'scanning')]
+        if self.cfg.get('curtain_mode', 'curtain') in self.machine.modes:
+            out.append(self.cfg.get('curtain_mode', 'curtain'))
+        return out
+
+    @property
+    def is_driving(self):
+        return self.phase in ('to_split', 'to_curtain', 'to_option')
+
+    @property
+    def target_label(self):
+        return self.target['tile'] if self.target else None
+
+    def _label(self):
+        return T.tile_label(self.split) if self.split else '?'
+
+    def enter(self, reason, split=None, curtain_ok=None, **kw):
+        tiles = self.ctx.tiles
+        self.target, self.traversal, self.options, self.why, self.crossing = None, None, [], '', None
+        tiles.open_curtains = True                 # curtain edges are no virtual walls while backtracking
+        if curtain_ok is False:                    # back from the curtain mode, which did not get through
+            entry = next((s for s in tiles.splits if T.tile_label(s['tile']) == split), None)
+            if entry is not None:
+                tiles.drop_split(entry['tile'])
+            self.split = entry['tile'] if entry else None
+            return self._abort('could not walk through the curtain on the way back')
+        entry = None
+        if tiles.ready:
+            entry = (next((s for s in tiles.splits if T.tile_label(s['tile']) == split), None) if split
+                     else tiles.last_split(exclude=tiles.current))
+        if entry is None or not tiles.split_remaining(entry, include_unreachable=True):
+            self.split = None
+            return self._abort('no split tile with an untravelled option')
+        self.split = entry['tile']
+        self.ctx.event('backtracking', split=self._label(), remaining=tiles.split_remaining(entry, include_unreachable=True))
+        pose = self.ctx.pose()
+        here = tuple(tiles.grid.tile_of(pose[0], pose[1])) if pose is not None else tiles.current
+        if here == self.split:
+            self._check_options()
+            return
+        self._head_back(here)
+
+    def _goal(self, tile):
+        tiles = self.ctx.tiles
+        return tiles.goal_point(tile, float(self.cfg.get('min_clearance_m', 0.25))) \
+            or [round(v, 3) for v in tiles.grid.center(tile)]
+
+    def _head_back(self, here):
+        """Drive towards the split tile: straight there, or first to the tile before a curtain on the way."""
+        tiles = self.ctx.tiles
+        route = tiles.known_route(here, self.split) if here is not None else None
+        for a, b in zip(route or [], (route or [])[1:]):
+            if tiles.is_curtain_edge(a, b):
+                self.crossing = (a, b)
+                self.ctx.log('info', f'Backtracking: the way back to split tile {self._label()} goes through the curtain '
+                                     f'between tiles {T.tile_label(a)} and {T.tile_label(b)}.')
+                if a == here:
+                    self.set_phase('cross')
+                    return
+                self._start({'tile': T.tile_label(a), 'goal_xy': self._goal(a)}, 'to_curtain')
+                return
+        self._start({'tile': self._label(), 'goal_xy': self._goal(self.split)}, 'to_split')
+
+    def _cross(self):
+        """Hand over to the curtain mode for the curtain edge ahead; it comes back here (curtain_ok says how it went)."""
+        a, b = self.crossing
+        mode = self.cfg.get('curtain_mode', 'curtain')
+        if mode not in self.machine.modes:
+            self.ctx.tiles.drop_split(self.split)
+            self._abort('a curtain is in the way back but there is no curtain mode')
+            return None
+        edge = CC.edge_crossing(self.ctx.tiles.grid, a, T.side_towards(a, b))
+        return self.go(mode, f'backtracking through the curtain into tile {T.tile_label(b)}', edge=edge,
+                       then=self.name, then_kwargs={'split': self._label()})
+
+    def _abort(self, why):
+        self.why = why
+        self.set_phase('abort')
+
+    def _start(self, target, phase):
+        try:
+            trav = self.ctx.traversal(self.cfg.get('traversal', 'direct'))
+        except KeyError as exc:
+            self.ctx.log('error', str(exc))
+            return self._abort('bad traversal profile')
+        if not trav.available():
+            return self._abort('traversal not available (Nav2 down?)')
+        pose = self.ctx.pose() or [0.0, 0.0, 0.0]
+        gx, gy = target['goal_xy'][:2]
+        grid_yaw = self.ctx.tiles.grid.yaw
+        yaw = A.snap_to_axis(math.atan2(gy - pose[1], gx - pose[0]), grid_yaw)
+        if phase == 'to_option' and self.cfg.get('face_away_from_walls', True):
+            sides = self.ctx.tiles.tiles.get(tuple(int(v) for v in target['tile'].split(',')), {}).get('sides')
+            yaw = A.yaw_away_from_walls(sides, grid_yaw, yaw)
+        self.target, self.traversal = target, trav
+        if not trav.start([gx, gy], yaw, None):
+            return self._abort(f'could not start driving to tile {target["tile"]}')
+        self.ctx.set_target(target['tile'], [gx, gy], None)
+        where = {'to_split': 'back to the split tile', 'to_curtain': 'to the tile before the curtain'}.get(
+            phase, 'to the untravelled tile')
+        self.ctx.log('info', f'Backtracking: driving {where} {target["tile"]}.')
+        self.set_phase(phase)
+
+    def _check_options(self):
+        """At the split tile: Nav2 path to each option not travelled to yet."""
+        tiles = self.ctx.tiles
+        entry = next((s for s in tiles.splits if s['tile'] == self.split), None)
+        remaining = tiles.split_remaining(entry, include_unreachable=True) if entry else []
+        restored = [lab for lab in remaining if lab in tiles.unreachable]
+        for lab in restored:                       # given up on from elsewhere: try again from the split tile
+            tiles.unreachable.pop(lab, None)
+            tiles.failures.pop(lab, None)
+        if restored:
+            tiles.invalidate()
+            tiles.update()
+            self.ctx.log('info', f'Backtracking: retrying tile(s) {", ".join(restored)} from split tile {self._label()}.')
+        clearance = float(self.cfg.get('min_clearance_m', 0.25))
+        self.options = []
+        for label in remaining:
+            goal = tiles.goal_point(tuple(int(v) for v in label.split(',')), clearance)
+            if goal is not None:
+                self.options.append({'tile': label, 'goal_xy': goal})
+        if not self.options:
+            tiles.drop_split(self.split)
+            return self._abort(f'split tile {self._label()} has no untravelled option left')
+        if not self.ctx.paths.start([o['goal_xy'] for o in self.options]):
+            self.options.sort(key=lambda o: math.dist(o['goal_xy'], (self.ctx.pose() or [0, 0])[:2]))
+            return self._start(self.options[0], 'to_option')       # no planner to ask: nearest first
+        self.set_phase('checking_paths')
+
+    def tick(self):
+        c = self.cfg
+        if self.phase == 'abort':
+            self.ctx.log('info', f'Backtracking: {self.why}; back to exploring.')
+            return self.go(c.get('next_mode', 'exploring'), f'backtracking: {self.why}')
+        if self.phase == 'cross':
+            return self._cross()
+        if self.phase == 'checking_paths':
+            results = self.ctx.paths.poll()
+            if results is None and self.in_phase_s() <= float(c.get('path_check_timeout_s', 10.0)):
+                return None
+            if results is None:
+                self.ctx.paths.cancel()
+                results = []
+            from lite3_explorer.mission.exploration import path_length
+            ok = [(path_length([tuple(p[:2]) for p in r]), o) for o, r in zip(self.options, results) if r]
+            if not ok:
+                self.ctx.tiles.drop_split(self.split)
+                self._abort(f'no Nav2 path to the untravelled tile(s) of split tile {self._label()}')
+                return None
+            ok.sort(key=lambda x: x[0])
+            self._start(ok[0][1], 'to_option')
+            return None
+        if self.phase in ('to_split', 'to_curtain', 'to_option'):
+            res = self.traversal.poll()
+            if not res.done:
+                if self.in_phase_s() > float(c.get('goal_timeout_s', 120.0)):
+                    self.traversal.cancel()
+                    res = TraversalResult(FAILED, 'timed out')
+                else:
+                    return None
+            if res.state != SUCCEEDED:
+                self.ctx.log('warn', f'Backtracking to tile {self.target["tile"]} failed: {res.reason}.')
+                self.ctx.event('backtracking_failed', split=self._label(), tile=self.target['tile'], reason=res.reason)
+                if self.phase == 'to_option':
+                    self.ctx.tiles.record_failure(self.target['tile'], f'backtracking: {res.reason}')
+                self.ctx.tiles.drop_split(self.split)              # forget the split: never backtrack there in a loop
+                self._abort(f'could not reach tile {self.target["tile"]}')
+                return None
+            if self.phase == 'to_curtain':
+                self.traversal, self.target = None, None
+                self.ctx.set_target(None, None, None)
+                return self._cross()
+            if self.phase == 'to_split':
+                self.traversal, self.target = None, None
+                self.ctx.set_target(None, None, None)
+                self._check_options()
+                return None
+            t = self.target
+            self.ctx.tiles.mark_goal_reached(tuple(int(v) for v in t['tile'].split(',')), t['goal_xy'], self.ctx.pose())
+            self.ctx.event('backtracked', split=self._label(), tile=t['tile'])
+            why = f'backtracked from split tile {self._label()} to tile {t["tile"]}'
+            if c.get('scan_after_reach', True):
+                return self.go(c.get('scan_mode', 'scanning'), why)       # scanning hands over to exploring
+            return self.go(c.get('next_mode', 'exploring'), why)
+        return None
+
+    def exit(self, next_mode, reason):
+        if self.phase == 'checking_paths':
+            self.ctx.paths.cancel()
+        if self.phase in ('to_split', 'to_curtain', 'to_option') and self.traversal is not None:
+            self.traversal.cancel()
+        if next_mode != self.cfg.get('curtain_mode', 'curtain'):
+            self.ctx.tiles.open_curtains = False       # the curtain mode hands back here: keep them open meanwhile
+        self.target, self.traversal = None, None
+        self.ctx.set_target(None, None, None)
 
 
 # ----------------------------------------------------------------------------------------- recovery

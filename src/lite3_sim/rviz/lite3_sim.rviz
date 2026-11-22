@@ -1,0 +1,337 @@
+Panels:
+- Class: rviz_common/Displays
+  Help Height: 0
+  Name: Displays
+  Property Tree Widget:
+    Expanded:
+    - /Global Options1
+    Splitter Ratio: 0.6
+  Tree Height: 600
+- Class: rviz_common/Views
+  Expanded:
+  - /Current View1
+  Name: Views
+  Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ''
+  Displays:
+  - Alpha: 0.3
+    Cell Size: 1.02
+    Class: rviz_default_plugins/Grid
+    Color: 160; 160; 164
+    Enabled: false
+    Line Style:
+      Line Width: 0.03
+      Value: Lines
+    Name: Grid (1.02 m)
+    Normal Cell Count: 0
+    Offset:
+      X: 0
+      Y: 0
+      Z: 0
+    Plane: XY
+    Plane Cell Count: 20
+    Reference Frame: <Fixed Frame>
+    Value: false
+  - Alpha: 0.7
+    Class: rviz_default_plugins/Map
+    Color Scheme: map
+    Draw Behind: false
+    Enabled: true
+    Name: SLAM map (/map)
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /map
+      Filter size: 10
+    Update Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /map_updates
+    Use Timestamp: false
+    Value: true
+  - Alpha: 0.35
+    Class: rviz_default_plugins/Map
+    Color Scheme: costmap
+    Draw Behind: true
+    Enabled: true
+    Name: Global costmap
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /global_costmap/costmap
+      Filter size: 10
+    Update Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /global_costmap/costmap_updates
+    Use Timestamp: false
+    Value: true
+  - Alpha: 0.3
+    Class: rviz_default_plugins/Map
+    Color Scheme: costmap
+    Draw Behind: true
+    Enabled: false
+    Name: Local costmap
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /local_costmap/costmap
+      Filter size: 10
+    Update Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /local_costmap/costmap_updates
+    Use Timestamp: false
+    Value: false
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: true
+    Name: Maze ground truth (/sim/maze)
+    Namespaces: {}
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /sim/maze
+    Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: true
+    Name: Robot + curtain camera (/sim/robot)
+    Namespaces: {}
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /sim/robot
+    Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: true
+    Name: Tiles (mission tile_markers)
+    Namespaces: {}
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /mission_manager/tile_markers
+    Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: false
+    Name: Terrain (mission terrain_markers)
+    Namespaces: {}
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /mission_manager/terrain_markers
+    Value: false
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: false
+    Name: Tile reports (mission markers)
+    Namespaces: {}
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /mission_manager/markers
+    Value: false
+  - Alpha: 1
+    Autocompute Intensity Bounds: true
+    Class: rviz_default_plugins/LaserScan
+    Color: 255; 255; 0
+    Color Transformer: FlatColor
+    Decay Time: 0
+    Enabled: true
+    Name: Scan (/scan)
+    Position Transformer: XYZ
+    Selectable: true
+    Size (Pixels): 3
+    Size (m): 0.03
+    Style: Points
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Best Effort
+      Value: /scan
+    Use Fixed Frame: true
+    Use rainbow: true
+    Value: true
+  - Alpha: 1
+    Autocompute Intensity Bounds: true
+    Class: rviz_default_plugins/PointCloud2
+    Color: 255; 0; 0
+    Color Transformer: FlatColor
+    Decay Time: 0
+    Enabled: true
+    Name: Virtual walls (/virtual_walls)
+    Position Transformer: XYZ
+    Selectable: true
+    Size (Pixels): 3
+    Size (m): 0.04
+    Style: Flat Squares
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /virtual_walls
+    Use Fixed Frame: true
+    Use rainbow: true
+    Value: true
+  - Alpha: 1
+    Buffer Length: 1
+    Class: rviz_default_plugins/Path
+    Color: 25; 200; 80
+    Enabled: true
+    Head Diameter: 0.3
+    Head Length: 0.2
+    Length: 0.3
+    Line Style: Billboards
+    Line Width: 0.02
+    Name: Nav2 path (/plan)
+    Offset:
+      X: 0
+      Y: 0
+      Z: 0.02
+    Pose Color: 25; 200; 80
+    Pose Style: Arrows
+    Radius: 0.03
+    Shaft Diameter: 0.05
+    Shaft Length: 0.15
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /plan
+    Value: true
+  - Alpha: 1
+    Buffer Length: 1
+    Class: rviz_default_plugins/Path
+    Color: 255; 140; 0
+    Enabled: true
+    Head Diameter: 0.3
+    Head Length: 0.2
+    Length: 0.3
+    Line Style: Billboards
+    Line Width: 0.04
+    Name: Mission route (waypoints)
+    Offset:
+      X: 0
+      Y: 0
+      Z: 0.02
+    Pose Color: 255; 140; 0
+    Pose Style: Arrows
+    Radius: 0.03
+    Shaft Diameter: 0.05
+    Shaft Length: 0.15
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /mission_manager/route
+    Value: true
+  - Alpha: 1
+    Axes Length: 1
+    Axes Radius: 0.1
+    Class: rviz_default_plugins/Pose
+    Color: 255; 25; 0
+    Enabled: true
+    Head Length: 0.2
+    Head Radius: 0.1
+    Name: Current goal
+    Shaft Length: 0.4
+    Shaft Radius: 0.04
+    Shape: Arrow
+    Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /mission_manager/current_goal
+    Value: true
+  - Class: rviz_default_plugins/TF
+    Enabled: false
+    Frame Timeout: 15
+    Frames:
+      All Enabled: true
+    Marker Scale: 0.5
+    Name: TF
+    Show Arrows: true
+    Show Axes: true
+    Show Names: true
+    Tree: {}
+    Update Interval: 0
+    Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+  - Class: rviz_default_plugins/Interact
+    Hide Inactive Objects: true
+  - Class: rviz_default_plugins/MoveCamera
+  - Class: rviz_default_plugins/Select
+  - Class: rviz_default_plugins/Measure
+    Line color: 128; 128; 0
+  - Class: rviz_default_plugins/PublishPoint
+    Single click: true
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /clicked_point
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Angle: 0
+      Class: rviz_default_plugins/TopDownOrtho
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Scale: 110
+      Target Frame: base_link
+      Value: TopDownOrtho (rviz_default_plugins)
+      X: 0
+      Y: 0
+    Saved: null
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: true
+  Views:
+    collapsed: true
+  Width: 1600
+  X: 60
+  Y: 40

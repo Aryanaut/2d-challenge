@@ -173,10 +173,19 @@ def edge_curtain(grid, tile, points, visited=(), skip=(), *, tol_m: float = 0.30
         if span < min_span_m:
             continue
         if best is None or on.sum() > best['spots']:
-            mid_u = tile[0] + (0.5 if dj else (1.0 if di > 0 else 0.0))        # the middle of that edge, in tile units
-            mid_v = tile[1] + (0.5 if di else (1.0 if dj > 0 else 0.0))
-            cx, cy = grid.to_world(mid_u * size, mid_v * size)
-            best = {'side': side, 'neighbour': neighbour, 'centre_xy': (cx, cy), 'normal': normal,
-                    'yaw': math.atan2(normal[1], normal[0]), 'through_m': 0.5 * size,
-                    'spots': int(on.sum()), 'span_m': round(span, 2)}
+            best = dict(edge_crossing(grid, tile, side), spots=int(on.sum()), span_m=round(span, 2))
     return best
+
+
+def edge_crossing(grid, tile, side: str) -> dict:
+    """How to walk from `tile` through its `side` edge into the neighbour (the curtain mode's `edge`): {side,
+    neighbour, centre_xy, normal, yaw, through_m, spots, span_m}; normal / yaw point out through the edge."""
+    di, dj = SIDE_STEPS[side]
+    size = grid.size
+    c, s = math.cos(grid.yaw), math.sin(grid.yaw)
+    normal = (c * di - s * dj, s * di + c * dj)
+    mid_u = tile[0] + (0.5 if dj else (1.0 if di > 0 else 0.0))        # the middle of that edge, in tile units
+    mid_v = tile[1] + (0.5 if di else (1.0 if dj > 0 else 0.0))
+    cx, cy = grid.to_world(mid_u * size, mid_v * size)
+    return {'side': side, 'neighbour': (tile[0] + di, tile[1] + dj), 'centre_xy': (cx, cy), 'normal': normal,
+            'yaw': math.atan2(normal[1], normal[0]), 'through_m': 0.5 * size, 'spots': 0, 'span_m': size}

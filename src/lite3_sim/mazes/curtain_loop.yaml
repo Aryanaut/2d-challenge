@@ -1,0 +1,10 @@
+# A loop whose only way into the east half is through a curtain (tests curtain mode).
+# With curtain mode off, tiles 3,0 .. 4,1 are never reached (the lidar sees the curtain as a wall).
+name: curtain_loop
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+
+  |           ~       |
+  +   +   +---+   +   +
+  | ^         |       |
+  +---+---+---+---+---+
