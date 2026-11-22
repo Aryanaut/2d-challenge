@@ -17,12 +17,12 @@ controller_server:
     controller_frequency: 5.0
     odom_topic: /odom
     min_x_velocity_threshold: 0.001
-    min_y_velocity_threshold: 0.5
+    min_y_velocity_threshold: 0.001      # RecoveryMPPI strafes: vy must not be thrown away (the pure pursuit never commands it)
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 3.0               # controller patience: seconds without a valid command before the goal is aborted
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"]
-    controller_plugins: ["FollowPath"]
+    controller_plugins: ["FollowPath", "RecoveryMPPI"]   # RecoveryMPPI: the recovery mode's controller
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.3
@@ -64,6 +64,81 @@ controller_server:
       cost_scaling_dist: 0.4
       cost_scaling_gain: 1.0
       inflation_cost_scaling_factor: 3.0
+    # ---- RecoveryMPPI: the same holonomic (Omni) MPPI, used by the mission's RECOVERY mode only (traversal profile
+    # recovery_mppi -> behavior_trees/recovery_mppi.xml, FollowPath controller_id="RecoveryMPPI"). It strafes with vx / vy
+    # back to the chosen tile centre, holding the heading.
+    RecoveryMPPI:
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 14                     # horizon = time_steps * model_dt = 2.8 s
+      model_dt: 0.2                      # MUST equal the controller period (1 / controller_frequency = 0.2 s here)
+      batch_size: 2000                   # sampled trajectories per cycle (lower it if the controller misses its rate)
+      iteration_count: 1
+      motion_model: "Omni"               # DiffDrive | Omni | Ackermann: Omni = holonomic, vy is sampled too
+      # speed limits (m/s, rad/s); the velocity smoother below uses the same
+      vx_max: 0.4
+      vx_min: -0.2
+      vy_max: 0.3
+      wz_max: 0.3                        # low on purpose: lateral moves keep the heading (was 0.6)
+      # sampling noise: how far the samples spread around the current best control
+      vx_std: 0.2
+      vy_std: 0.2
+      wz_std: 0.1                        # samples barely rotate (was 0.4)
+      temperature: 0.3
+      gamma: 0.015
+      prune_distance: 1.7                # path length ahead that is optimised
+      transform_tolerance: 0.1
+      regenerate_noises: true
+      visualize: true                    # /trajectories (MarkerArray) in RViz: the sampled and the chosen path
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      # The cost terms, in order. Holonomic and heading-holding: no PreferForwardCritic and no PathAngleCritic (in this
+      # Nav2 it turns the robot to face the path; Humble has no 'mode' parameter), TwirlingCritic penalises rotation, so
+      # the robot sidesteps with vy and keeps its heading.
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic",
+                "PathFollowCritic", "TwirlingCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        consider_footprint: true         # the 0.61 x 0.37 m body, not a circle: it fits narrow gaps sideways
+        collision_cost: 1000000.0
+        near_goal_distance: 0.5
+        trajectory_point_step: 2
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      TwirlingCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 10.0                # raise it if the heading still drifts, lower it if the robot cannot turn when it must
 
 local_costmap:
   local_costmap:
@@ -215,11 +290,11 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    # Lite3 accepts vx, vy, wz on /cmd_vel. vy kept at 0 because RPP only commands vx/wz.
-    max_velocity: [0.4, 0.0, 0.6]
-    min_velocity: [-0.2, 0.0, -0.6]
-    max_accel: [0.6, 0.0, 1.5]
-    max_decel: [-0.8, 0.0, -2.0]
+    # Lite3 accepts vx, vy, wz on /cmd_vel. RPP only commands vx/wz; vy is for the recovery mode's RecoveryMPPI (Omni).
+    max_velocity: [0.4, 0.3, 0.6]
+    min_velocity: [-0.2, -0.3, -0.6]
+    max_accel: [0.6, 0.5, 1.5]
+    max_decel: [-0.8, -0.5, -2.0]
     odom_topic: /odom
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

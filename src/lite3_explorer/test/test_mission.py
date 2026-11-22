@@ -272,8 +272,8 @@ def test_stuck_without_motion_goes_to_nearest_tile_centre_then_gives_up_on_the_t
     assert 'recovery' in seen
     stuck = [d for k, d in ctx.events if k == 'stuck']
     assert stuck and stuck[0]['target'] == '2,0' and 'moved only' in stuck[0]['why']
-    # recovery drives to a tile centre with the 'direct' profile, never the tile it got stuck on
-    rec = [tile for name, tile in ctx.drives if name == 'direct']
+    # recovery drives to a tile centre with the 'recovery_mppi' profile, never the tile it got stuck on
+    rec = [tile for name, tile in ctx.drives if name == 'recovery_mppi']
     assert rec and '2,0' not in rec
     assert ctx.cleared >= 1
     assert '2,0' in ctx.tiles.unreachable
@@ -762,3 +762,98 @@ def test_unreachable_split_option_is_retried_by_backtracking():
     assert 'backtracking' in modes_seen(m)
     assert any(k == 'backtracked' and d['tile'] == other for k, d in ctx.events)
     assert ctx.complete and ctx.tiles.unexplored() == []
+
+
+# ------------------------------------------------------------------------------------------------ recovery: mppi + omni
+def test_recovery_uses_mppi_then_falls_back_to_omni_on_the_same_tile_centre():
+    ctx, m = make()
+    run(ctx, m, steps=8, until_complete=False)
+    calls = []
+
+    class Flaky(FakeTraversal):
+        def poll(self):
+            if self.name == 'recovery_mppi':
+                return TraversalResult(FAILED, 'controller failed')
+            return super().poll()
+
+    ctx.traversal = lambda name: (calls.append(name), Flaky(ctx, name, ctx.cfg['traversals'][name]))[1]
+    m.request('recovery', 'test')
+    run(ctx, m, steps=12, until_complete=False)
+    assert calls[:2] == ['recovery_mppi', 'omni']
+    fb = [d for k, d in ctx.events if k == 'recovery_fallback']
+    assert fb and fb[0]['failed'] == 'recovery_mppi' and fb[0]['traversal'] == 'omni'
+    rec = [d for k, d in ctx.events if k == 'recovered']
+    assert rec and rec[0]['traversal'] == 'omni' and rec[0]['tile'] == fb[0]['tile']   # same tile centre
+
+
+def test_omni_traversal_slides_with_x_and_y_and_holds_the_heading():
+    from lite3_explorer.mission.traversal import OmniTraversal
+
+    class Robot:
+        def __init__(self):
+            self.p, self.t, self.cmds = [0.0, 0.0, 0.5], 0.0, []
+
+        def pose(self):
+            return list(self.p)
+
+        def now(self):
+            return self.t
+
+        def drive(self, vx, wz, vy=0.0):
+            self.cmds.append((vx, vy, wz))
+            c, s = math.cos(self.p[2]), math.sin(self.p[2])
+            self.p[0] += vx * c - vy * s          # 1 s steps, robot frame -> map
+            self.p[1] += vx * s + vy * c
+            self.p[2] += wz
+
+        def stop(self):
+            self.cmds.append('stop')
+
+    r = Robot()
+    tr = OmniTraversal(r, 'omni', DEFAULTS['traversals']['omni'])
+    assert tr.start([0.0, 1.0], 0.0)                    # straight "left" of the map, robot turned 0.5 rad
+    for _ in range(60):
+        r.t += 1.0
+        if tr.poll().done:
+            break
+    assert tr.poll().state == SUCCEEDED
+    assert math.dist(r.p[:2], (0.0, 1.0)) <= 0.10
+    assert abs(r.p[2] - 0.5) < 1e-6                     # heading held: no turning
+    moves = [c for c in r.cmds if c != 'stop']
+    assert any(abs(vy) > 0.01 for _, vy, _ in moves) and any(abs(vx) > 0.01 for vx, _, _ in moves)
+    assert r.cmds[-1] == 'stop'
+
+
+def test_omni_traversal_stops_at_a_wall_in_the_costmap():
+    from lite3_explorer.mission.traversal import OmniTraversal
+    grid, info = corridor(4.0)                          # wall cells (100) just outside y = 0..1
+
+    class Robot:
+        p, t = [0.5, 0.5, 0.0], 0.0
+
+        def pose(self):
+            return list(self.p)
+
+        def now(self):
+            return self.t
+
+        def drive(self, vx, wz, vy=0.0):
+            self.p[0] += vx * 0.1
+            self.p[1] += vy * 0.1
+
+        def stop(self):
+            pass
+
+        def costmap_snapshot(self):
+            return grid, info
+
+    r = Robot()
+    tr = OmniTraversal(r, 'omni', DEFAULTS['traversals']['omni'])
+    tr.start([0.5, 2.0], 0.0)                           # through the north wall
+    for _ in range(100):
+        r.t += 0.1
+        if tr.poll().done:
+            break
+    res = tr.poll()
+    assert res.state == FAILED and 'wall' in res.reason
+    assert r.p[1] < 1.0                                 # never drove into it

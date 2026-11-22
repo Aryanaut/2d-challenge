@@ -1262,11 +1262,16 @@ class BacktrackingMode(Mode):
 # ----------------------------------------------------------------------------------------- recovery
 @register_mode('recovery')
 class RecoveryMode(Mode):
-    """Stuck: move to the nearest tile centre. Phases: clearing -> driving (candidate by candidate) -> next mode."""
+    """Stuck: move to the nearest tile centre. Phases: clearing -> driving (candidate by candidate) -> next mode.
+
+    Each candidate is driven to with `traversal` (default recovery_mppi: Nav2 with the holonomic RecoveryMPPI controller,
+    vx / vy / wz). When that fails, `fallback_traversal` (default omni: straight linear x / y velocity, heading held, no
+    Nav2) takes the SAME tile centre before the next candidate is tried ('' = no fallback)."""
 
     def __init__(self, name, machine, cfg):
         super().__init__(name, machine, cfg)
         self.candidates, self.target, self.traversal, self.exclude = [], None, None, []
+        self.profile = None                       # traversal profile driving the current candidate
 
     def targets(self):
         return [self.cfg.get('next_mode', 'scanning'), self.cfg.get('fail_mode', 'scanning'), self.machine.complete_mode]
@@ -1321,8 +1326,7 @@ class RecoveryMode(Mode):
             return self._next_candidate()
         if self.phase == 'wait_traversal':
             if self.traversal.available():
-                self.candidates.insert(0, self.target)
-                return self._next_candidate()
+                return self._drive(self.profile)
             if self.in_phase_s() > float(self.cfg.get('attempt_timeout_s', 45.0)):
                 return self._leave(self.cfg.get('fail_mode', 'scanning'), 'traversal not available')
             return None
@@ -1331,21 +1335,36 @@ class RecoveryMode(Mode):
             if not res.done:
                 if self.in_phase_s() > float(self.cfg.get('attempt_timeout_s', 45.0)):
                     self.traversal.cancel()
-                    self.ctx.log('warn', f'Recovery to tile {self.target["tile"]} timed out.')
-                    return self._next_candidate()
+                    self.ctx.log('warn', f'Recovery to tile {self.target["tile"]} ({self.profile}) timed out.')
+                    return self._fallback_or_next('timed out')
                 return None
             if res.state == SUCCEEDED:
-                return self._leave(self.cfg.get('next_mode', 'scanning'), f'recovered at the centre of tile {self.target["tile"]}')
-            self.ctx.log('warn', f'Recovery to tile {self.target["tile"]} failed: {res.reason}.')
-            return self._next_candidate()
+                self.ctx.event('recovered', tile=self.target['tile'], traversal=self.profile)
+                return self._leave(self.cfg.get('next_mode', 'scanning'),
+                                   f'recovered at the centre of tile {self.target["tile"]} ({self.profile})')
+            self.ctx.log('warn', f'Recovery to tile {self.target["tile"]} ({self.profile}) failed: {res.reason}.')
+            return self._fallback_or_next(res.reason)
         return None
+
+    def _fallback_or_next(self, why):
+        """The main traversal failed: the omni x / y fallback tries the same tile centre, then the next candidate."""
+        fallback = self.cfg.get('fallback_traversal', 'omni')
+        if fallback and self.profile != fallback and self.target is not None:
+            self.ctx.event('recovery_fallback', tile=self.target['tile'], failed=self.profile, why=why, traversal=fallback)
+            return self._drive(fallback)
+        return self._next_candidate()
 
     def _next_candidate(self):
         if not self.candidates:
             return self._leave(self.cfg.get('fail_mode', 'scanning'), 'no tile centre could be reached')
         self.target = self.candidates.pop(0)
+        return self._drive(self.cfg.get('traversal', 'recovery_mppi'))
+
+    def _drive(self, profile):
+        """Drive to the current candidate's centre with this traversal profile."""
+        self.profile = profile
         try:
-            self.traversal = self.ctx.traversal(self.cfg.get('traversal', 'direct'))
+            self.traversal = self.ctx.traversal(profile)
         except KeyError as exc:
             self.ctx.log('error', str(exc))
             return self._leave(self.cfg.get('fail_mode', 'scanning'), 'bad traversal profile')
@@ -1354,13 +1373,13 @@ class RecoveryMode(Mode):
         grid_yaw = self.ctx.tiles.grid.yaw if self.ctx.tiles.grid is not None else 0.0
         yaw = A.snap_to_axis(math.atan2(gy - pose[1], gx - pose[0]), grid_yaw)
         if not self.traversal.available():
-            self.ctx.log('warn', 'Recovery traversal not available yet (Nav2 down?): waiting.')
+            self.ctx.log('warn', f'Recovery traversal {profile!r} not available yet (Nav2 down?): waiting.')
             self.set_phase('wait_traversal')
             return None
         self.ctx.log('info', f'Recovery: driving to the centre of tile {self.target["tile"]} '
-                             f'({self.target["distance_m"]:.2f} m away, {self.target["status"]}).')
+                             f'({self.target["distance_m"]:.2f} m away, {self.target["status"]}) with {profile}.')
         if not self.traversal.start(self.target['goal_xy'], yaw, None):
-            return self._next_candidate()
+            return self._fallback_or_next('could not start')
         self.ctx.set_target(self.target['tile'], self.target['goal_xy'], None)
         self.set_phase('driving')
         return None

@@ -114,6 +114,22 @@ mission_manager:
       direct:                                # straight NavigateToPose
         type: nav2_pose
         behavior_tree: ""                    # '' = Nav2's default tree
+      recovery_mppi:                         # recovery: NavigateToPose with the holonomic RecoveryMPPI controller (vx, vy, wz)
+        type: nav2_pose
+        behavior_tree: recovery_mppi.xml     # behavior_trees/ of this package: FollowPath controller_id="RecoveryMPPI"
+      omni:                                  # recovery fallback, no Nav2: straight linear x / y velocity, heading held
+        type: omni
+        speed_mps: 0.20
+        min_speed_mps: 0.06                  # speed = gain * distance, between these two
+        gain: 0.8
+        tolerance_m: 0.10                    # done this close to the tile centre
+        heading_kp: 1.5                      # wz P-controller holding the starting heading
+        wz_max: 0.3
+        block_cost: 100                      # fail when a global-costmap cell this costly (lethal: wall / virtual wall) ...
+        lookahead_m: 0.30                    # ... lies this far ahead on the way
+        timeout_s: 30.0
+        stall_s: 6.0                         # fail when not min_progress_m closer within this long
+        min_progress_m: 0.05
       # stairs:                              # example slot for a future stair traversal
       #   type: stairs
 
@@ -126,7 +142,7 @@ mission_manager:
       scanning:
         type: scanning
         turn: true
-        turn_deg: 360.0
+        turn_deg: 180.0
         opening_setpoints_deg: [0, 80, -160, -80]   # opening spin: yaw setpoints relative to the starting heading (flat gait), then back to 0
         opening_retries: 2                  # the opening scan must finish: retry the sweep (alternating sides) this often
         opening_min_turn_deg: 160            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
@@ -155,7 +171,7 @@ mission_manager:
         backtracking_mode: backtracking      # target is left but tiles are unexplored, go back there and take the other way (else retry_wait)
         classify_target: true                # terrain-classify the target tile as soon as the robot points at it; floor not visible -> choose another tile
         classify_max_angle_deg: 20.0         # "points at it": heading within this angle of the tile
-        retry_period_s: 15.0                 # nothing reachable but tiles are left: wait this long, then give every tile another chance
+        retry_period_s: 3.0                 # nothing reachable but tiles are left: wait this long, then give every tile another chance
         retry_rescan: true                   # ... after a rescan (new map data may open a Nav2 path)
         retry_clear_costmaps: true
         scan_mode: scanning
@@ -221,7 +237,8 @@ mission_manager:
         next_mode: exploring
       recovery:
         type: recovery
-        traversal: direct
+        traversal: recovery_mppi             # Nav2 with the holonomic RecoveryMPPI controller (strafes with vx / vy)
+        fallback_traversal: omni             # that failed: straight linear x / y velocity to the same tile centre ('' = none)
         tile_statuses: [visited, to_visit]   # whose centres count as recovery targets
         candidates: 3                        # nearest centres tried in turn
         min_distance_m: 0.25                 # skip the centre the robot is already on

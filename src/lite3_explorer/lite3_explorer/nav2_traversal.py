@@ -3,11 +3,13 @@
 Registered on import into mission.traversal.TRAVERSAL_TYPES. Profile options (traversals.<name>.*):
   type            nav2_pose | nav2_route
   action          action name (default navigate_to_pose / follow_waypoints)
-  behavior_tree   nav2_pose only: a behaviour tree XML path for this profile ('' = Nav2's default)
+  behavior_tree   nav2_pose only: a behaviour tree XML for this profile ('' = Nav2's default); a bare file name is
+                  taken from this package's share/behavior_trees (e.g. recovery_mppi.xml)
   waypoints, skip_start_m, drop_backward_waypoints
                   nav2_route only: how the exploring mode builds the route (approach.default_route)
 """
 import math
+import os
 
 from rclpy.action import ActionClient
 
@@ -17,6 +19,15 @@ from nav2_msgs.action import FollowWaypoints, NavigateToPose
 
 from lite3_explorer.mission.traversal import (FAILED, RUNNING, SUCCEEDED, Traversal, TraversalResult,
                                               register_traversal)
+
+
+def resolve_behavior_tree(path):
+    """A bare file name (e.g. recovery_mppi.xml) is looked up in this package's share/behavior_trees."""
+    path = os.path.expanduser(path)
+    if os.path.isabs(path):
+        return path
+    from ament_index_python.packages import get_package_share_directory
+    return os.path.join(get_package_share_directory('lite3_explorer'), 'behavior_trees', path)
 
 
 def yaw_to_quaternion(yaw):
@@ -104,7 +115,7 @@ class Nav2PoseTraversal(_Nav2Traversal):
         goal = NavigateToPose.Goal()
         goal.pose = self._pose(goal_xy[0], goal_xy[1], yaw)
         if self.cfg.get('behavior_tree'):
-            goal.behavior_tree = str(self.cfg['behavior_tree'])
+            goal.behavior_tree = resolve_behavior_tree(str(self.cfg['behavior_tree']))
         self.node.publish_goal(goal.pose, self.name)
         return self._send(goal)
 

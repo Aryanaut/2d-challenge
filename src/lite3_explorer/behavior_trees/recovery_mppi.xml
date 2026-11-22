@@ -1,0 +1,19 @@
+<!--
+  NavigateToPose for the mission's RECOVERY mode (traversal profile recovery_mppi, config/mission.yaml):
+  plan with the normal planner, follow with the holonomic RecoveryMPPI controller (motion_model Omni: vx, vy, wz),
+  so the robot strafes back to the chosen tile centre. Replans at 1 Hz; one local-costmap clear + retry on failure,
+  after that the recovery mode takes over (next candidate, or its own omni x/y fallback).
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="1" name="RecoveryMPPI">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        </RateController>
+        <FollowPath path="{path}" controller_id="RecoveryMPPI" goal_checker_id="general_goal_checker"/>
+      </PipelineSequence>
+      <ClearEntireCostmap name="ClearLocalCostmap" service_name="local_costmap/clear_entirely_local_costmap"/>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

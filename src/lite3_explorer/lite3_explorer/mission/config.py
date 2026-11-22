@@ -120,6 +120,12 @@ DEFAULTS: Dict[str, Any] = {
                   'max_waypoint_deviation_m': 0.25,   # drop waypoints further than this off the straight line to the tile centre (0 = keep all)
                   'drop_backward_waypoints': False},   # True: drop waypoints facing away from the goal (fewer than N)
         'direct': {'type': 'nav2_pose', 'behavior_tree': ''},   # NavigateToPose straight to the goal
+        # recovery: NavigateToPose followed by the holonomic RecoveryMPPI controller (nav2_params*.yaml), vx / vy / wz
+        'recovery_mppi': {'type': 'nav2_pose', 'behavior_tree': 'recovery_mppi.xml'},
+        # recovery fallback without Nav2: straight linear x / y velocity to the goal, heading held (mission/traversal.py)
+        'omni': {'type': 'omni', 'speed_mps': 0.20, 'min_speed_mps': 0.06, 'gain': 0.8, 'tolerance_m': 0.10,
+                 'heading_kp': 1.5, 'wz_max': 0.3, 'block_cost': 100, 'lookahead_m': 0.30, 'timeout_s': 30.0,
+                 'stall_s': 6.0, 'min_progress_m': 0.05},
     },
 
     'modes': {
@@ -237,7 +243,8 @@ DEFAULTS: Dict[str, Any] = {
         },
         'recovery': {
             'type': 'recovery',
-            'traversal': 'direct',
+            'traversal': 'recovery_mppi',     # Nav2 + holonomic RecoveryMPPI controller (strafes with vx / vy)
+            'fallback_traversal': 'omni',     # that failed: straight x / y velocity to the same centre ('' = none)
             'tile_statuses': ['visited', 'to_visit'],   # which tiles' centres are recovery targets
             'candidates': 3,
             'min_distance_m': 0.25,       # skip centres the robot is already on

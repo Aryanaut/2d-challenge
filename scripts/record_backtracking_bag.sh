@@ -15,12 +15,12 @@
 #   what the lidar / curtain detector saw                        /scan, /curtain/points, /curtain/markers
 #
 # Usage:
-#   ./record_backtracking_bag.sh                     record to ~/lite3_bags/backtracking_<time>
+#   ./record_backtracking_bag.sh                     record to <repo>/bags/sim/backtracking_<time>
 #   DEPTH=1 ./record_backtracking_bag.sh             also the depth image (curtain detector input; large)
 #   CLOUD=1 ./record_backtracking_bag.sh             also the raw lidar point cloud (large)
 #
 # Settings (environment variables):
-#   OUT_DIR      where bags go                 (default ~/lite3_bags)
+#   OUT_DIR      where bags go                 (default <repo>/bags/sim, next to this scripts/ folder)
 #   NAME         bag name                      (default backtracking_<time>)
 #   STORAGE      sqlite3 | mcap                (default sqlite3; mcap needs ros-$ROS_DISTRO-rosbag2-storage-mcap)
 #   MAX_SIZE_MB  split the bag at this size    (default 0 = never)
@@ -37,7 +37,8 @@ set -euo pipefail
 
 ROS_DISTRO="${ROS_DISTRO:-humble}"
 WS="${WS:-$HOME/2d-challenge}"
-OUT_DIR="${OUT_DIR:-$HOME/lite3_bags}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # the 2d-challenge checkout this script lives in
+OUT_DIR="${OUT_DIR:-$REPO_DIR/bags/sim}"
 NAME="${NAME:-backtracking_$(date +%Y%m%d_%H%M%S)}"
 STORAGE="${STORAGE:-sqlite3}"
 MAX_SIZE_MB="${MAX_SIZE_MB:-0}"
