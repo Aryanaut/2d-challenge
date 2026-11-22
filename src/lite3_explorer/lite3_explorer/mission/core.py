@@ -18,7 +18,9 @@ The context object (`ctx`, the ROS node in production, a fake in tests) gives mo
   animation_play(name) -> bool  animation_state() -> 'pending' | 'running' | 'done'  animation_cancel()
   set_target(label, goal_xy, route)       event(kind, **data)   on_mode_change(mode, phase)   on_complete(reason)
   curtain_points() -> Nx4 (x, y, ux, uy) | None    (only with curtains: true)
-  drive(vx, wz, vy=0.0)  stop()  costmap_snapshot() -> (grid, GridInfo) | None      (curtain and mppi modes)
+  drive(vx, wz, vy=0.0)  stop()  costmap_snapshot() -> (grid, GridInfo) | None      (curtain, stairs and mppi modes)
+  ai_mode(on, cmd_code) -> bool   robot AI mode on / off via /simple_cmd; False = no robot listening   (stairs mode)
+  (staircase tiles come in through tiles.set_stair_points(); the mission manager feeds it /stairs/points)
 """
 from __future__ import annotations
 
@@ -119,6 +121,7 @@ class ModeMachine:
                 self.exploration(name)
         self.scenes_done = set()           # scene tiles already looked at (never twice)
         self.curtains_tried = set()        # tiles behind a curtain that was already walked into (never twice)
+        self.stairs_tried = set()          # staircase tiles the stairs mode already went for (never twice)
         self.current: Optional[Mode] = None
         self.previous: Optional[str] = None
         self.started_at: Optional[float] = None

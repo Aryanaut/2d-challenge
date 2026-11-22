@@ -8,7 +8,8 @@ transfer_interfaces/MotionSimpleCMD {cmd_code, type: 0} on /simple_cmd, the same
 message the lite3_<gait> shell aliases send with `ros2 topic pub --once`.
 Switching rules (flat delay, minimum interval) live in terrain_gait.py. The gait only changes when the robot starts
 for a new tile (/mission_manager/next_target names a tile) or when a new terrain is classified (/terrain_type changes);
-a finished spin / animation brings the terrain gait back.
+a finished spin / animation brings the terrain gait back. While the robot is in AI mode (/ai_mode true: the mission
+manager's stairs mode climbs a staircase) no gait is sent at all: a gait command would take it out of AI mode.
 """
 import rclpy
 from rclpy.node import Node
@@ -50,6 +51,8 @@ class GaitSwitcher(Node):
         self.create_subscription(Bool, '/spin_flat', self._on_flat_request, 10)
         self.animating = False                            # no gait commands while a robot animation runs
         self.create_subscription(Bool, '/animation_active', self._on_animation, 10)
+        self.ai_mode = False                              # no gait commands while the robot is in AI mode (stairs)
+        self.create_subscription(Bool, '/ai_mode', self._on_ai_mode, latched)
         self.create_timer(0.2, self._tick)
         self.get_logger().info(f'gait switcher: non_rugged -> {self.switcher.flat_gait}, '
                                f'rugged -> {self.switcher.rugged_gait}')
@@ -79,6 +82,8 @@ class GaitSwitcher(Node):
                            else f'terrain {self.switcher.terrain}')
 
     def _on_crawl_hold(self, msg):
+        if self.ai_mode:
+            return
         now = self._now()
         was_holding, self.crawl_hold = self.crawl_hold, bool(msg.data)
         if self.crawl_hold:
@@ -91,6 +96,8 @@ class GaitSwitcher(Node):
 
     def _on_flat_request(self, msg):
         # Hold flat_slow for the opening spin: the terrain loop must not switch back until the reporter releases it.
+        if self.ai_mode:
+            return
         if msg.data:
             self.crawl_hold = True
             self.hold_gait = 'flat_slow'
@@ -104,6 +111,14 @@ class GaitSwitcher(Node):
         if was and not self.animating:
             self.switcher.restore()                       # move mode is back: restore the terrain gait
 
+    def _on_ai_mode(self, msg):
+        was, self.ai_mode = self.ai_mode, bool(msg.data)
+        if self.ai_mode and not was:
+            self._burst = None                            # a gait still being repeated would end AI mode
+            self._publish_gait('AI mode: stairs')
+        elif was and not self.ai_mode:
+            self.switcher.restore()                       # AI mode is over: restore the terrain gait
+
     def _repeat_burst(self, now):
         out, left, last = self._burst
         if left <= 0:
@@ -114,6 +129,8 @@ class GaitSwitcher(Node):
 
     def _tick(self):
         now = self._now()
+        if self.ai_mode:
+            return
         if self._burst is not None:
             self._repeat_burst(now)
         if self.crawl_hold or self.animating:

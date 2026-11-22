@@ -8,6 +8,8 @@
              decision.
   scene      a scene tile (scanned, mostly not traversable) shares a side with the current tile: face it, ask the AI
              to describe it, mark it explored and go back to exploring. The robot never enters it.
+  stairs     a staircase tile (depth camera, stairs_core.py) shares a side with the current tile: square up to it, turn
+             the robot's AI mode on, climb over it into the tile beyond, AI mode off, wall the staircase off, exploring.
   backtracking  no exploration target left but tiles are still unexplored: drive back to the last split tile (a tile
              that had two or more tiles to travel to), then on to its option not travelled to yet; then exploring again.
   recovery   the robot is stuck (or no target has a Nav2 path): drive to the nearest tile centre, then rescan.
@@ -23,6 +25,7 @@ from typing import Dict, Optional, Type
 from lite3_explorer import approach as A
 from lite3_explorer import costmap_escape as CE
 from lite3_explorer import curtain_core as CC
+from lite3_explorer import stairs_core as SC
 from lite3_explorer import tiles as T
 from lite3_explorer.mission.core import Mode
 from lite3_explorer.mission.traversal import FAILED, SUCCEEDED, TraversalResult
@@ -297,6 +300,8 @@ class ExploringMode(Mode):
             out.append(c.get('scene_mode', 'scene'))
         if c.get('curtains', False):
             out.append(c.get('curtain_mode', 'curtain'))
+        if c.get('stairs', False):
+            out.append(c.get('stairs_mode', 'stairs'))
         if c.get('backtracking', False) and c.get('backtracking_mode', 'backtracking') in self.machine.modes:
             out.append(c.get('backtracking_mode', 'backtracking'))     # optional: unused when not in mission.modes
         return out
@@ -346,7 +351,7 @@ class ExploringMode(Mode):
         if pose is None:
             return None
         if self.index == 0:
-            hop = self._scene_beside(pose)
+            hop = self._stairs_beside(pose) or self._scene_beside(pose)
             if hop is not None:
                 return hop
             edge = self._curtain_on_edge(pose)
@@ -646,7 +651,8 @@ class ExploringMode(Mode):
     def _scene_beside(self, pose):
         """scenes: true. At a decision, standing on a tile that shares an open side with a scene tile not looked at yet
         (also one that only became a scene tile since the robot arrived: the scan finished it) -> the scene mode faces
-        it, has the AI describe it and marks it explored; the robot stays on its tile. Each scene tile once
+        it, has the AI describe it and marks it explored; the robot stays on its tile. Scene tiles are detected
+        anywhere, but the scene mode only starts for one that shares a side with the current tile. Each scene tile once
         (machine.scenes_done)."""
         tiles = self.ctx.tiles
         if (not self.cfg.get('scenes', False) or tiles.grid is None
@@ -663,6 +669,26 @@ class ExploringMode(Mode):
             return self.go(self.cfg.get('scene_mode', 'scene'), f'scene tile {label} beside tile {T.tile_label(here)}',
                            tile=label)
         return None
+
+    def _stairs_beside(self, pose):
+        """stairs: true. At a decision, standing on a tile that shares a side with a staircase tile the steps go up away
+        from (stairs_core.stair_crossing) -> the stairs mode climbs over it into the tile beyond. Each staircase once
+        (machine.stairs_tried); one already climbed is walled off (tiles.stairs_crossed)."""
+        tiles = self.ctx.tiles
+        if (not self.cfg.get('stairs', False) or not tiles.stairs or tiles.grid is None or tiles.current is None
+                or self.cfg.get('stairs_mode', 'stairs') not in self.machine.modes
+                or tuple(tiles.grid.tile_of(pose[0], pose[1])) != tuple(tiles.current)):
+            return None
+        crossing = SC.stair_crossing(tiles.grid, tuple(tiles.current), tiles.stairs,
+                                     skip=self.machine.stairs_tried | tiles.stairs_crossed,
+                                     min_facing=float(self.cfg.get('stair_min_facing', 0.5)))
+        if crossing is None:
+            return None
+        here, first = T.tile_label(tiles.current), T.tile_label(crossing['neighbour'])
+        self.ctx.log('info', f'Staircase on tile {first}, along the {crossing["side"]} side of tile {here}: climbing '
+                             f'over it into tile {T.tile_label(crossing["beyond"])}.')
+        return self.go(self.cfg.get('stairs_mode', 'stairs'), f'staircase on tile {first} beside tile {here}',
+                       crossing=crossing)
 
     def _curtain_on_edge(self, pose):
         """curtains: true. A detected curtain (depth camera) along an edge of the tile the robot stands on, with an
@@ -1104,6 +1130,185 @@ class CurtainMode(Mode):
         self.ctx.stop()
         if next_mode != self.then:
             self.ctx.tiles.open_curtains = False
+
+
+# ----------------------------------------------------------------------------------------- stairs
+def _cmd_code(value) -> int:
+    """A /simple_cmd code from the config: an int, or a string such as '0x21010528'."""
+    return int(value, 0) if isinstance(value, str) else int(value)
+
+
+@register_mode('stairs')
+class StairsMode(CurtainMode):
+    """A staircase tile shares a side with the current tile: climb over it in the robot's AI mode.
+
+    Phases: center (vx / vy to the centre of the current tile, heading held) -> align (turn in place until square to the
+    side the staircase is on) -> ai_on (AI mode on: MotionSimpleCMD ai_on_code on /simple_cmd; stand still ai_settle_s)
+    -> cross (vx forward, wz holds the heading, vy the line through the tile centres) until the robot is over the
+    staircase tile(s), at the centre of the tile beyond -> ai_off (stop, AI mode off with ai_off_code, stand still
+    ai_settle_s) -> next_mode (exploring). The staircase is then walled off (tiles.mark_stairs_crossed: virtual walls on
+    all four edges of its tiles) so the robot never enters it again; the tile beyond counts as reached.
+
+    Giving up before AI mode is on (could not square up, no pose) hands back to the mode that was running before. Once it
+    is on, a climb that stalls or times out stops the robot, turns AI mode off, walls the staircase off as well (no
+    second try) and goes to fail_mode. Leaving the mode any other way (an operator mode command, shutdown) also turns
+    AI mode off. Each staircase is gone for once (machine.stairs_tried). While AI mode is on, the mission manager also
+    publishes /ai_mode true: the gait switcher sends no gait and the stair detector pauses.
+    The centring / squaring-up / line-following helpers are the curtain mode's: the geometry is the same (walk straight
+    through one edge of the current tile and on to the centre of a tile further along)."""
+
+    def targets(self):
+        return [self.cfg.get('next_mode', 'exploring'), self.cfg.get('fail_mode', 'recovery')]
+
+    @property
+    def is_driving(self):
+        return self.phase in ('center', 'cross')
+
+    def enter(self, reason, crossing=None, **kw):
+        self.edge, self.then, self.then_kwargs = crossing, None, {}
+        prev = self.machine.previous
+        self.came_from = prev if prev and prev != self.name else self.cfg.get('next_mode', 'exploring')
+        self.ai_on, self.climbed, self.attempts, self.pose_lost_at = False, False, 0, None
+        self.ctx.set_target(None, None, None)
+        if not crossing:
+            self.set_phase('abort')
+            return
+        self.machine.stairs_tried.update(map(tuple, crossing['stairs']))
+        self.from_tile = tuple(self.ctx.tiles.current) if self.ctx.tiles.current is not None else None
+        cx, cy = crossing['centre_xy']
+        nx, ny = crossing['normal']
+        half = 0.5 * self.ctx.tiles.grid.size
+        self.tile_centre = (cx - nx * half, cy - ny * half)          # centre of the tile in front of the staircase
+        self.ctx.event('stairs', side=crossing['side'], stairs=[T.tile_label(t) for t in crossing['stairs']],
+                       beyond=T.tile_label(crossing['beyond']), facing=crossing.get('facing'),
+                       through_m=crossing['through_m'])
+        self._start_center()
+
+    def _labels(self):
+        return ', '.join(T.tile_label(t) for t in self.edge['stairs']) if self.edge else '?'
+
+    def _ai(self, on):
+        code = _cmd_code(self.cfg.get('ai_on_code' if on else 'ai_off_code', 0x21010528 if on else 0x2101052B))
+        heard = self.ctx.ai_mode(on, code)
+        self.ai_on = on
+        self.climbed |= on
+        self.ctx.log('info' if heard else 'warn', f'Stairs: AI mode {"ON" if on else "OFF"} (0x{code:08X})'
+                     + ('' if heard else ': nobody is listening on /simple_cmd, the robot did not get it') + '.')
+        self.ctx.event('ai_mode', on=on, cmd_code=f'0x{code:08X}', heard=heard)
+
+    def _finish(self, why, through=False):
+        self.ctx.stop()
+        if self.ai_on:
+            self._ai(False)
+        tiles = self.ctx.tiles
+        if self.edge is not None and self.climbed:
+            tiles.mark_stairs_crossed(self.edge['stairs'])           # never again: virtual walls all round it
+        if through:
+            beyond = tuple(self.edge['beyond'])
+            tiles.mark_goal_reached(beyond, tiles.grid.center(beyond), self.ctx.pose())
+            self.ctx.log('info', f'Stairs: {why}; staircase tile(s) {self._labels()} walled off, now on tile '
+                                 f'{T.tile_label(beyond)}.')
+            self.ctx.event('stairs_crossed', stairs=[T.tile_label(t) for t in self.edge['stairs']],
+                           beyond=T.tile_label(beyond))
+            return self.go(self.cfg.get('next_mode', 'exploring'), f'stairs: {why}')
+        back = self.cfg.get('fail_mode', 'recovery') if self.climbed else self.came_from
+        self.ctx.log('warn', f'Stairs: {why}; giving up on staircase tile(s) {self._labels()}'
+                             + (' (walled off)' if self.climbed else '') + '.')
+        self.ctx.event('stairs_failed', stairs=self._labels(), why=why, ai_was_on=self.climbed, back_to=back)
+        return self.go(back, f'stairs: {why}')
+
+    def _climb_over(self, why, through=False):
+        """Done climbing (over it, or given up): stop, AI mode off, stand still, then _finish."""
+        self.ctx.stop()
+        self.result = (why, through)
+        if self.ai_on:
+            self._ai(False)
+        self.set_phase('ai_off')
+
+    def tick(self):
+        c = self.cfg
+        if self.phase == 'abort':
+            return self._finish('no staircase to climb')
+        if self.phase == 'ai_on':
+            self.ctx.stop()
+            if self.in_phase_s() >= float(c.get('ai_settle_s', 2.0)):
+                pose = self.ctx.pose()
+                self.best = self._progress(pose) if pose is not None and len(pose) >= 3 else -math.inf
+                self.best_at = self.ctx.now()
+                self.set_phase('cross')
+            return None
+        if self.phase == 'ai_off':
+            self.ctx.stop()
+            if self.in_phase_s() >= float(c.get('ai_settle_s', 2.0)):
+                why, through = self.result
+                return self._finish(why, through=through)
+            return None
+        pose = self.ctx.pose()
+        if pose is None or len(pose) < 3:
+            if self.phase != 'cross':
+                self.ctx.stop()
+                return self._finish('no pose') if self.in_phase_s() > 3.0 else None
+            # SLAM can lose the robot on the stairs: keep walking straight for a moment
+            self.pose_lost_at = self.pose_lost_at if self.pose_lost_at is not None else self.ctx.now()
+            if self.ctx.now() - self.pose_lost_at > float(c.get('pose_lost_s', 3.0)):
+                self._climb_over('lost the robot pose on the stairs')
+                return None
+            self.ctx.drive(float(c.get('speed_mps', 0.20)), 0.0)
+            return None
+        self.pose_lost_at = None
+        if self.phase == 'center':
+            dx, dy = self.tile_centre[0] - pose[0], self.tile_centre[1] - pose[1]
+            dist = math.hypot(dx, dy)
+            if dist <= float(c.get('center_tol_m', 0.06)) or self.in_phase_s() > float(c.get('center_timeout_s', 15.0)):
+                if dist > float(c.get('center_tol_m', 0.06)):
+                    self.ctx.log('warn', f'Stairs: could not reach the tile centre ({dist:.2f} m off); squaring up '
+                                         f'from here.')
+                self.ctx.stop()
+                self.set_phase('align')
+                return None
+            v = max(float(c.get('center_min_speed_mps', 0.05)),
+                    min(float(c.get('center_speed_mps', 0.15)), float(c.get('center_gain', 1.0)) * dist))
+            wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * self._yaw_error(pose, self.hold_yaw)))
+            self._drive_map(pose, v * dx / dist, v * dy / dist, wz)
+            return None
+        err = self._yaw_error(pose)
+        if self.phase == 'align':
+            if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))):
+                self.ctx.stop()
+                self._ai(True)
+                self.set_phase('ai_on')
+                return None
+            if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
+                return self._finish(f'could not square up to it ({math.degrees(err):+.0f} deg off)')
+            w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+                                                              float(c.get('turn_gain', 1.0)) * abs(err)))
+            self.ctx.drive(0.0, math.copysign(w, err))
+            return None
+        if self.phase == 'cross':
+            prog = self._progress(pose)
+            if prog >= self.edge['through_m'] + float(c.get('extra_m', 0.0)):
+                self._climb_over('over the staircase', through=True)
+                return None
+            if prog > self.best + float(c.get('stall_m', 0.05)):
+                self.best, self.best_at = prog, self.ctx.now()
+            if self.ctx.now() - self.best_at > float(c.get('stall_s', 10.0)):
+                self._climb_over(f'stuck {prog:+.2f} m past the edge of the staircase')
+                return None
+            if self.in_phase_s() > float(c.get('cross_timeout_s', 60.0)):
+                self._climb_over(f'timed out {prog:+.2f} m past the edge of the staircase')
+                return None
+            wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * err))
+            nx, ny = self.edge['normal']
+            lim = float(c.get('lateral_max_mps', 0.08))
+            lat = max(-lim, min(lim, -float(c.get('lateral_gain', 0.5)) * self._lateral(pose)))
+            v = float(c.get('speed_mps', 0.20))
+            self._drive_map(pose, v * nx - lat * ny, v * ny + lat * nx, wz)
+        return None
+
+    def exit(self, next_mode, reason):
+        self.ctx.stop()
+        if self.ai_on:                                   # left mid-climb (operator command, shutdown): AI mode off
+            self._ai(False)
 
 
 # ----------------------------------------------------------------------------------------- quickscan

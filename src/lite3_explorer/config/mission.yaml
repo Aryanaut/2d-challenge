@@ -25,10 +25,11 @@ mission_manager:
       min_known: 0.5                         # a tile exists once this share of it is scanned (was 0.7: the 1.7 m lidar range left edge tiles unknown)
       scene_min_known: 0.95                  # scene tile (drawn blue hatched in RViz): scanned at least this much ...
       scene_max_free: 0.85                   # ... but less than this share of it traversable
+      stair_min_points: 4                    # confirmed stair cells (10 cm, /stairs/points) that make a tile a staircase tile
 
     # ---------------------------------------------------------------- mission manager
     mission:
-      modes: [idle, scanning, exploring, quickscan, curtain, scene, mppi, backtracking, recovery, complete]   # instances to build (configured under modes.<name>)
+      modes: [idle, scanning, exploring, quickscan, curtain, stairs, scene, mppi, backtracking, recovery, complete]   # instances to build (configured under modes.<name>)
       initial_mode: idle
       start_mode: scanning                   # set_active(true) / auto start goes here
       recovery_mode: recovery                # the stuck supervisor sends the robot here
@@ -169,6 +170,9 @@ mission_manager:
         curtain_min_span_m: 0.40             # ... spread over at least this much of it
         curtain_last: true                   # another reachable tile beside the curtain's tile: explore it first (the tile becomes the
                                              # last split); backtracking returns and walks through the curtain afterwards
+        stairs: false                        # use_stairs:=true (launch / explorer.sh --stairs): a staircase tile (stair_detector) shares a
+                                             # side with the current tile -> stairs mode: AI mode on, climb over it, AI mode off, wall it off
+        stair_min_facing: 0.5                # climb only from a side the steps go up from (cos of ascent vs the way across; 0.5 = 60 deg)
         backtracking: true                   # a tile with two or more tiles to travel to is the 'last split'; when no exploration
         backtracking_mode: backtracking      # target is left but tiles are unexplored, go back there and take the other way (else retry_wait)
         classify_target: true                # terrain-classify the target tile as soon as the robot points at it; floor not visible -> choose another tile
@@ -237,6 +241,26 @@ mission_manager:
         heading_gain: 1.0                    # wz that holds the heading while walking
         extra_m: 0.0                         # stop this much beyond the next tile's centre
         cross_timeout_s: 20.0
+      stairs:                                # a staircase tile beside the current tile: centre, square up, AI mode on, climb over it with vx
+        type: stairs                         # into the tile beyond, AI mode off, wall the staircase off, exploring
+        next_mode: exploring
+        fail_mode: recovery                  # stuck / timed out after AI mode was on (it is turned off first): recovery
+        ai_on_code: "0x21010528"             # /simple_cmd MotionSimpleCMD {cmd_code, type: 0}: enter AI mode
+        ai_off_code: "0x2101052B"            # ... leave AI mode
+        ai_settle_s: 2.0                     # stand still this long after each AI mode command
+        center_tol_m: 0.06                   # first drive (vx / vy) to within this of the centre of the tile in front of the staircase
+        center_timeout_s: 15.0
+        align_tol_deg: 5.0                   # square up to the staircase's side within this before AI mode goes on
+        align_timeout_s: 15.0                # could not square up: give up (AI mode never turned on), back to exploring
+        speed_mps: 0.20                      # forward speed (vx) over the stairs
+        heading_gain: 1.0                    # wz that holds the heading while climbing
+        lateral_gain: 0.5                    # vy that keeps the robot on the line through the tile centres (0 = off)
+        lateral_max_mps: 0.08
+        extra_m: 0.0                         # stop this much beyond the centre of the tile beyond the staircase
+        cross_timeout_s: 60.0
+        stall_m: 0.05                        # climbing: less progress than this ...
+        stall_s: 10.0                        # ... in this long = stuck on the stairs
+        pose_lost_s: 3.0                     # no pose on the stairs: keep walking straight this long, then stop
       backtracking:                          # no target left: back to the last split tile, on to its untravelled tile, then exploring
         type: backtracking
         traversal: route                     # FollowWaypoints through the tile centres of the way back (a nav2_route profile)

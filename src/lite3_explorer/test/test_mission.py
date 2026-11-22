@@ -690,16 +690,19 @@ def test_scene_turn_does_not_flip_direction_when_the_scene_tile_is_behind():
     assert turns and len({w > 0 for w in turns}) == 1                         # one direction all the way round
 
 
-def test_scene_tiles_count_wherever_they_are_seen_and_are_never_driven_to():
+def test_scene_tiles_are_detected_anywhere_but_looked_at_only_from_a_neighbour():
     ctx, m = make(world=scene_world())
     ctx.nav_up = False
     run(ctx, m, steps=30, until_complete=False)               # grid placed, robot on tile 0,0; the scene tile 2,0 is two tiles away
-    assert ctx.tiles.tiles[(2, 0)]['scene'] is True and ctx.tiles.current == (0, 0)
-    assert ctx.tiles.scene_tiles() == [(2, 0)] and ctx.tiles.is_scene((2, 0))   # a scene tile from afar too
-    assert ctx.tiles.skip_scene and not ctx.tiles._drivable('2,0')              # so it is never a target
-    assert ctx.tiles.scene_neighbours((0, 0)) == []                             # not beside 0,0: nothing to look at
-    assert ctx.tiles.scene_neighbours((1, 0)) == [(2, 0)]                       # from 1,0 the scene mode takes it
-    assert ctx.tiles.scene_viewpoints((2, 0)) == [(1, 0)]
+    tiles = ctx.tiles
+    assert tiles.tiles[(2, 0)]['scene'] is True and tiles.current == (0, 0)
+    assert tiles.scene_tiles() == [(2, 0)] and tiles.is_scene((2, 0))         # detected from afar
+    assert tiles.skip_scene and not tiles._drivable('2,0')                    # so never a target
+    assert '2,0' not in tiles.unreachable                                     # and not eliminated (no clear goal point)
+    assert tiles.scene_neighbours((0, 0)) == []                               # not beside 0,0: no scene mode here
+    assert 'scene' not in modes_seen(m)
+    assert tiles.scene_neighbours((1, 0)) == [(2, 0)]                         # from 1,0 the scene mode takes it
+    assert tiles.scene_viewpoints((2, 0)) == [(1, 0)]
 
 
 # ------------------------------------------------------------------------------------------------ backtracking
@@ -891,23 +894,26 @@ def test_omni_traversal_stops_at_a_wall_in_the_costmap():
     assert r.p[1] < 1.0                                 # never drove into it
 
 
-def test_scene_tile_is_never_a_target_and_is_looked_at_from_a_visited_neighbour():
+def test_scene_tile_is_looked_at_from_a_visited_neighbour():
     ctx, m = make()                                     # corridor tiles 0,0 .. 3,0
     ctx.nav_up = False                                  # scan and place the grid, but never drive
     run(ctx, m, steps=30, until_complete=False)
     tiles = ctx.tiles
-    tiles.skip_scene = True
     for t in [(1, 0), (2, 0), (1, 0)]:                   # been to 2,0, now back on 1,0
         tiles._visit(t, list(tiles.grid.center(t)) + [0.0], 'test')
     tiles.update(force=True)
+    strat = m.exploration('tiles')
+    target = {'tile': '3,0', 'label': '3,0', 'kind': 'tile'}
+    assert strat.still_valid(target)
     tiles.tiles[(3, 0)]['scene'] = True                  # 3,0 turned out to be a scene tile after the robot left 2,0
     assert tiles.is_scene((3, 0)) and not tiles._drivable('3,0')
+    assert not strat.still_valid(target)                 # a drive towards it would stop
     assert '3,0' not in [t['tile'] for t in tiles.targets(ctx.pose_[:2])]           # never driven into
-    strat = m.exploration('tiles')
+    assert tiles.scene_neighbours((1, 0)) == []          # not beside 1,0: no scene mode from here
     cands = strat.candidates(list(tiles.grid.center((1, 0))) + [0.0])
-    view = [c for c in cands if c.get('scene') == '3,0']
-    assert [c['tile'] for c in view] == ['2,0']          # go back to the visited neighbour to look at it
-    assert '3,0' not in tiles.unreachable                # not eliminated for having no clear goal point
+    assert [c['tile'] for c in cands if c.get('scene') == '3,0'] == ['2,0']   # go back to the neighbour it shares a side with
+    assert '3,0' not in tiles.unreachable
+    tiles._visit((2, 0), list(tiles.grid.center((2, 0))) + [0.0], 'test')
     assert tiles.scene_neighbours((2, 0)) == [(3, 0)]    # standing there, the scene mode takes it
     tiles.mark_described((3, 0))
     assert not tiles.pending_scenes() and not [c for c in strat.candidates(ctx.pose_) if c.get('scene')]

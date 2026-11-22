@@ -35,6 +35,7 @@ background what it looks like, and the answers are compiled into `~/2d/reports/t
 | `scanning` | First time: waits for the map around the robot, **places the tile grid** (snapped to nearby walls) and does the opening sweep −90…+90° in the flat gait. Later: one in-place turn (360°) in the crawl gait, skipped where the body has no room. Then re-classifies the tiles. | `wait_map`, `settle`, `turning`, `done` |
 | `exploring` | **Checkpoint**: checks the end condition. Asks its exploration profiles in order (default `[tiles]`) for candidates, has Nav2 check a path to each, and drives to the best reachable one with a traversal profile. If a profile has nothing reachable, the next one is asked. Reached → `scanning`. Failed → the profile records it (tile failure / frontier blacklist) and it re-decides. | `decide`, `checking_paths`, `driving`, `wait_planner`, `wait_traversal` |
 | `quickscan` | Optional (`quickscan_on_edge`). Entered from `exploring` when the robot is within `quickscan_edge_margin_m` (0.15 m) of a tile boundary, once per tile. Cancels the Nav2 goal, waits `settle_s`, plays the `quickscan` robot animation and waits for it to end, then returns to `exploring`, which re-decides (the cancelled goal is normally re-chosen; it does not count as a failure). Skipped if `animation_player` doesn't start it within `start_timeout_s`; cancelled after `timeout_s`. | `settle`, `playing` |
+| `stairs` | Optional (`use_stairs:=true`, `./explorer.sh --stairs`). Entered from `exploring` at a decision when a **staircase tile** (found by `stair_detector` in the depth image) shares a side with the current tile and its steps go up away from it. Drives to the current tile's centre, squares up to that side, turns the robot's **AI mode on** (`/simple_cmd` `0x21010528`), walks forward over the staircase tile(s) to the centre of the tile beyond, turns **AI mode off** (`0x2101052B`), walls the staircase off (virtual walls on all four edges: never entered again) and returns to `exploring`. Stuck / timed out on the stairs: AI mode off, walled off, `fail_mode` (`recovery`). Any other exit (operator command, shutdown) also turns AI mode off. While AI mode is on, `/ai_mode` is true: `gait_switcher` sends no gait and `stair_detector` pauses. | `center`, `align`, `ai_on`, `cross`, `ai_off` |
 | `recovery` | Clears the costmaps, then drives to the **nearest tile centre** (visited or to-visit tiles, excluding the tile it got stuck on and the centre it already stands on), trying up to `candidates` of them. Then `scanning`. After `give_up_after` recoveries in a row without reaching a new tile, the failing tiles are marked unreachable. | `clearing`, `driving`, `wait_traversal`, `give_up` |
 | `complete` | The end condition is met. Publishes `/exploration_complete`, writes `tiles.json` and the final tile report. `set_active(true)` starts again. | `done` |
 
@@ -50,7 +51,9 @@ and either trigger fires, it switches to `recovery` (if none remain, it checks t
 **Tile states:** `visited` (explored), `to_visit`, `blocked`, `unknown` (not identified yet: doesn't count), and
 `unreachable`: a `to_visit` tile that was **eliminated**: no Nav2 path `eliminate_after` decisions in a row, no point
 clear of the walls, `tiles.max_failures` failed attempts (Nav2 abort, stuck, timeout), or repeated recoveries.
-Reaching an eliminated tile by any route clears that status.
+Reaching an eliminated tile by any route clears that status. `staircase` (drawn yellow): a tile holding at least
+`tiles.stair_min_points` confirmed stair cells: never a Nav2 target, never counted as unexplored; only the `stairs` mode
+enters it.
 
 ## Robot animations
 
@@ -153,7 +156,8 @@ SERVER_URL=http://192.168.10.141:8000 GROUP_ID=team7 src/lite3_explorer/scripts/
 
 Launch arguments are the same as before (`use_slam`, `use_nav2`, `use_terrain`, `use_gait`, lidar TF, `use_ai`,
 `server_url`, ...), plus `mission_params:=<yaml>`, `auto_start:=true|false`, `use_mission:=false` and
-`quickscan_on_edge:=true` (see [Robot animations](#robot-animations)).
+`quickscan_on_edge:=true` (see [Robot animations](#robot-animations)), `use_curtains:=true` and `use_stairs:=true`
+(starts `stair_detector`, `config/stairs.yaml`, and turns on `modes.exploring.stairs`).
 `mission_only.launch.py` skips odom TF, cloud→scan, SLAM and Nav2 for robots that already run them.
 
 ### Local controller: pure pursuit or holonomic MPPI
@@ -256,14 +260,15 @@ missions in simulated corridors and rooms, including a fake lidar that reveals t
 | `config/nav2_params_mppi.yaml` | Nav2 parameters with the holonomic MPPI local controller (`controller:=mppi`). |
 | `nav2_traversal.py` | `nav2_pose` and `nav2_route` traversal types. |
 | `mission/core.py` | `Mode`, `Transition`, `ModeMachine` (switching, stuck supervisor, end-condition checks). |
-| `mission/modes.py` | `idle`, `scanning`, `exploring`, `quickscan`, `recovery`, `complete`. |
+| `mission/modes.py` | `idle`, `scanning`, `exploring`, `quickscan`, `curtain`, `stairs`, `scene`, `mppi`, `backtracking`, `recovery`, `complete`. |
+| `stairs_core.py`, `stair_detector.py`, `config/stairs.yaml` | Staircase detection in the depth image (treads at evenly spaced heights, each farther than the one below; tuned on `bags/data/stairs`), staircase tiles, the side to climb from; the optional node publishing `/stairs/points`. |
 | `animations.py`, `animation_player.py`, `animation_test.py` | Robot animations (movement / pose), the node that plays them, and the one-shot test node (`launch/test_animation.launch.py`). |
 | `mission/exploration.py` | Exploration strategies (`tiles`, `frontier`) and their registry. |
 | `mission/stuck.py`, `mission/end_conditions.py`, `mission/traversal.py`, `mission/config.py` | Stuck detector, end conditions, traversal interface, config defaults. |
 | `frontiers.py` | Frontier clustering (only used by the optional `frontier` profile and `no_frontiers_left`). |
 | `tile_tracker.py` | Tile grid, classification, trail, failures, unreachable tiles. |
 | `tiles.py` (incl. adjacency levels), `map_grid.py`, `approach.py`, `turn_check.py`, `tile_reports.py`, `llm_link.py` | Tile geometry, map helpers, waypoint routes, turn-room check, tile report, AI link (from the kitchen explorer). |
-| `gait_switcher.py` | Terrain gait switching; pauses while an animation runs. |
+| `gait_switcher.py` | Terrain gait switching; pauses while an animation runs and while the robot is in AI mode (`/ai_mode`). |
 | `terrain_gait.py`, `odom_tf_bridge.py`, `preflight.py`, `survey_monitor.py` | Unchanged helpers. |
 
 Run files: `~/lite3_survey_runs/run_<time>/events.jsonl` (every mode switch, target, failure, stuck event,

@@ -33,6 +33,7 @@ setup(
             'preflight =lite3_explorer.preflight:main',
             'survey_monitor = lite3_explorer.survey_monitor:main',
             'curtain_detector = lite3_explorer.curtain_detector:main',
+            'stair_detector = lite3_explorer.stair_detector:main',
         ],
     },
 )

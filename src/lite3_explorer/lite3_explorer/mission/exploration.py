@@ -157,8 +157,8 @@ class TileExploration(Exploration):
 
     def _scene_viewpoints(self, pose, clearance, already):
         """Scene tiles still to look at: their neighbours the robot already visited become targets too (a neighbour
-        still to visit is a target anyway). Arriving there, the exploring mode hands over to the scene mode. A scene tile
-        with no neighbour to look from is given up on."""
+        still to visit is a target anyway). Arriving there the scene tile shares a side with the current tile, so the
+        exploring mode hands over to the scene mode. A scene tile with no neighbour to look from is given up on."""
         tiles = self.ctx.tiles
         if not tiles.skip_scene:
             return []
@@ -257,9 +257,12 @@ class TileExploration(Exploration):
         return reachable[:int(self.cfg.get('target_limit', 6))]
 
     def still_valid(self, target):
-        """Keep driving unless the tile turned out blocked / unreachable on the way (visited is fine: Nav2 centres it)."""
-        return self.ctx.tiles.tiles.get(tuple(int(v) for v in target['tile'].split(',')), {}).get('status') \
-            in ('to_visit', 'visited', None)
+        """Keep driving unless the tile turned out blocked / unreachable on the way (visited is fine: Nav2 centres it),
+        or turned out to be a scene tile (never entered: the scene mode looks at it from a neighbour)."""
+        tile = tuple(int(v) for v in target['tile'].split(','))
+        if self.ctx.tiles.skip_scene and self.ctx.tiles.is_scene(tile):
+            return False
+        return self.ctx.tiles.tiles.get(tile, {}).get('status') in ('to_visit', 'visited', None)
 
     def on_reached(self, target):
         self.strikes.pop(target['tile'], None)

@@ -6,6 +6,7 @@ Example:
   ros2 launch lite3_explorer exploration.launch.py use_ai:=false mission_params:=/path/to/my_mission.yaml
   ros2 launch lite3_explorer exploration.launch.py controller:=mppi      # holonomic MPPI controller (vx, vy, wz)
   ros2 launch lite3_explorer exploration.launch.py use_curtains:=true    # walk through curtains on tile edges
+  ros2 launch lite3_explorer exploration.launch.py use_stairs:=true      # climb over staircases in AI mode
 """
 import os
 
@@ -66,6 +67,8 @@ def _mission_manager(context):
         params.append({'modes.exploring.quickscan_on_edge': edge.lower() == 'true'})
     if LaunchConfiguration('use_curtains').perform(context).lower() == 'true':
         params.append({'modes.exploring.curtains': True})
+    if LaunchConfiguration('use_stairs').perform(context).lower() == 'true':
+        params.append({'modes.exploring.stairs': True})
     for arg in ('scene_max_free', 'scene_min_known'):
         value = LaunchConfiguration(arg).perform(context)
         if value:
@@ -121,6 +124,10 @@ def generate_launch_description():
                               description='Optional: detect hanging curtains in the depth image (low rate); one along the '
                                           "current tile's edge is squared up to and walked through with vx commands"),
         DeclareLaunchArgument('curtain_params', default_value=cfg('curtain.yaml')),
+        DeclareLaunchArgument('use_stairs', default_value='false',
+                              description='Optional: detect staircases in the depth image (low rate); one on a tile '
+                                          'beside the current tile is climbed over in the robot AI mode, then walled off'),
+        DeclareLaunchArgument('stairs_params', default_value=cfg('stairs.yaml')),
         DeclareLaunchArgument('slam_params', default_value=cfg('slam_toolbox.yaml')),
         DeclareLaunchArgument('controller', default_value='rpp',
                               description='Nav2 local controller: rpp (regulated pure pursuit: vx/wz only) | '
@@ -156,6 +163,9 @@ def generate_launch_description():
         Node(package=PKG, executable='curtain_detector', name='curtain_detector', output='screen',
              parameters=[lc('curtain_params'), {'use_sim_time': lc('use_sim_time')}],
              condition=IfCondition(lc('use_curtains'))),
+        Node(package=PKG, executable='stair_detector', name='stair_detector', output='screen',
+             parameters=[lc('stairs_params'), {'use_sim_time': lc('use_sim_time')}],
+             condition=IfCondition(lc('use_stairs'))),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(
                 get_package_share_directory('lite3_terrain_classifier'), 'launch', 'terrain_classifier.launch.py')),

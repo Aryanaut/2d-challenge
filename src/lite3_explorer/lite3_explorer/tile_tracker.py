@@ -11,6 +11,9 @@ import datetime as dt
 import math
 from typing import Callable, Dict, List, Optional, Sequence
 
+import numpy as np
+
+from lite3_explorer import stairs_core as SC
 from lite3_explorer import tiles as T
 from lite3_explorer.tile_reports import within_reach
 
@@ -52,6 +55,13 @@ class TileTracker:
         # curtains left for later: a curtain on an edge of a split tile whose other way was taken first.
         # {tile behind the curtain: {'tile': split tile, 'side': edge side}}. Backtracking walks through them.
         self.deferred_curtains: Dict[tuple, dict] = {}
+        # staircases (stairs mode): the stair detector's confirmed stair cells make STAIRCASE tiles (status 'staircase':
+        # never a Nav2 target, never unexplored; the lidar sees the risers as a wall anyway). The stairs mode climbs over
+        # one in AI mode; afterwards its four edges are virtual walls so it is never entered again (stairs_crossed).
+        self.stair_points = np.zeros((0, 4))
+        self.stair_min_points = 4                      # confirmed stair cells a tile needs to be a staircase tile
+        self.stairs: Dict[tuple, dict] = {}            # staircase tile -> {'points': n, 'ascent': (ux, uy)}
+        self.stairs_crossed: set = set()
         self._map = None                              # (grid array, GridInfo)
         self._map_version = 0
         self._classified_version = -1
@@ -99,7 +109,9 @@ class TileTracker:
         self.splits = []
         self.curtain_edges = {}
         self.deferred_curtains = {}
+        self.stairs, self.stairs_crossed = {}, set()
         self._visit(start, pose, 'start')
+        self.set_stair_points(self.stair_points)       # stairs seen before the grid existed
         self.update(force=True)
         return start
 
@@ -120,16 +132,24 @@ class TileTracker:
                 t['sides'] = T.tile_sides(grid, info, self.grid, tile)
             if t['status'] == 'to_visit' and T.tile_label(tile) in self.unreachable:
                 t['status'] = 'unreachable'
+        for tile in set(self.stairs) | self.stairs_crossed:
+            t = self.tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False,
+                                             'scene': False})
+            t['status'], t['scene'] = 'staircase', False
         self._flag_last_split()
         return True
 
     def virtual_walls(self, min_fraction: float = 0.5, start_wall: bool = True):
-        """World segments to block in the planner: the wall behind the start pose and every tile edge more than
-        min_fraction covered by mapped wall. With open_curtains (backtracking) edges with a curtain are left out."""
+        """World segments to block in the planner: the wall behind the start pose, every tile edge more than
+        min_fraction covered by mapped wall, and all four edges of every staircase the robot has climbed over. With
+        open_curtains (backtracking) edges with a curtain are left out."""
         segs = []
         skip = set(self.curtain_edges) if self.open_curtains else set()
         if start_wall and getattr(self, 'start_wall', None):
             segs.append(self.start_wall)
+        if self.grid is not None:
+            for tile in sorted(self.stairs_crossed):
+                segs += [self.grid.edge(tile, side) for side in 'NESW']
         if self.grid is not None and self._map is not None:
             # Hysteresis: an edge becomes a wall above min_fraction but is only released below wall_release_fraction. Next
             # to a wall the SLAM map thins it (the robot is close, grazing rays), so the share hovers around min_fraction
@@ -234,14 +254,17 @@ class TileTracker:
         return self.current is not None and abs(tile[0] - self.current[0]) + abs(tile[1] - self.current[1]) == 1
 
     def scene_tiles(self) -> List[tuple]:
-        """Scene tiles: completely scanned but less than scene_max_free traversable (never entered: the robot looks at
-        them from a neighbouring tile), plus the ones already looked at."""
+        """Scene tiles, wherever they are: completely scanned but less than scene_max_free traversable (never entered;
+        the scene mode looks at them, only from a tile that shares a side with them: scene_neighbours), plus the ones
+        already looked at."""
         return [t for t, d in sorted(self.tiles.items()) if t in self.described or self._scene_flag(t)]
 
     def _scene_flag(self, tile) -> bool:
-        """Looks like a scene tile and the robot has never stood on it (a tile it walked through stays a tile)."""
-        d = self.tiles.get(tuple(tile), {})
-        return bool(d.get('scene')) and tuple(tile) not in set(self.trail)
+        """Looks like a scene tile and the robot has never stood on it (a tile it walked through stays a tile). A
+        staircase tile is never a scene tile (the stairs mode climbs it)."""
+        tile = tuple(tile)
+        return (bool(self.tiles.get(tile, {}).get('scene')) and tile not in set(self.trail)
+                and tile not in self.stairs and tile not in self.stairs_crossed)
 
     def mark_described(self, tile):
         """A scene tile was looked at from a neighbouring tile: it counts as explored (status visited) although the robot
@@ -265,7 +288,8 @@ class TileTracker:
         return T.tile_sides(grid, info, self.grid, tuple(a), wall_fraction=0.9).get(side) != 'wall'
 
     def scene_neighbours(self, tile) -> List[tuple]:
-        """Scene tiles not looked at yet that share an open side with `tile` (call with the current tile)."""
+        """Scene tiles not looked at yet that share an open side with `tile` (call with the current tile): the only
+        ones the scene mode is started for."""
         i, j = tile
         return [n for n in ((i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1))
                 if n not in self.described and self._scene_flag(n) and self._open_between(tile, n)]
@@ -282,8 +306,13 @@ class TileTracker:
                 if self.tiles.get(n, {}).get('status') in ('visited', 'to_visit') and not self.is_scene(n)
                 and self._open_between(scene, n)]
 
+
+
     def _drivable(self, label: str) -> bool:
-        return not (self.skip_scene and self.is_scene(tuple(int(v) for v in label.split(','))))
+        tile = tuple(int(v) for v in label.split(','))
+        if tile in self.stairs or tile in self.stairs_crossed:
+            return False                                # Nav2 never drives onto stairs: the stairs mode climbs them
+        return not (self.skip_scene and self.is_scene(tile))
 
     def unexplored(self) -> List[str]:
         """Identified, walkable tiles not visited yet and not given up on."""
@@ -353,13 +382,42 @@ class TileTracker:
         tile = tuple(int(v) for v in label.split(','))
         return self.deferred_curtains.get(tile) if tile not in set(self.trail) else None
 
+    # ------------------------------------------------------------- staircases
+    def set_stair_points(self, points) -> bool:
+        """Confirmed stair cells (Nx4 x, y, ux, uy, from the stair detector) -> staircase tiles. A tile the robot has
+        already stood on is floor, never a staircase (stair cells can spill over the edge of the tile in front of the
+        steps); a staircase tile stays one. True if the set of staircase tiles changed."""
+        self.stair_points = np.asarray(points, float).reshape(-1, 4)
+        if self.grid is None:
+            return False
+        found = SC.stair_tiles(self.grid, self.stair_points, self.stair_min_points)
+        floor = set(self.trail) - set(self.stairs) - self.stairs_crossed
+        stairs = {t: d for t, d in found.items() if t not in floor}
+        for t, d in self.stairs.items():
+            stairs.setdefault(t, d)                     # once a staircase, always a staircase
+        changed = set(stairs) != set(self.stairs)
+        self.stairs = stairs
+        if changed:
+            self.invalidate()
+            self.version += 1
+        return changed
+
+    def mark_stairs_crossed(self, tiles):
+        """The robot climbed over these staircase tiles: wall them off (virtual walls on all four edges)."""
+        self.stairs_crossed |= set(map(tuple, tiles))
+        self.invalidate()
+        self.update()
+        self.version += 1
+
     def known_route(self, start, goal) -> Optional[List[tuple]]:
         """Tiles from start to goal along moves the robot has already made (consecutive trail entries, either way),
-        fewest steps first; None when the trail does not link them."""
+        fewest steps first; None when the trail does not link them. Never over a staircase it climbed (walled off)."""
         from collections import deque
         start, goal = tuple(start), tuple(goal)
         links: Dict[tuple, set] = {}
         for a, b in zip(self.trail, self.trail[1:]):
+            if a in self.stairs_crossed or b in self.stairs_crossed:
+                continue
             links.setdefault(a, set()).add(b)
             links.setdefault(b, set()).add(a)
         prev = {start: None}
@@ -436,6 +494,9 @@ class TileTracker:
                 'current_tile': T.tile_label(self.current) if self.current else None,
                 'counts': self.counts(), 'trail': [T.tile_label(t) for t in self.trail],
                 'unreachable': dict(self.unreachable),
+                'staircases': {T.tile_label(t): {'points': d['points'], 'ascent': [round(v, 2) for v in d['ascent']],
+                                                 'crossed': t in self.stairs_crossed}
+                               for t, d in sorted(self.stairs.items())},
                 'last_split': ({'tile': T.tile_label(top['tile']), 'options': top['options'],
                                 'remaining': self.split_remaining(top)} if top else None),
                 'tiles': {T.tile_label(k): (dict(v, terrain=self.terrain[T.tile_label(k)])

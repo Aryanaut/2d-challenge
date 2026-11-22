@@ -32,6 +32,10 @@ Interfaces
   pub  /tile_report             std_msgs/String   JSON: one tile report entry (latched, depth 100)
   pub  ~/tile_markers, ~/markers  visualization_msgs/MarkerArray   tiles, trail, target / tile descriptions
   pub  /spin_crawl, /spin_flat  std_msgs/Bool     gait holds for gait_switcher while turning
+  sub  /curtain/points, /stairs/points   std_msgs/String   curtain / stair detectors (use_curtains, use_stairs)
+  pub  /cmd_vel                 geometry_msgs/Twist   direct velocity (curtain, stairs and mppi modes)
+  pub  /simple_cmd              transfer_interfaces/MotionSimpleCMD   robot AI mode on / off (stairs mode)
+  pub  /ai_mode                 std_msgs/Bool     (latched) true while AI mode is on: gait_switcher and stair_detector pause
   act  spin, compute_path_to_pose, navigate_to_pose, follow_waypoints   (Nav2 clients)
   srv  /global_costmap/clear_entirely_global_costmap, /local_costmap/clear_entirely_local_costmap  (recovery)
 """
@@ -47,7 +51,7 @@ from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 
 from action_msgs.msg import GoalStatus
@@ -78,7 +82,8 @@ from lite3_explorer.tile_tracker import TileTracker
 
 SIDE_NAMES = {'N': 'north', 'E': 'east', 'S': 'south', 'W': 'west'}
 TILE_COLOURS = {'visited': (0.2, 0.5, 1.0, 0.45), 'to_visit': (0.1, 0.8, 0.2, 0.35),
-                'blocked': (0.8, 0.1, 0.1, 0.25), 'unreachable': (0.6, 0.0, 0.6, 0.35)}
+                'blocked': (0.8, 0.1, 0.1, 0.25), 'unreachable': (0.6, 0.0, 0.6, 0.35),
+                'staircase': (1.0, 0.85, 0.0, 0.6)}
 
 
 # ------------------------------------------------------------------------------- Nav2 helpers
@@ -251,6 +256,7 @@ class MissionManager(Node):
                                  scene_min_known=float(tcfg.get('scene_min_known', 0.95)),
                                  scene_max_free=float(tcfg.get('scene_max_free', 0.80)))
         self.tiles.skip_scene = bool(mode_cfg(cfg, 'exploring').get('scenes', False))   # scene tiles are looked at, never entered
+        self.tiles.stair_min_points = int(tcfg.get('stair_min_points', 4))
         self.target = None                     # (label, goal_xy) for the RViz highlight
         self._published_tiles = -1
 
@@ -332,6 +338,19 @@ class MissionManager(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._cmd = None                                  # (vx, wz, expires): republished at 20 Hz until it expires
         self.create_timer(0.05, self._publish_cmd)
+        # stairs mode (use_stairs): the stair detector's confirmed stair cells, and the robot's AI mode on / off
+        self.create_subscription(String, '/stairs/points', self._on_stair_points, latched)
+        self.ai_pub = self.create_publisher(Bool, '/ai_mode', latched)
+        self.ai_pub.publish(Bool(data=False))
+        self.simple_cmd_pub, self._simple_cmd_type = None, None
+        try:
+            from transfer_interfaces.msg import MotionSimpleCMD
+            # same QoS as gait_switcher: the robot's domain bridge subscribes RELIABLE + TRANSIENT_LOCAL
+            self.simple_cmd_pub = self.create_publisher(MotionSimpleCMD, '/simple_cmd', QoSProfile(
+                depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE))
+            self._simple_cmd_type = MotionSimpleCMD
+        except ImportError:
+            self.get_logger().warning('transfer_interfaces is not installed: the stairs mode cannot switch AI mode.')
 
     # ===================================================== context API used by the modes
     def now(self):
@@ -425,6 +444,27 @@ class MissionManager(Node):
 
     def curtain_points(self):
         return self._curtain_pts
+
+    def _on_stair_points(self, msg):
+        try:
+            pts = np.array(json.loads(msg.data).get('points', []), float).reshape(-1, 4)
+        except (ValueError, TypeError):
+            return
+        if self.tiles.set_stair_points(pts):
+            self.tiles.update()
+            self.log('info', f'Staircase tile(s): {", ".join(T.tile_label(t) for t in sorted(self.tiles.stairs))}.')
+            self.event('staircases', tiles=[T.tile_label(t) for t in sorted(self.tiles.stairs)])
+
+    def ai_mode(self, on, cmd_code):
+        """Robot AI mode on / off: MotionSimpleCMD {cmd_code, type: 0} on /simple_cmd (what `ros2 topic pub --once
+        /simple_cmd ...` sends), and /ai_mode for gait_switcher / stair_detector. False when no robot subscriber heard it."""
+        self.ai_pub.publish(Bool(data=bool(on)))
+        if self.simple_cmd_pub is None:
+            return False
+        msg = self._simple_cmd_type()
+        msg.cmd_code, msg.type = int(cmd_code), 0
+        self.simple_cmd_pub.publish(msg)
+        return self.simple_cmd_pub.get_subscription_count() > 0
 
     def drive(self, vx, wz, vy=0.0):
         """Direct velocity command (curtain / mppi modes); lapses 0.5 s after the last call, so a stalled mission stops the robot."""

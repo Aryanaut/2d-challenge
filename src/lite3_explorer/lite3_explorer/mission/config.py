@@ -39,13 +39,14 @@ DEFAULTS: Dict[str, Any] = {
         'min_known': 0.5,                 # share of a tile that must be scanned before it becomes a tile
         'scene_min_known': 0.95,          # scene tile: scanned at least this much ...
         'scene_max_free': 0.80,           # ... but less than this share of it traversable (drawn blue hatched in RViz)
+        'stair_min_points': 4,            # confirmed stair cells (10 cm, /stairs/points) that make a tile a staircase tile
     },
 
     'mission': {
         # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
         # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
-        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'scene', 'mppi', 'backtracking', 'recovery',
-                  'complete'],
+        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'stairs', 'scene', 'mppi', 'backtracking',
+                  'recovery', 'complete'],
         'initial_mode': 'idle',
         'start_mode': 'scanning',         # where set_active(true) / auto start goes
         'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
@@ -166,6 +167,9 @@ DEFAULTS: Dict[str, Any] = {
             'curtain_min_span_m': 0.40,   # ... spread over at least this much of it
             'curtain_last': True,         # another reachable tile beside the curtain's tile: go there first, the tile is the
                                           # last split, backtracking walks through the curtain later (needs backtracking)
+            'stairs': False,              # use_stairs:=true: a staircase tile shares a side with the current tile -> stairs
+            'stairs_mode': 'stairs',      # mode (AI mode on, climb over it into the tile beyond, AI mode off, wall it off)
+            'stair_min_facing': 0.5,      # climb only from a side the steps go up from (cos of ascent vs the way across)
             'backtracking': True,         # two or more tiles to travel to -> the tile is the last split; no exploration
                                           # target left but tiles unexplored -> backtracking mode (else retry_wait)
             'backtracking_mode': 'backtracking',
@@ -231,6 +235,33 @@ DEFAULTS: Dict[str, Any] = {
             'heading_gain': 1.0,          # wz that holds the heading while walking
             'extra_m': 0.0,               # stop this much beyond the next tile's centre
             'cross_timeout_s': 20.0,
+        },
+        'stairs': {
+            'type': 'stairs',
+            'next_mode': 'exploring',     # over the staircase: exploring again
+            'fail_mode': 'recovery',      # gave up after AI mode was on (somewhere on / near the stairs): recovery
+            'ai_on_code': 0x21010528,     # /simple_cmd MotionSimpleCMD {cmd_code, type: 0}: enter AI mode
+            'ai_off_code': 0x2101052B,    # ... and leave it
+            'ai_settle_s': 2.0,           # stand still this long after each AI mode command
+            'center_tol_m': 0.06,         # first drive (vx / vy) to within this of the centre of the tile in front of it
+            'center_speed_mps': 0.15,
+            'center_min_speed_mps': 0.05,
+            'center_gain': 1.0,
+            'center_timeout_s': 15.0,     # not there by then: square up from where it is
+            'align_tol_deg': 5.0,         # square to the edge within this before climbing
+            'align_timeout_s': 15.0,      # could not square up: give up (AI mode never turned on)
+            'min_turn_rad_s': 0.2,
+            'max_turn_rad_s': 0.6,
+            'turn_gain': 1.0,
+            'speed_mps': 0.20,            # forward speed (vx) over the stairs in AI mode
+            'heading_gain': 1.0,          # wz that holds the heading while climbing
+            'lateral_gain': 0.5,          # vy that keeps the robot on the line through the tile centres (0 = off)
+            'lateral_max_mps': 0.08,
+            'extra_m': 0.0,               # stop this much beyond the centre of the tile beyond the staircase
+            'cross_timeout_s': 60.0,      # not over it by then: stop, AI mode off, fail_mode
+            'stall_m': 0.05,              # climbing: less progress than this ...
+            'stall_s': 10.0,              # ... in this long = stuck on the stairs
+            'pose_lost_s': 3.0,           # no pose (SLAM lost on the stairs): keep walking straight this long, then stop
         },
         'backtracking': {
             'type': 'backtracking',
