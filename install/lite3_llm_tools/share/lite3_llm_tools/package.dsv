@@ -1,9 +1,0 @@
-source;share/lite3_llm_tools/hook/pythonpath.ps1
-source;share/lite3_llm_tools/hook/pythonpath.dsv
-source;share/lite3_llm_tools/hook/pythonpath.sh
-source;share/lite3_llm_tools/hook/ament_prefix_path.ps1
-source;share/lite3_llm_tools/hook/ament_prefix_path.dsv
-source;share/lite3_llm_tools/hook/ament_prefix_path.sh
-source;../../build/lite3_llm_tools/share/lite3_llm_tools/hook/pythonpath_develop.ps1
-source;../../build/lite3_llm_tools/share/lite3_llm_tools/hook/pythonpath_develop.dsv
-source;../../build/lite3_llm_tools/share/lite3_llm_tools/hook/pythonpath_develop.sh
