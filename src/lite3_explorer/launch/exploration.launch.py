@@ -15,7 +15,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 PKG = 'lite3_explorer'
@@ -104,6 +104,10 @@ def generate_launch_description():
         DeclareLaunchArgument('lidar_yaw', default_value='0.0'),
         DeclareLaunchArgument('lidar_pitch', default_value='0.0'),
         DeclareLaunchArgument('lidar_roll', default_value='0.0'),
+        DeclareLaunchArgument('use_tilt_gate', default_value='true',
+                              description='Drop scans while the robot / lidar IMU is tilted away from its start reference '
+                                          '(stairs): /scan_raw -> tilt_gate -> /scan'),
+        DeclareLaunchArgument('tilt_params', default_value=cfg('tilt_gate.yaml')),
         DeclareLaunchArgument('use_slam', default_value='true'),
         DeclareLaunchArgument('use_nav2', default_value='true'),
         DeclareLaunchArgument('use_terrain', default_value='true'),
@@ -154,12 +158,15 @@ def generate_launch_description():
              condition=IfCondition(lc('publish_lidar_tf'))),
         Node(package='pointcloud_to_laserscan', executable='pointcloud_to_laserscan_node',
              name='cloud_to_scan', output='screen',
-             remappings=[('cloud_in', lc('cloud_topic')), ('scan', '/scan')],
+             remappings=[('cloud_in', lc('cloud_topic')), ('scan', PythonExpression(["'/scan_raw' if '", lc('use_tilt_gate'), "'.lower() == 'true' else '/scan'"]))],
              parameters=[{'target_frame': 'base_link', 'transform_tolerance': 0.05,
                           'min_height': lc('scan_min_height'), 'max_height': lc('scan_max_height'),
                           'angle_min': -3.14159, 'angle_max': 3.14159, 'angle_increment': 0.0087,
                           'scan_time': 0.1, 'range_min': 0.35, 'range_max': 12.0, 'use_inf': True}],
              condition=IfCondition(lc('use_cloud_to_scan'))),
+        Node(package=PKG, executable='tilt_gate', name='tilt_gate', output='screen',
+             parameters=[lc('tilt_params'), {'use_sim_time': lc('use_sim_time')}],
+             condition=IfCondition(lc('use_tilt_gate'))),
         Node(package=PKG, executable='curtain_detector', name='curtain_detector', output='screen',
              parameters=[lc('curtain_params'), {'use_sim_time': lc('use_sim_time')}],
              condition=IfCondition(lc('use_curtains'))),
@@ -179,7 +186,7 @@ def generate_launch_description():
             condition=IfCondition(lc('use_slam'))),
         OpaqueFunction(function=_nav2),
         Node(package=PKG, executable='gait_switcher', name='gait_switcher', output='screen',
-             parameters=[{'flat_gait': 'flat_medium', 'rugged_gait': 'rug_general'}],
+             parameters=[{'flat_gait': 'flat_slow', 'rugged_gait': 'rug_general'}],
              condition=IfCondition(lc('use_gait'))),
         Node(package=PKG, executable='animation_player', name='animation_player', output='screen'),
         OpaqueFunction(function=_llm_client),

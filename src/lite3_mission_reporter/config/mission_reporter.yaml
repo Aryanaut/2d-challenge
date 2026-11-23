@@ -1,0 +1,23 @@
+mission_reporter:
+  ros__parameters:
+    group_id: "group01_A7K2"          # YOUR group id, copied exactly from the organisers
+
+    # Mission tasks, as parallel lists (same index = same task). Fill these in on the day.
+    #   task_types : object | hazard | survivor | qr
+    #   task_labels: required label for that task ("" = accept any label of that type)
+    #   task_scenes: scene_type to force for that task ("" = use the current scene, see below)
+    task_ids:    ["M01", "M02", "M03", "M04", "M05"]
+    task_types:  ["object", "hazard", "survivor", "qr", "survivor"]
+    task_labels: ["medical_kit", "", "", "", ""]
+    task_scenes: ["", "", "", "", ""]
+
+    # Room the robot is in. Update live with:
+    #   ros2 topic pub --once /mission/scene_type std_msgs/String "{data: kitchen}"
+    default_scene_type: ""
+
+    use_llm_result: false             # true = wait for /perception/llm_result and use its verified label
+    require_survivor_confirmed: true  # (use_llm_result only) skip survivors the LLM says are not survivors
+    min_confidence: 0.0
+    report_each_task_once: true       # a task is answered by its first matching event, then closed
+    output_dir: "~/lite3_mission_results"   # results.jsonl + results.json are written here
+    republish_hz: 0.0                 # >0 = re-send all results periodically (late subscribers)

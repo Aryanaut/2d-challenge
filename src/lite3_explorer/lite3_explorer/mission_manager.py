@@ -464,7 +464,19 @@ class MissionManager(Node):
         msg = self._simple_cmd_type()
         msg.cmd_code, msg.type = int(cmd_code), 0
         self.simple_cmd_pub.publish(msg)
+        # a lone command can be lost (the gait switcher repeats its commands too): repeat it, newest command only
+        self._ai_repeat = (msg, 2)
+        if getattr(self, '_ai_repeat_timer', None) is None:
+            self._ai_repeat_timer = self.create_timer(0.3, self._repeat_ai_cmd)
         return self.simple_cmd_pub.get_subscription_count() > 0
+
+    def _repeat_ai_cmd(self):
+        rep = getattr(self, '_ai_repeat', None)
+        if rep is None or rep[1] <= 0:
+            self._ai_repeat = None
+            return
+        self.simple_cmd_pub.publish(rep[0])
+        self._ai_repeat = (rep[0], rep[1] - 1)
 
     def drive(self, vx, wz, vy=0.0):
         """Direct velocity command (curtain / mppi modes); lapses 0.5 s after the last call, so a stalled mission stops the robot."""

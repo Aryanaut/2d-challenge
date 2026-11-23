@@ -1,0 +1,24 @@
+{
+  "scene_description": "staircase: metal steps rise ahead, with the surrounding walls and openings unclear.",
+  "relevant_to_mission": true,
+  "evidence": [
+    "Multiple raised metal steps are visible ahead.",
+    "Metal rails are visible at the sides."
+  ],
+  "confidence": 0.97,
+  "image": "scene_1_0_q0002.jpg",
+  "elapsed_s": 5.41,
+  "pose": [
+    3.414,
+    -0.68,
+    1.2781
+  ],
+  "lidar": "LIDAR (robot frame): nearest obstacle ahead 0.65 m, left 0.78 m, behind 0.59 m, right 0.53 m.",
+  "raw": {
+    "success": true,
+    "group_id": "group01",
+    "request_id": "36b6ea25-7a2e-4847-bd0d-1f96ec8ba824",
+    "result": "{\n  \"scene_description\": \"staircase: metal steps rise ahead, with the surrounding walls and openings unclear.\",\n  \"relevant_to_mission\": true,\n  \"evidence\": [\n    \"Multiple raised metal steps are visible ahead.\",\n    \"Metal rails are visible at the sides.\"\n  ],\n  \"confidence\": 0.97\n}",
+    "processing_time_s": 3.277
+  }
+}

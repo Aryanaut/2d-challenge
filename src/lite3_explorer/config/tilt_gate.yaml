@@ -1,0 +1,12 @@
+tilt_gate:
+  ros__parameters:
+    # Drops /scan_raw (-> /scan) while the body is pitched/rolled away from how it stood at the start, e.g. on stairs, where
+    # the lidar slice no longer lies flat and slam_toolbox loses the pose. Optional: use_tilt_gate:=true on exploration.launch.py.
+    scan_in: /scan_raw
+    scan_out: /scan
+    robot_imu_topic: /imu/data      # CHECK with `ros2 topic list | grep -i imu`; '' = ignore the robot IMU
+    lidar_imu_topic: /livox/imu     # the Livox's own IMU; '' = ignore it
+    reference_s: 3.0                # seconds of readings averaged into the flat reference (start the robot standing still)
+    max_tilt_deg: 6.0               # drop scans when either IMU's gravity is this far from its reference
+    hold_s: 1.0                     # keep dropping this long after the tilt is back under the limit
+    filter_alpha: 0.2               # low-pass on the gravity vector (gait vibration)

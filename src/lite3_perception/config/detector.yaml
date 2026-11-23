@@ -1,0 +1,56 @@
+object_detector:
+  ros__parameters:
+    # Robot's Orbbec camera. For the Pi camera, point this at whatever topic the Pi publishes
+    # (and set use_depth: false - the Pi has no depth, you will get bearing only).
+    image_topic: /camera/color/image_raw/compressed
+    depth_topic: /camera/depth/image_raw          # needs depth ALIGNED to colour (enable align in the Orbbec driver)
+    camera_info_topic: /camera_info
+    use_depth: false                              # true once depth alignment is checked
+
+    backend: onnx                                 # onnx = no PyTorch on the robot (needs onnxruntime OR OpenCV >= 4.8)
+    model_path: detector.onnx                     # put the file in src/lite3_perception/models/ then rebuild
+    class_names: [""]                             # leave empty: ultralytics embeds names (only read by onnxruntime);
+                                                  # if using OpenCV DNN, list them in the same order as training
+    nms_iou: 0.45
+    # open_vocab_classes is only used with backend: ultralytics + a YOLO-World .pt
+    open_vocab_classes: ["person", "toy figure", "doll", "first aid kit", "red cross sign",
+                         "fire extinguisher", "electrical panel", "warning sign", "qr code",
+                         "stove", "refrigerator", "sink", "bed", "sofa", "toilet", "curtain"]
+    device: "cpu"
+    imgsz: 640                                    # must match the export size (only used by the OpenCV fallback)
+    conf_threshold: 0.35
+    class_conf_overrides: '{"survivor": 0.35, "hand_tools": 0.30}'
+    ignore_classes: ["cart", "market_stall", "tool_bench"]   # context only, never reported as a label
+
+    # anything detected as these labels is reported as "survivor"
+    label_map: '{"person": "survivor", "toy figure": "survivor", "doll": "survivor"}'
+    survivor_max_height_m: 1.0                      # with depth on: taller = real person, ignored
+    survivor_new_if_moved_m: 1.5
+    survivor_new_if_bearing_deg: 25.0
+
+    hazard_enable: true
+    hazard_template_dir: ""                       # "" = installed hazard_templates/ (one PNG per sign, filename = label)
+                                                  # labels: high_voltage, radioactive, chemical, biological, flammable
+    hazard_min_area: 400
+    hazard_min_score: 0.6
+    hazard_min_margin: 0.02
+
+    detect_hz: 3.0
+    confirm_hits: 3
+    confirm_window_s: 2.0
+    dedup_radius_m: 1.0
+    dedup_cooldown_s: 20.0
+    max_range_m: 4.0
+
+    map_frame: map                                # use "odom" if you run without a map frame
+    base_frame: base_link
+    jpeg_quality: 80
+
+llm_event_bridge:
+  ros__parameters:
+    mission_text: ""                              # paste the mission tasks on the day
+    timeout_s: 8.0
+    retries: 2
+    min_accept_confidence: 0.6
+    object_labels: ["survivor", "medical_kit", "hand_tools", "food", "water", "utensils"]
+    hazard_list: ["high_voltage", "radioactive", "chemical", "biological", "flammable"]
