@@ -23,13 +23,16 @@ mission_manager:
       reach_radius_m: 0.30                   # a tile is explored once the robot is this close to its centre
       max_failures: 2                        # failed attempts (Nav2 abort, stuck, timeout) before a tile is unreachable
       min_known: 0.5                         # a tile exists once this share of it is scanned (was 0.7: the 1.7 m lidar range left edge tiles unknown)
-      scene_min_known: 0.95                  # scene tile (drawn blue hatched in RViz): scanned at least this much ...
-      scene_max_free: 0.85                   # ... but less than this share of it traversable
+      scene_min_known: 0.85                  # scene tile (drawn blue hatched in RViz): scanned at least this much ...
+      scene_max_free: 0.80                   # ... and less than this share of the SCANNED part traversable (free/known)
       stair_min_points: 4                    # confirmed stair cells (10 cm, /stairs/points) that make a tile a staircase tile
+      roller_min_points: 4                   # confirmed roller spots (10 cm, /roller/points) that make a tile a roller tile ...
+      roller_min_lidar: 2                    # ... of which this many the 3D lidar confirms (low returns only, open behind; 0 = depth alone)
+      roller_edge_margin_m: 0.15             # spots this close to a tile edge do not count (the roller lies across the middle)
 
     # ---------------------------------------------------------------- mission manager
     mission:
-      modes: [idle, scanning, exploring, quickscan, curtain, stairs, scene, mppi, backtracking, recovery, complete]   # instances to build (configured under modes.<name>)
+      modes: [idle, scanning, exploring, quickscan, curtain, stairs, roller, scene, mppi, backtracking, recovery, complete]   # instances to build (configured under modes.<name>)
       initial_mode: idle
       start_mode: scanning                   # set_active(true) / auto start goes here
       recovery_mode: recovery                # the stuck supervisor sends the robot here
@@ -143,16 +146,16 @@ mission_manager:
       scanning:
         type: scanning
         turn: true
-        turn_deg: 180.0
+        turn_deg: 80.0
         opening_setpoints_deg: [0, 80, -160, -80]   # opening spin: yaw setpoints relative to the starting heading (flat gait), then back to 0
         opening_retries: 2                  # the opening scan must finish: retry the sweep (alternating sides) this often
-        opening_min_turn_deg: 160            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
+        opening_min_turn_deg: 80            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
         return_tolerance_deg: 3.0            # after the opening sweep, turn back to the starting heading (within this)
         time_allowance_s: 20.0
         use_crawl: true                      # crawl gait while turning (gait_switcher)
         settle_s: 1.0
         check_room: true                     # skip the turn where the body would hit the local costmap
-        map_wait_s: 10.0
+        map_wait_s: 5.0
         next_mode: exploring
       exploring:
         type: exploring
@@ -162,7 +165,7 @@ mission_manager:
         tile_traversals: ['']                # per-tile overrides "i,j:profile", e.g. ["3,1:stairs"]
         path_check_timeout_s: 10.0
         goal_timeout_s: 30.0
-        scan_after_reach: false
+        scan_after_reach: true
         scenes: true                         # a scene tile shares a side with the current tile -> scene mode (face it, AI describes it, mark explored; never entered)
         scene_mode: scene
         curtains: false                      # use_curtains:=true (launch / explorer.sh --curtains): a curtain on the current tile's edge -> curtain mode
@@ -173,6 +176,9 @@ mission_manager:
         stairs: false                        # use_stairs:=true (launch / explorer.sh --stairs): a staircase tile (stair_detector) shares a
                                              # side with the current tile -> stairs mode: AI mode on, climb over it, AI mode off, wall it off
         stair_min_facing: 0.5                # climb only from a side the steps go up from (cos of ascent vs the way across; 0.5 = 60 deg)
+        rollers: false                       # use_rollers:=true (launch / explorer.sh --roller): a roller tile (roller_detector) shares a side
+                                             # with the current tile -> roller mode: square up, h-step gait, cross it into the tile beyond
+        roller_min_facing: 0.8               # cross only when the roller lies across the way (|cos| of its normal vs the side; 0.8 = 37 deg)
         backtracking: true                   # a tile with two or more tiles to travel to is the 'last split'; when no exploration
         backtracking_mode: backtracking      # target is left but tiles are unexplored, go back there and take the other way (else retry_wait)
         classify_target: true                # terrain-classify the target tile as soon as the robot points at it; floor not visible -> choose another tile
@@ -274,6 +280,27 @@ mission_manager:
         climber_search_timeout_s: 15.0       # still searching after this long: the lidar does not see stairs, give up (no climb)
         climber_timeout_s: 180.0             # whole climb, alignment included
         climber_lost_s: 5.0                  # no /stair_climber/state for this long: the node is not running, give up
+      roller:                                # a roller tile beside the current tile: square up to it, h-step gait (/step_up), cross it with vx
+        type: roller                         # into the tile beyond, terrain gait again, the roller tile is marked explored, exploring
+        next_mode: exploring
+        fail_mode: recovery                  # gave up with the robot past the edge (at / on the roller): recovery; before it: the mode before
+        gait_settle_s: 2.0                   # stand still this long after switching to the h-step gait (and after switching back)
+        center_tol_m: 0.10                   # first drive (turn, then vx / wz) to within this of the centre of the tile in front of the roller
+        center_timeout_s: 15.0
+        align_tol_deg: 4.0                   # square up to the roller within this before stepping over it
+        align_timeout_s: 15.0                # could not square up: give up (never crossed), back to exploring
+        speed_mps: 0.20                      # forward speed (vx) over the roller
+        heading_gain: 1.0                    # wz that holds the heading while crossing
+        lateral_gain: 0.5                    # vy that keeps the robot on the line through the tile centres (0 = off)
+        lateral_max_mps: 0.08
+        extra_m: 0.0                         # stop this much beyond the centre of the tile beyond the roller
+        cross_timeout_s: 40.0
+        stall_m: 0.05                        # crossing: less progress than this ...
+        stall_s: 6.0                         # ... in this long = stuck at the roller: back off and try again
+        max_attempts: 2                      # crossing tries (back off, square up again, cross) before giving up
+        back_speed_mps: 0.12
+        back_timeout_s: 10.0
+        pose_lost_s: 3.0                     # no pose while crossing: keep walking straight this long, then stop
       backtracking:                          # no target left: back to the last split tile, on to its untravelled tile, then exploring
         type: backtracking
         traversal: route                     # FollowWaypoints through the tile centres of the way back (a nav2_route profile)

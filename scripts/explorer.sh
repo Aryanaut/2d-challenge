@@ -19,6 +19,9 @@
 #                                    up to and walked through with forward commands, then exploring goes on
 #   ./explorer.sh --stairs           detect staircases (depth camera, low rate); one on a tile beside the current tile is climbed
 #                                    over in the robot's AI mode into the tile beyond, then walled off, then exploring goes on
+#   ./explorer.sh --roller           detect roller tiles (depth camera, confirmed by the 3D lidar; low rate): the lidar maps the
+#                                    roller as a wall across half the tile; one beside the current tile is squared up to and
+#                                    crossed in the h-step gait into the tile beyond, the roller tile is marked explored
 #   ./explorer.sh --images           with --bag: also record the depth and (compressed) colour camera images, so the slats
 #                                    detection can be replayed offline (large)
 #   ./explorer.sh --bag [bagname]    also record a rosbag to bags/<bagname>_DD_MM_HHMMSS (default bagname: explorer)
@@ -53,7 +56,7 @@ LATCHED="--qos-durability transient_local --qos-reliability reliable"
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
 /exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
 
 BAG=0
 BAG_NAME=""
@@ -61,6 +64,7 @@ QUICKSCAN=0
 IMAGES=0
 CURTAINS=0
 STAIRS=0
+ROLLER=0
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --images) IMAGES=1 ;;
         --curtains) CURTAINS=1 ;;
         --stairs) STAIRS=1 ;;
+        --roller|--rollers) ROLLER=1 ;;
         --bag=*) BAG=1; BAG_NAME="${1#--bag=}" ;;
         *) ARGS+=("$1") ;;
     esac
@@ -144,6 +149,7 @@ LAUNCH="ros2 launch lite3_explorer exploration.launch.py"
 [[ $QUICKSCAN == 1 ]] && LAUNCH+=" quickscan_on_edge:=true"
 [[ $CURTAINS == 1 ]] && LAUNCH+=" use_curtains:=true"
 [[ $STAIRS == 1 ]] && LAUNCH+=" use_stairs:=true"
+[[ $ROLLER == 1 ]] && LAUNCH+=" use_rollers:=true"
 [[ -n "$LAUNCH_ARGS" ]] && LAUNCH+=" $LAUNCH_ARGS"
 
 [[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS /camera/depth/image_raw /camera/color/image_raw/compressed"

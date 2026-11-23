@@ -10,6 +10,8 @@
              to describe it, mark it explored and go back to exploring. The robot never enters it.
   stairs     a staircase tile (depth camera, stairs_core.py) shares a side with the current tile: square up to it, turn
              the robot's AI mode on, climb over it into the tile beyond, AI mode off, wall the staircase off, exploring.
+  roller     a roller tile (depth camera + 3D lidar, roller_core.py) shares a side with the current tile: square up to
+             it, h-step gait on, cross it into the tile beyond, terrain gait again, mark the roller tile explored.
   backtracking  no exploration target left but tiles are still unexplored: drive back to the last split tile (a tile
              that had two or more tiles to travel to), then on to its option not travelled to yet; then exploring again.
   recovery   the robot is stuck (or no target has a Nav2 path): drive to the nearest tile centre, then rescan.
@@ -25,6 +27,7 @@ from typing import Dict, Optional, Type
 from lite3_explorer import approach as A
 from lite3_explorer import costmap_escape as CE
 from lite3_explorer import curtain_core as CC
+from lite3_explorer import roller_core as RC
 from lite3_explorer import stairs_core as SC
 from lite3_explorer import tiles as T
 from lite3_explorer.mission.core import Mode
@@ -302,6 +305,8 @@ class ExploringMode(Mode):
             out.append(c.get('curtain_mode', 'curtain'))
         if c.get('stairs', False):
             out.append(c.get('stairs_mode', 'stairs'))
+        if c.get('rollers', False):
+            out.append(c.get('roller_mode', 'roller'))
         if c.get('backtracking', False) and c.get('backtracking_mode', 'backtracking') in self.machine.modes:
             out.append(c.get('backtracking_mode', 'backtracking'))     # optional: unused when not in mission.modes
         return out
@@ -341,21 +346,27 @@ class ExploringMode(Mode):
             self._new_decision()
         return None
 
-    # -- decide: end condition, then ask the strategies in order
+    # -- decide: scene / stairs beside the current tile, end condition, then ask the strategies in order
     def _decide(self):
         pose = self.ctx.pose()
         if pose is None:
             return None
         edge = self._curtain_on_edge(pose) if self.index == 0 else None
         if self.index == 0:
+            # scenes first: the scene mode keeps the robot on this tile, but a stairs crossing is one way (the staircase
+            # is walled off behind it), so a scene beside this tile could never be looked at afterwards.
+            # Both before the end condition: the lidar cannot see past a staircase's riser, so the tiles behind it are
+            # not identified yet and 'all identified tiles explored' can be true while a staircase is still to climb.
+            # A roller is the same: one way for Nav2 (no route back over it), and the map shows a wall across the half
+            # tile, so nothing behind it is identified until it is crossed.
+            hop = self._scene_beside(pose) or self._roller_ahead(pose) or self._stairs_beside(pose)
+            if hop is not None:
+                return hop
             # a curtain on an edge of the tile the robot stands on (e.g. the opening tile) hides what is behind it: the map
             # shows a wall there, so the end condition must not see the mission as finished before the curtain is checked
             end = None if edge is not None else self.machine.check_end()
             if end:
                 return self.go(self.machine.complete_mode, end)
-            hop = self._stairs_beside(pose) or self._scene_beside(pose)
-            if hop is not None:
-                return hop
             if edge is not None:
                 self.ctx.log('info', f'Curtain on the {edge["side"]} edge of the current tile: end condition not checked yet.')
                 if not self._can_defer_curtain():
@@ -715,6 +726,49 @@ class ExploringMode(Mode):
                              f'over it into tile {T.tile_label(crossing["beyond"])}.')
         return self.go(self.cfg.get('stairs_mode', 'stairs'), f'staircase on tile {first} beside tile {here}',
                        crossing=crossing)
+
+    def _roller_ahead(self, pose):
+        """rollers: true. At a decision, standing on a tile that shares a side with a roller tile whose roller lies across
+        the way (roller_core.roller_crossing), or on a roller tile in front of its roller -> the roller mode squares up and
+        crosses it in the h-step gait into the tile beyond. Each roller tile once (machine.rollers_tried)."""
+        tiles = self.ctx.tiles
+        if (not self.cfg.get('rollers', False) or not tiles.rollers or tiles.grid is None or tiles.current is None
+                or self.cfg.get('roller_mode', 'roller') not in self.machine.modes
+                or tuple(tiles.grid.tile_of(pose[0], pose[1])) != tuple(tiles.current)):
+            return None
+        crossing = RC.roller_crossing(tiles.grid, tuple(tiles.current), tiles.rollers,
+                                      skip=self.machine.rollers_tried | tiles.rollers_crossed,
+                                      min_facing=float(self.cfg.get('roller_min_facing', 0.8)), robot_xy=pose[:2])
+        if crossing is None:
+            return None
+        here, roller = T.tile_label(tiles.current), T.tile_label(crossing['roller'])
+        if crossing['roller'] != tuple(tiles.current):
+            self._note_roller_split(crossing)
+        where = 'this tile' if crossing['roller'] == tuple(tiles.current) else f'tile {roller}'
+        self.ctx.log('info', f'Roller on {where} ({crossing["spots"]} spots, {crossing["lidar"]} confirmed by the lidar), '
+                             f'across the {crossing["side"]} side of tile {T.tile_label(crossing["from_tile"])}: crossing '
+                             f'it into tile {T.tile_label(crossing["beyond"])} in the h-step gait.')
+        return self.go(self.cfg.get('roller_mode', 'roller'), f'roller on tile {roller} (robot on tile {here})',
+                       crossing=crossing)
+
+    def _note_roller_split(self, crossing):
+        """Crossing a roller from a tile with other untravelled tiles beside it: the tile is the last split (the roller tile
+        one of its options), so backtracking comes back here (over the roller) once the far side is explored."""
+        tiles = self.ctx.tiles
+        if not self.cfg.get('backtracking', False) or tiles.current is None:
+            return
+        ci, cj = tiles.current
+        others = [T.tile_label(n) for n in ((ci + 1, cj), (ci - 1, cj), (ci, cj + 1), (ci, cj - 1))
+                  if n != tuple(crossing['roller']) and tiles.tiles.get(n, {}).get('status') == 'to_visit'
+                  and tiles._drivable(T.tile_label(n)) and tiles._open_between(tiles.current, n)]
+        if not others:
+            return
+        options = sorted(others + [T.tile_label(crossing['roller'])])
+        if tiles.mark_split(tiles.current, options):
+            label = T.tile_label(tiles.current)
+            self.ctx.log('info', f'Tile {label} is the last split: crossing the roller first, then back for '
+                                 f'{", ".join(others)}.')
+            self.ctx.event('split', tile=label, options=options)
 
     def _curtain_on_edge(self, pose):
         """curtains: true. A detected curtain (depth camera) along an edge of the tile the robot stands on, with an
@@ -1460,6 +1514,211 @@ class StairsMode(CurtainMode):
             self._ai(False)
 
 
+# ----------------------------------------------------------------------------------------- roller
+@register_mode('roller')
+class RollerMode(CurtainMode):
+    """A roller tile shares a side with the current tile (or the robot stands in front of the roller on its tile): cross
+    it in the h-step gait.
+
+    Phases: center (turn towards start_xy, the centre of the tile in front of the roller, and drive there with vx / wz)
+    -> align (turn in place until square to the roller: the robot faces across it) -> gait_on (/step_up true through
+    ctx.hstep: the gait switcher sends rug_hstep; stand still gait_settle_s) -> cross (vx forward, wz holds the heading,
+    vy the line through the tile centres) until the robot is at the centre of the tile beyond the roller -> gait_off
+    (stop, h-step released, stand still gait_settle_s) -> next_mode (exploring). The roller tile is then marked explored
+    (tiles.mark_roller_crossed: on the trail, tile report written) and the tile beyond counts as reached.
+
+    A cross that stalls (stall_m in stall_s) backs off along the line to where it squared up (phase back), squares up
+    again and crosses again, up to max_attempts tries. Given up before the robot got past the edge (could not square
+    up): back to the mode that was running before; past it: fail_mode (recovery). The h-step gait is released whenever
+    the mode is left. Each roller tile once from exploring (machine.rollers_tried).
+    Backtracking uses it too (then=<mode>, crossing back over a roller crossed before): afterwards it hands back to that
+    mode with roller_ok=True / False instead of next_mode (given up past the edge: still fail_mode)."""
+
+    def targets(self):
+        return [self.cfg.get('next_mode', 'exploring'), self.cfg.get('fail_mode', 'recovery')]
+
+    @property
+    def is_driving(self):
+        return self.phase in ('center', 'cross', 'back')
+
+    def enter(self, reason, crossing=None, then=None, then_kwargs=None, **kw):
+        self.edge, self.then, self.then_kwargs = crossing, then, dict(then_kwargs or {})
+        prev = self.machine.previous
+        self.came_from = then or (prev if prev and prev != self.name else None) or self.cfg.get('next_mode', 'exploring')
+        self.gait_on, self.attempts, self.pose_lost_at, self.result = False, 0, None, None
+        self.ctx.set_target(None, None, None)
+        if not crossing:
+            self.set_phase('abort')
+            return
+        self.machine.rollers_tried.add(tuple(crossing['roller']))
+        self.from_tile = tuple(crossing['from_tile'])
+        self.tile_centre = tuple(crossing['start_xy'])               # where it squares up (the line through the centres)
+        self.ctx.event('roller', side=crossing['side'], roller=T.tile_label(crossing['roller']),
+                       beyond=T.tile_label(crossing['beyond']), spots=crossing['spots'], lidar=crossing['lidar'],
+                       facing=crossing.get('facing'), through_m=crossing['through_m'])
+        self._start_center()
+
+    def _label(self):
+        return T.tile_label(self.edge['roller']) if self.edge else '?'
+
+    def _hstep(self, on):
+        if on != self.gait_on:
+            self.gait_on = on
+            if hasattr(self.ctx, 'hstep'):
+                self.ctx.hstep(on)
+            self.ctx.log('info', f'Roller: h-step gait {"ON" if on else "released"}.')
+            self.ctx.event('roller_gait', on=on)
+
+    def _done(self, why, through=False):
+        """Crossed (or given up after stepping on it): stop, release the h-step gait, stand still, then _finish."""
+        self.ctx.stop()
+        self.result = (why, through)
+        self._hstep(False)
+        self.set_phase('gait_off')
+
+    def _finish(self, why, through=False):
+        self.ctx.stop()
+        self._hstep(False)
+        tiles = self.ctx.tiles
+        if through:
+            roller, beyond = tuple(self.edge['roller']), tuple(self.edge['beyond'])
+            tiles.mark_roller_crossed(roller, beyond, self.ctx.pose(), from_tile=self.from_tile)
+            self.ctx.log('info', f'Roller: {why}; roller tile {self._label()} explored, now on tile {T.tile_label(beyond)}.')
+            self.ctx.event('roller_crossed', roller=self._label(), beyond=T.tile_label(beyond), attempts=self.attempts + 1,
+                           back_to=self.then)
+            if self.then:
+                return self.go(self.then, f'roller: {why}', roller_ok=True, **self.then_kwargs)
+            return self.go(self.cfg.get('next_mode', 'exploring'), f'roller: {why}')
+        pose = self.ctx.pose()
+        past = pose is not None and len(pose) >= 3 and self._progress(pose) > 0.0
+        back = self.cfg.get('fail_mode', 'recovery') if past else self.came_from
+        self.ctx.log('warn', f'Roller: {why}; giving up on roller tile {self._label()}.')
+        self.ctx.event('roller_failed', roller=self._label(), why=why, attempts=self.attempts, back_to=back)
+        if back == self.then:
+            return self.go(self.then, f'roller: {why}', roller_ok=False, **self.then_kwargs)
+        return self.go(back, f'roller: {why}')
+
+    def _stuck(self, why):
+        """A crossing try did not get over the roller: back off and try again, or give up."""
+        self.attempts += 1
+        tries = int(self.cfg.get('max_attempts', 2))
+        if self.attempts >= tries:
+            return self._done(f'{why}; gave up after {self.attempts} tries')
+        self.ctx.stop()
+        self.ctx.log('warn', f'Roller: {why} (try {self.attempts}/{tries}); backing off to cross again.')
+        self.ctx.event('roller_retry', roller=self._label(), why=why, attempt=self.attempts)
+        self.set_phase('back')
+        return None
+
+    def _turn(self, err):
+        c = self.cfg
+        w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+                                                          float(c.get('turn_gain', 1.0)) * abs(err)))
+        self.ctx.drive(0.0, math.copysign(w, err))
+
+    def _hold_line(self, pose, v, err):
+        """vx along the way across (negative: backwards), wz holding the heading, vy holding the centre line."""
+        c = self.cfg
+        wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * err))
+        nx, ny = self.edge['normal']
+        lim = float(c.get('lateral_max_mps', 0.08))
+        lat = max(-lim, min(lim, -float(c.get('lateral_gain', 0.5)) * self._lateral(pose)))
+        self._drive_map(pose, v * nx - lat * ny, v * ny + lat * nx, wz)
+
+    def tick(self):
+        c = self.cfg
+        if self.phase == 'abort':
+            return self._finish('no roller to cross')
+        if self.phase in ('gait_on', 'gait_off'):
+            self.ctx.stop()
+            if self.in_phase_s() < float(c.get('gait_settle_s', 2.0)):
+                return None
+            if self.phase == 'gait_off':
+                why, through = self.result
+                return self._finish(why, through=through)
+            pose = self.ctx.pose()
+            self.best = self._progress(pose) if pose is not None and len(pose) >= 3 else -math.inf
+            self.best_at = self.ctx.now()
+            self.set_phase('cross')
+            return None
+        pose = self.ctx.pose()
+        if pose is None or len(pose) < 3:
+            if self.phase != 'cross':
+                self.ctx.stop()
+                if self.in_phase_s() > 3.0:
+                    return self._done('no pose') if self.gait_on else self._finish('no pose')
+                return None
+            # keep walking straight over the roller for a moment
+            self.pose_lost_at = self.pose_lost_at if self.pose_lost_at is not None else self.ctx.now()
+            if self.ctx.now() - self.pose_lost_at > float(c.get('pose_lost_s', 3.0)):
+                return self._done('lost the robot pose on the roller')
+            self.ctx.drive(float(c.get('speed_mps', 0.20)), 0.0)
+            return None
+        self.pose_lost_at = None
+        if self.phase == 'center':
+            dx, dy = self.tile_centre[0] - pose[0], self.tile_centre[1] - pose[1]
+            dist = math.hypot(dx, dy)
+            tol = float(c.get('center_tol_m', 0.10))
+            if dist <= tol or self.in_phase_s() > float(c.get('center_timeout_s', 15.0)):
+                if dist > tol:
+                    self.ctx.log('warn', f'Roller: could not reach the tile centre ({dist:.2f} m off); squaring up '
+                                         f'from here.')
+                self.ctx.stop()
+                self.set_phase('align')
+                return None
+            v = max(float(c.get('center_min_speed_mps', 0.05)),
+                    min(float(c.get('center_speed_mps', 0.15)), float(c.get('center_gain', 1.0)) * dist))
+            bearing = self._yaw_error(pose, math.atan2(dy, dx))
+            if abs(bearing) > math.radians(float(c.get('center_turn_deg', 30.0))):
+                self._turn(bearing)
+            else:
+                wz = max(-0.6, min(0.6, float(c.get('center_heading_gain', 1.5)) * bearing))
+                self.ctx.drive(v * math.cos(bearing), wz)
+            return None
+        err = self._yaw_error(pose)
+        if self.phase == 'align':
+            if abs(err) <= math.radians(float(c.get('align_tol_deg', 4.0))):
+                self.ctx.stop()
+                if self.gait_on:                         # squared up again after backing off: straight on
+                    self.best, self.best_at = self._progress(pose), self.ctx.now()
+                    self.set_phase('cross')
+                else:
+                    self._hstep(True)
+                    self.set_phase('gait_on')
+                return None
+            if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
+                why = f'could not square up to it ({math.degrees(err):+.0f} deg off)'
+                return self._done(why) if self.gait_on else self._finish(why)
+            self._turn(err)
+            return None
+        if self.phase == 'back':
+            start = self._progress(tuple(self.tile_centre) + (0.0,))      # where it squared up, past the edge line
+            if self._progress(pose) <= start + 0.05 or self.in_phase_s() > float(c.get('back_timeout_s', 10.0)):
+                self.ctx.stop()
+                self.set_phase('align')
+                return None
+            self._hold_line(pose, -float(c.get('back_speed_mps', 0.12)), err)
+            return None
+        if self.phase == 'cross':
+            prog = self._progress(pose)
+            if prog >= self.edge['through_m'] + float(c.get('extra_m', 0.0)):
+                return self._done('over the roller', through=True)
+            if prog > self.best + float(c.get('stall_m', 0.05)):
+                self.best, self.best_at = prog, self.ctx.now()
+            if self.ctx.now() - self.best_at > float(c.get('stall_s', 6.0)):
+                return self._stuck(f'stuck {prog:+.2f} m past the edge of the roller tile')
+            if self.in_phase_s() > float(c.get('cross_timeout_s', 40.0)):
+                return self._stuck(f'timed out {prog:+.2f} m past the edge of the roller tile')
+            self._hold_line(pose, float(c.get('speed_mps', 0.20)), err)
+        return None
+
+    def exit(self, next_mode, reason):
+        self.ctx.stop()
+        self._hstep(False)                                 # left mid-crossing (operator command, shutdown): release
+        if next_mode != self.then:
+            self.ctx.tiles.open_curtains = False           # backtracking lifted them; nobody hands back to it now
+
+
 # ----------------------------------------------------------------------------------------- quickscan
 @register_mode('quickscan')
 class QuickscanMode(Mode):
@@ -1523,6 +1782,10 @@ class BacktrackingMode(Mode):
     mode gives up (curtain_ok=False) backtracking carries on: that crossing is left out (self.blocked) and Nav2 is asked
     for the way back to the split tile without it; only if that fails too is the split dropped.
 
+    Rollers: a roller the robot crossed (tiles.roller_between) is one hop of the way back, from the tile on one side to
+    the tile on the other. Nav2 (which sees the roller as a wall) drives to the tile before it (to_roller), the roller
+    mode crosses it back in the h-step gait and hands back here (roller_ok), exactly like a curtain.
+
     The way back is driven through the tile CENTRES of that tile route: for each hop from one tile to the next,
     waypoints_per_tile waypoints evenly spaced on the straight line between the two centres, then the next centre
     Yaw setpoints per tile (align_at_tiles): the hops are driven one at a time; before each, at the tile centre, the
@@ -1535,19 +1798,21 @@ class BacktrackingMode(Mode):
         super().__init__(name, machine, cfg)
         self.split, self.target, self.traversal, self.options, self.why = None, None, None, [], ''
         self.curtain_options = []                 # split options behind a curtain left for later (tiles.deferred_curtains)
-        self.crossing = None                      # (tile before the curtain, tile behind it) on the way back
+        self.crossing = None                      # (tile before, tile behind, 'curtain' | roller tile) on the way back
         self.hops, self.drive_phase, self.align_yaw = [], None, 0.0   # route hops still to drive, one at a time
-        self.blocked = set()                      # crossings the curtain mode could not get through (this backtrack)
+        self.blocked = set()                      # crossings the curtain / roller mode did not get through (this backtrack)
 
     def targets(self):
         out = [self.cfg.get('next_mode', 'exploring'), self.cfg.get('scan_mode', 'scanning')]
         if self.cfg.get('curtain_mode', 'curtain') in self.machine.modes:
             out.append(self.cfg.get('curtain_mode', 'curtain'))
+        if self.cfg.get('roller_mode', 'roller') in self.machine.modes:
+            out.append(self.cfg.get('roller_mode', 'roller'))
         return out
 
     @property
     def is_driving(self):
-        return self.phase in ('to_split', 'to_curtain', 'to_option')
+        return self.phase in ('to_split', 'to_curtain', 'to_roller', 'to_option')
 
     @property
     def target_label(self):
@@ -1556,16 +1821,17 @@ class BacktrackingMode(Mode):
     def _label(self):
         return T.tile_label(self.split) if self.split else '?'
 
-    def enter(self, reason, split=None, curtain_ok=None, **kw):
+    def enter(self, reason, split=None, curtain_ok=None, roller_ok=None, **kw):
         tiles = self.ctx.tiles
         self.target, self.traversal, self.options, self.why = None, None, [], ''
         tiles.open_curtains = True                 # curtain edges are no virtual walls while backtracking
         crossing, self.crossing = self.crossing, None
-        if curtain_ok is False and crossing is not None:   # back from the curtain mode, which did not get through
-            self.blocked.add(crossing)
-            self.ctx.log('warn', f'Backtracking: could not get through the curtain between tiles '
+        if False in (curtain_ok, roller_ok) and crossing is not None:   # the curtain / roller mode did not get through
+            self.blocked.add(crossing[:2])
+            what = 'curtain' if crossing[2] == 'curtain' else f'roller on tile {T.tile_label(crossing[2])}'
+            self.ctx.log('warn', f'Backtracking: could not get through the {what} between tiles '
                                  f'{T.tile_label(crossing[0])} and {T.tile_label(crossing[1])}; looking for another way.')
-        elif curtain_ok is None:
+        elif curtain_ok is None and roller_ok is None:
             self.blocked = set()                   # a fresh backtrack (not a hand-back from the curtain mode)
         entry = None
         if tiles.ready:
@@ -1594,21 +1860,25 @@ class BacktrackingMode(Mode):
         tiles = self.ctx.tiles
         route = tiles.known_route(here, self.split) if here is not None else None
         for k, (a, b) in enumerate(zip(route or [], (route or [])[1:])):
-            if tiles.is_curtain_edge(a, b) and (a, b) not in self.blocked:
-                self.crossing = (a, b)
-                self.ctx.log('info', f'Backtracking: the way back to split tile {self._label()} goes through the curtain '
-                                     f'between tiles {T.tile_label(a)} and {T.tile_label(b)}.')
-                if a == here:
-                    self.set_phase('cross')
-                    return
-                # the tile centre, facing the curtain: the curtain mode starts from there (it re-centres anyway, Nav2's
-                # goal tolerance is loose)
-                edge = CC.edge_crossing(tiles.grid, a, T.side_towards(a, b))
-                self._start({'tile': T.tile_label(a), 'goal_xy': [round(v, 3) for v in tiles.grid.center(a)],
-                             'yaw': edge['yaw']}, 'to_curtain', via=route[:k + 1])
+            kind = 'curtain' if tiles.is_curtain_edge(a, b) else tiles.roller_between(a, b)
+            if kind is None or (a, b) in self.blocked:
+                continue
+            self.crossing = (a, b, kind)
+            what = 'curtain' if kind == 'curtain' else f'roller on tile {T.tile_label(kind)}'
+            self.ctx.log('info', f'Backtracking: the way back to split tile {self._label()} goes through the {what} '
+                                 f'between tiles {T.tile_label(a)} and {T.tile_label(b)}.')
+            if a == here:
+                self.set_phase('cross')
                 return
-        if route and any(tiles.is_curtain_edge(a, b) for a, b in zip(route, route[1:])):
-            route = None                           # the only known way crosses a blocked curtain: let Nav2 find one
+            # the tile centre, facing the curtain / roller: the curtain / roller mode starts from there (it re-centres
+            # anyway, Nav2's goal tolerance is loose)
+            towards = b if kind == 'curtain' else kind
+            edge = CC.edge_crossing(tiles.grid, a, T.side_towards(a, towards))
+            self._start({'tile': T.tile_label(a), 'goal_xy': [round(v, 3) for v in tiles.grid.center(a)],
+                         'yaw': edge['yaw']}, 'to_curtain' if kind == 'curtain' else 'to_roller', via=route[:k + 1])
+            return
+        if route and any(tiles.is_curtain_edge(a, b) or tiles.roller_between(a, b) for a, b in zip(route, route[1:])):
+            route = None                           # the only known way crosses a blocked curtain / roller: let Nav2 find one
         self._start({'tile': self._label(), 'goal_xy': self._goal(self.split)}, 'to_split', via=route)
 
     def _centre_route(self, via, goal_xy, final_yaw):
@@ -1652,8 +1922,11 @@ class BacktrackingMode(Mode):
         self.set_phase(self.drive_phase)
         return None
     def _cross(self):
-        """Hand over to the curtain mode for the curtain edge ahead; it comes back here (curtain_ok says how it went)."""
-        a, b = self.crossing
+        """Hand over to the curtain mode for the curtain edge ahead (or the roller mode for the roller ahead); it comes
+        back here (curtain_ok / roller_ok says how it went)."""
+        a, b, kind = self.crossing
+        if kind != 'curtain':
+            return self._cross_roller(a, b, kind)
         mode = self.cfg.get('curtain_mode', 'curtain')
         if mode not in self.machine.modes:
             self.ctx.tiles.drop_split(self.split)
@@ -1662,6 +1935,19 @@ class BacktrackingMode(Mode):
         edge = CC.edge_crossing(self.ctx.tiles.grid, a, T.side_towards(a, b))
         return self.go(mode, f'backtracking through the curtain into tile {T.tile_label(b)}', edge=edge,
                        then=self.name, then_kwargs={'split': self._label()})
+
+    def _cross_roller(self, a, b, roller):
+        tiles = self.ctx.tiles
+        mode = self.cfg.get('roller_mode', 'roller')
+        crossing = RC.crossing_between(tiles.grid, a, roller, tiles.rollers.get(tuple(roller)))
+        if mode not in self.machine.modes or crossing is None or tuple(crossing['beyond']) != tuple(b):
+            self.blocked.add((a, b))
+            self.ctx.log('warn', f'Backtracking: cannot cross the roller on tile {T.tile_label(roller)} back; looking '
+                                 f'for another way.')
+            self._head_back(a)
+            return None
+        return self.go(mode, f'backtracking over the roller on tile {T.tile_label(roller)} into tile {T.tile_label(b)}',
+                       crossing=crossing, then=self.name, then_kwargs={'split': self._label()})
 
     def _through_deferred_curtain(self):
         """At the split tile, the other ways explored: walk through the curtain that was left for later. Through it:
@@ -1707,7 +1993,8 @@ class BacktrackingMode(Mode):
         elif not trav.start([gx, gy], yaw, route):
             return self._abort(f'could not start driving to tile {target["tile"]}')
         self.ctx.set_target(target['tile'], [gx, gy], route)
-        where = {'to_split': 'back to the split tile', 'to_curtain': 'to the tile before the curtain'}.get(
+        where = {'to_split': 'back to the split tile', 'to_curtain': 'to the tile before the curtain',
+                 'to_roller': 'to the tile before the roller'}.get(
             phase, 'to the untravelled tile')
         how = (f' through the centres of {" -> ".join(T.tile_label(t) for t in via)} ({len(route)} poses)'
                if route else '')
@@ -1798,7 +2085,7 @@ class BacktrackingMode(Mode):
             ok.sort(key=lambda x: x[0])
             self._start(ok[0][1], 'to_option', via=self._option_via(ok[0][1]))
             return None
-        if self.phase in ('to_split', 'to_curtain', 'to_option'):
+        if self.phase in ('to_split', 'to_curtain', 'to_roller', 'to_option'):
             tiles = self.ctx.tiles
             if self.phase == 'to_option' and tiles.skip_scene and self.target is not None \
                     and tiles.is_scene(tuple(int(v) for v in self.target['tile'].split(','))):
@@ -1824,7 +2111,7 @@ class BacktrackingMode(Mode):
             if self.hops:                                         # at a tile centre on the way: face the next tile
                 self._next_hop()
                 return None
-            if self.phase == 'to_curtain':
+            if self.phase in ('to_curtain', 'to_roller'):
                 self.traversal, self.target = None, None
                 self.ctx.set_target(None, None, None)
                 return self._cross()
@@ -1848,9 +2135,9 @@ class BacktrackingMode(Mode):
         if self.phase == 'align':
             self.ctx.stop()
         self.hops = []
-        if self.phase in ('to_split', 'to_curtain', 'to_option') and self.traversal is not None:
+        if self.phase in ('to_split', 'to_curtain', 'to_roller', 'to_option') and self.traversal is not None:
             self.traversal.cancel()
-        if next_mode != self.cfg.get('curtain_mode', 'curtain'):
+        if next_mode not in (self.cfg.get('curtain_mode', 'curtain'), self.cfg.get('roller_mode', 'roller')):
             self.ctx.tiles.open_curtains = False       # the curtain mode hands back here: keep them open meanwhile
         self.target, self.traversal = None, None
         self.ctx.set_target(None, None, None)

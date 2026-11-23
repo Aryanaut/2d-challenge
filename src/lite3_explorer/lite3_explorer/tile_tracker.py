@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from lite3_explorer import roller_core as RC
 from lite3_explorer import stairs_core as SC
 from lite3_explorer import tiles as T
 from lite3_explorer.tile_reports import within_reach
@@ -22,10 +23,10 @@ class TileTracker:
     def __init__(self, size_m: float = 1.0, reach_radius_m: float = 0.30, max_failures: int = 2,
                  on_reached: Optional[Callable[[tuple, list, str], None]] = None,
                  on_enter: Optional[Callable[[tuple], None]] = None, min_known: float = 0.5,
-                 scene_min_known: float = 0.95, scene_max_free: float = 0.80):
+                 scene_min_known: float = 0.85, scene_max_free: float = 0.80):
         self.size_m = size_m
         self.min_known = min_known           # share of a tile the lidar must have scanned before it becomes a tile
-        self.scene_min_known, self.scene_max_free = scene_min_known, scene_max_free   # scene tile: scanned >= this, traversable < this
+        self.scene_min_known, self.scene_max_free = scene_min_known, scene_max_free   # scene tile: scanned >= this, free/scanned < this
         self.reach_radius_m = reach_radius_m
         self.wall_release_fraction = 0.25               # a virtual wall stays until less than this share of its edge is mapped wall
         self._wall_keys = set()                         # edges that are virtual walls now (hysteresis)
@@ -63,6 +64,16 @@ class TileTracker:
         self.stair_min_points = 4                      # confirmed stair cells a tile needs to be a staircase tile
         self.stairs: Dict[tuple, dict] = {}            # staircase tile -> {'points': n, 'ascent': (ux, uy)}
         self.stairs_crossed: set = set()
+        # roller tiles (roller mode): a roller lying across the middle of a tile, which the lidar maps as a wall (the tile
+        # looks like half a tile). Status 'roller' (never a Nav2 target, never unexplored) until the roller mode has
+        # crossed it in the h-step gait: then it is marked explored (on the trail) and stays out of Nav2 routes.
+        self.roller_points = np.zeros((0, 5))
+        self.roller_min_points, self.roller_min_lidar, self.roller_edge_margin_m = 4, 2, 0.15
+        self.rollers: Dict[tuple, dict] = {}           # roller tile -> {'points', 'lidar', 'normal', 'line_xy'}
+        self.rollers_crossed: set = set()
+        # roller crossings the robot made: {sorted (tile before, tile beyond): roller tile}. Backtracking may cross back
+        # over them with the roller mode (known_route links the two tiles, roller_between names the roller tile).
+        self.roller_crossings: Dict[tuple, tuple] = {}
         self._map = None                              # (grid array, GridInfo)
         self._map_version = 0
         self._classified_version = -1
@@ -111,8 +122,10 @@ class TileTracker:
         self.curtain_edges = {}
         self.deferred_curtains = {}
         self.stairs, self.stairs_crossed = {}, set()
+        self.rollers, self.rollers_crossed, self.roller_crossings = {}, set(), {}
         self._visit(start, pose, 'start')
         self.set_stair_points(self.stair_points)       # stairs seen before the grid existed
+        self.set_roller_points(self.roller_points)     # rollers too
         self.update(force=True)
         return start
 
@@ -137,6 +150,10 @@ class TileTracker:
             t = self.tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False,
                                              'scene': False})
             t['status'], t['scene'] = 'staircase', False
+        for tile in set(self.rollers) - self.rollers_crossed:
+            t = self.tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False,
+                                             'scene': False})
+            t['status'], t['scene'] = 'roller', False
         self._flag_last_split()
         return True
 
@@ -279,9 +296,9 @@ class TileTracker:
         return self.current is not None and abs(tile[0] - self.current[0]) + abs(tile[1] - self.current[1]) == 1
 
     def scene_tiles(self) -> List[tuple]:
-        """Scene tiles, wherever they are: completely scanned but less than scene_max_free traversable (never entered;
-        the scene mode looks at them, only from a tile that shares a side with them: scene_neighbours), plus the ones
-        already looked at."""
+        """Scene tiles, wherever they are: (almost) completely scanned, less than scene_max_free of the scanned area
+        traversable (never entered; the scene mode looks at them, only from a tile that shares a side with them:
+        scene_neighbours), plus the ones already looked at."""
         return [t for t, d in sorted(self.tiles.items()) if t in self.described or self._scene_flag(t)]
 
     def _scene_flag(self, tile) -> bool:
@@ -289,7 +306,7 @@ class TileTracker:
         staircase tile is never a scene tile (the stairs mode climbs it)."""
         tile = tuple(tile)
         return (bool(self.tiles.get(tile, {}).get('scene')) and tile not in set(self.trail)
-                and tile not in self.stairs and tile not in self.stairs_crossed)
+                and tile not in self.stairs and tile not in self.stairs_crossed and tile not in self.rollers)
 
     def mark_described(self, tile):
         """A scene tile was looked at from a neighbouring tile: it counts as explored (status visited) although the robot
@@ -337,6 +354,8 @@ class TileTracker:
         tile = tuple(int(v) for v in label.split(','))
         if tile in self.stairs or tile in self.stairs_crossed:
             return False                                # Nav2 never drives onto stairs: the stairs mode climbs them
+        if tile in self.rollers:
+            return False                                # nor to a roller tile: the roller mode crosses it (h-step gait)
         return not (self.skip_scene and self.is_scene(tile))
 
     def unexplored(self) -> List[str]:
@@ -434,15 +453,61 @@ class TileTracker:
         self.update()
         self.version += 1
 
+    # ------------------------------------------------------------- rollers
+    def set_roller_points(self, points) -> bool:
+        """Confirmed roller spots (Nx5 x, y, nx, ny, lidar, from the roller detector) -> roller tiles. Unlike a staircase
+        a roller tile may already be on the trail (Nav2 can drive into its front half before the roller is confirmed);
+        one already crossed stays crossed. A roller tile stays one. True if the set of roller tiles changed."""
+        self.roller_points = np.asarray(points, float).reshape(-1, 5)
+        if self.grid is None:
+            return False
+        found = RC.roller_tiles(self.grid, self.roller_points, self.roller_min_points, self.roller_min_lidar,
+                                self.roller_edge_margin_m)
+        rollers = dict(self.rollers)
+        rollers.update({t: d for t, d in found.items() if t not in self.rollers_crossed})
+        changed = set(rollers) != set(self.rollers)
+        self.rollers = rollers
+        if changed:
+            self.invalidate()
+            self.version += 1
+        return changed
+
+    def mark_roller_crossed(self, roller, beyond, pose, from_tile=None) -> None:
+        """The roller mode crossed `roller` (from `from_tile`) into `beyond`: the roller tile is explored (on the trail,
+        its tile report is written) and the robot stands on `beyond`. The crossing is remembered: backtracking may cross
+        back over it."""
+        roller, beyond = tuple(roller), tuple(beyond)
+        self.rollers_crossed.add(roller)
+        if from_tile is not None:
+            self.roller_crossings[tuple(sorted((tuple(from_tile), beyond)))] = roller
+        self._visit(roller, pose, 'roller crossed')
+        self._visit(beyond, pose, 'over the roller')
+        self.invalidate()
+        self.update()
+        self.version += 1
+
+    def roller_between(self, a, b) -> Optional[tuple]:
+        """The roller tile the robot crossed between tiles a and b (either way), or None."""
+        return self.roller_crossings.get(tuple(sorted((tuple(a), tuple(b)))))
+
+    def rollers_left(self) -> List[str]:
+        """Roller tiles not crossed yet."""
+        return [T.tile_label(t) for t in sorted(set(self.rollers) - self.rollers_crossed)]
+
     def known_route(self, start, goal) -> Optional[List[tuple]]:
         """Tiles from start to goal along moves the robot has already made (consecutive trail entries, either way),
-        fewest steps first; None when the trail does not link them. Never over a staircase it climbed (walled off)."""
+        fewest steps first; None when the trail does not link them. Never over a staircase it climbed (walled off) nor
+        INTO a roller tile (Nav2 cannot drive over the roller: the lidar maps it as a wall); a roller the robot crossed is
+        one hop from the tile before it to the tile beyond it (roller_between: the roller mode crosses it back)."""
         from collections import deque
         start, goal = tuple(start), tuple(goal)
         links: Dict[tuple, set] = {}
         for a, b in zip(self.trail, self.trail[1:]):
-            if a in self.stairs_crossed or b in self.stairs_crossed:
+            if a in self.stairs_crossed or b in self.stairs_crossed or a in self.rollers or b in self.rollers:
                 continue
+            links.setdefault(a, set()).add(b)
+            links.setdefault(b, set()).add(a)
+        for a, b in self.roller_crossings:
             links.setdefault(a, set()).add(b)
             links.setdefault(b, set()).add(a)
         prev = {start: None}
@@ -522,6 +587,10 @@ class TileTracker:
                 'staircases': {T.tile_label(t): {'points': d['points'], 'ascent': [round(v, 2) for v in d['ascent']],
                                                  'crossed': t in self.stairs_crossed}
                                for t, d in sorted(self.stairs.items())},
+                'rollers': {T.tile_label(t): {'points': d['points'], 'lidar': d.get('lidar', 0),
+                                              'normal': [round(v, 2) for v in d['normal']],
+                                              'crossed': t in self.rollers_crossed}
+                            for t, d in sorted(self.rollers.items())},
                 'last_split': ({'tile': T.tile_label(top['tile']), 'options': top['options'],
                                 'remaining': self.split_remaining(top)} if top else None),
                 'tiles': {T.tile_label(k): (dict(v, terrain=self.terrain[T.tile_label(k)])

@@ -276,15 +276,17 @@ def wall_edges(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, min_fra
 
 def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, free_threshold: int = 25,
                    occupied_threshold: int = 65, min_free: float = 0.15, min_known: float = 0.70,
-                   scene_min_known: float = 0.95, scene_max_free: float = 0.80) -> Dict[Tile, dict]:
+                   scene_min_known: float = 0.85, scene_max_free: float = 0.80) -> Dict[Tile, dict]:
     """Status and coverage for every tile that has any mapped cell (plus every visited tile).
 
     A tile is defined (to_visit / blocked) only once at least min_known of its area has been
     scanned by the lidar; before that it is 'unknown' and is not offered as a target. Visited
     tiles (including the initial tile the robot stands in) are always defined.
 
-    'scene' marks a SCENE tile: completely scanned (known >= scene_min_known) but with less than scene_max_free of its
-    area traversable (free map cells). It is a flag only: the status (and so the tile selection) is unchanged."""
+    'scene' marks a SCENE tile: (almost) completely scanned (known >= scene_min_known) and less than scene_max_free of
+    its SCANNED area traversable (free / known). Relative to the scanned area, not the whole tile: a cluttered tile always
+    has corners hidden behind its own clutter until the robot stands on it, so an absolute free share with a ~0.95 scan
+    gate flagged it too late (after it was entered). It is a flag only: the status (and so the tile selection) is unchanged."""
     h, w = grid.shape
     cols, rows = np.meshgrid(np.arange(w), np.arange(h))
     xs = info.origin_x + (cols + 0.5) * info.resolution
@@ -318,7 +320,8 @@ def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, f
         tot = max(1, int(total[k]))
         info_t = {'free': round(free_c[k] / tot, 2), 'occupied': round(occ_c[k] / tot, 2),
                   'known': round(known_c[k] / tot, 2), 'unmapped_edge': bool(edge_c[k] > 0),
-                  'scene': bool(known_c[k] / tot >= scene_min_known and free_c[k] / tot < scene_max_free)}
+                  'scene': bool(known_c[k] / tot >= scene_min_known
+                                 and free_c[k] / known_c[k] < scene_max_free)}
         if tile in visited:
             status = 'visited'
         elif info_t['known'] < min_known:

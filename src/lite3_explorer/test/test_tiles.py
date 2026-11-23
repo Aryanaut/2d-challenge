@@ -120,6 +120,40 @@ def test_scene_tiles_are_scanned_but_less_than_80_percent_traversable():
     assert T.classify_tiles(part, info, tg, [(0, 0)], min_known=0.4)[(1, 0)]['scene'] is False
 
 
+
+def _tile_row(fractions):
+    """One row of 1 m tiles (20 x 20 cells of 5 cm); each (occupied, unscanned) share fills that tile's cells in order:
+    occupied first, then unscanned, the rest free."""
+    info = fc.GridInfo(20 * len(fractions), 20, 0.05, 0.0, 0.0)
+    grid = np.zeros((20, 20 * len(fractions)), dtype=np.int16)
+    for i, (occ, unknown) in enumerate(fractions):
+        cells = np.zeros(400, dtype=np.int16)
+        n_occ, n_unk = round(occ * 400), round(unknown * 400)
+        cells[:n_occ] = 100
+        cells[n_occ:n_occ + n_unk] = -1
+        grid[:, 20 * i:20 * (i + 1)] = cells.reshape(20, 20)
+    return grid, info
+
+
+def test_scene_flag_uses_the_scanned_part_so_cluttered_tiles_are_caught_before_entry():
+    """Bag 'generational run' (23 Nov): the scene tiles 2,0 and 2,-3 were never fully scanned before the robot drove
+    at them (part of a cluttered tile hides behind its own clutter), so the old rule (known >= 0.95 and free/TILE < 0.85)
+    flagged 2,0 only after it was entered and 2,-3 only 24 s into the drive. Numbers are /tile_map values at the time
+    each tile was chosen as a target; 1,-3 is a real maze tile with the lowest free/known ratio seen before entry."""
+    grid, info = _tile_row([
+        (0.00, 0.00),     # 0,0: the robot's tile
+        (0.24, 0.10),     # 1,0 ~ scene 2,0:  known 0.90, free 0.66 (free/known 0.73)
+        (0.21, 0.07),     # 2,0 ~ scene 2,-3: known 0.93, free 0.72 (free/known 0.77)
+        (0.17, 0.07),     # 3,0 ~ real 1,-3:  known 0.93, free 0.76 (free/known 0.82)
+        (0.06, 0.00),     # 4,0 ~ real 0,-1:  known 1.00, free 0.94 (walls on its edges)
+        (0.40, 0.50),     # 5,0: half of it never scanned -> not enough to call it a scene yet
+    ])
+    tg = T.TileGrid(0.0, 0.0, 0.0)
+    tiles = T.classify_tiles(grid, info, tg, [(0, 0)])
+    assert [tiles[(i, 0)]['scene'] for i in range(6)] == [False, True, True, False, False, False]
+    old = T.classify_tiles(grid, info, tg, [(0, 0)], scene_min_known=0.95, scene_max_free=0.85)
+    assert not old[(1, 0)]['scene'] and not old[(2, 0)]['scene']   # the old thresholds miss both (absolute share)
+
 def test_edge_distance():
     from lite3_explorer.tiles import TileGrid
     g = TileGrid(0.0, 0.0, 0.0, 1.0)

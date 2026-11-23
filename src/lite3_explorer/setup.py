@@ -34,6 +34,7 @@ setup(
             'survey_monitor = lite3_explorer.survey_monitor:main',
             'curtain_detector = lite3_explorer.curtain_detector:main',
             'stair_detector = lite3_explorer.stair_detector:main',
+            'roller_detector = lite3_explorer.roller_detector:main',
             'tilt_gate = lite3_explorer.tilt_gate:main',
             'controller_monitor = lite3_explorer.controller_monitor:main',
         ],

@@ -167,7 +167,7 @@ class HeadlessCtx:
         tcfg = cfg['tiles']
         self.tiles = TileTracker(float(tcfg['size_m']), float(tcfg['reach_radius_m']), int(tcfg['max_failures']),
                                  min_known=float(tcfg.get('min_known', 0.5)),
-                                 scene_min_known=float(tcfg.get('scene_min_known', 0.95)),
+                                 scene_min_known=float(tcfg.get('scene_min_known', 0.85)),
                                  scene_max_free=float(tcfg.get('scene_max_free', 0.80)))
         self.tiles.skip_scene = bool(cfg['modes'].get('exploring', {}).get('scenes', False))   # like the node
         self.tiles.stair_min_points = int(tcfg.get('stair_min_points', 4))

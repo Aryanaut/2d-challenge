@@ -7,6 +7,7 @@ Example:
   ros2 launch lite3_explorer exploration.launch.py controller:=mppi      # holonomic MPPI controller (vx, vy, wz)
   ros2 launch lite3_explorer exploration.launch.py use_curtains:=true    # walk through curtains on tile edges
   ros2 launch lite3_explorer exploration.launch.py use_stairs:=true      # climb over staircases in AI mode
+  ros2 launch lite3_explorer exploration.launch.py use_rollers:=true     # cross roller tiles in the h-step gait
 """
 import os
 
@@ -69,6 +70,8 @@ def _mission_manager(context):
         params.append({'modes.exploring.curtains': True})
     if LaunchConfiguration('use_stairs').perform(context).lower() == 'true':
         params.append({'modes.exploring.stairs': True})
+    if LaunchConfiguration('use_rollers').perform(context).lower() == 'true':
+        params.append({'modes.exploring.rollers': True})
     for arg in ('scene_max_free', 'scene_min_known'):
         value = LaunchConfiguration(arg).perform(context)
         if value:
@@ -120,10 +123,10 @@ def generate_launch_description():
         DeclareLaunchArgument('quickscan_on_edge', default_value='',
                               description='true: stop on each tile edge and run the quickscan animation (empty = mission.yaml)'),
         DeclareLaunchArgument('scene_max_free', default_value='',
-                              description='Scene tile: scanned, but less than this share of it traversable, e.g. 0.6 '
+                              description='Scene tile: scanned, but less than this share of the scanned part traversable, e.g. 0.6 '
                                           '(empty = mission.yaml tiles.scene_max_free, 0.80)'),
         DeclareLaunchArgument('scene_min_known', default_value='',
-                              description='Scene tile: scanned at least this much (empty = mission.yaml, 0.95)'),
+                              description='Scene tile: scanned at least this much (empty = mission.yaml, 0.85)'),
         DeclareLaunchArgument('use_curtains', default_value='false',
                               description='Optional: detect hanging curtains in the depth image (low rate); one along the '
                                           "current tile's edge is squared up to and walked through with vx commands"),
@@ -135,6 +138,10 @@ def generate_launch_description():
                               description='Optional: detect staircases in the depth image (low rate); one on a tile '
                                           'beside the current tile is climbed over in the robot AI mode, then walled off'),
         DeclareLaunchArgument('stairs_params', default_value=cfg('stairs.yaml')),
+        DeclareLaunchArgument('use_rollers', default_value='false',
+                              description='Optional: detect roller tiles (depth camera, confirmed by the 3D lidar; low rate); '
+                                          'one beside the current tile is squared up to and crossed in the h-step gait'),
+        DeclareLaunchArgument('roller_params', default_value=cfg('roller.yaml')),
         DeclareLaunchArgument('slam_params', default_value=cfg('slam_toolbox.yaml')),
         DeclareLaunchArgument('controller', default_value='rpp',
                               description='Nav2 local controller: rpp (regulated pure pursuit: vx/wz only) | '
@@ -176,6 +183,9 @@ def generate_launch_description():
         Node(package=PKG, executable='stair_detector', name='stair_detector', output='screen',
              parameters=[lc('stairs_params'), {'use_sim_time': lc('use_sim_time')}],
              condition=IfCondition(lc('use_stairs'))),
+        Node(package=PKG, executable='roller_detector', name='roller_detector', output='screen',
+             parameters=[lc('roller_params'), {'use_sim_time': lc('use_sim_time'), 'cloud_topic': lc('cloud_topic')}],
+             condition=IfCondition(lc('use_rollers'))),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(
                 get_package_share_directory('lite3_terrain_classifier'), 'launch', 'terrain_classifier.launch.py')),

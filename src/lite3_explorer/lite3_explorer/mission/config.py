@@ -41,16 +41,19 @@ DEFAULTS: Dict[str, Any] = {
         'reach_radius_m': 0.30,           # a tile is reached (explored) this close to its centre
         'max_failures': 2,                # failed attempts before a tile is given up on (unreachable); 0 = never
         'min_known': 0.5,                 # share of a tile that must be scanned before it becomes a tile
-        'scene_min_known': 0.95,          # scene tile: scanned at least this much ...
-        'scene_max_free': 0.80,           # ... but less than this share of it traversable (drawn blue hatched in RViz)
+        'scene_min_known': 0.85,          # scene tile: scanned at least this much ...
+        'scene_max_free': 0.80,           # ... and less than this share of the SCANNED part traversable (drawn blue hatched in RViz)
         'stair_min_points': 4,            # confirmed stair cells (10 cm, /stairs/points) that make a tile a staircase tile
+        'roller_min_points': 4,           # confirmed roller spots (10 cm, /roller/points) that make a tile a roller tile ...
+        'roller_min_lidar': 2,            # ... of which this many are confirmed by the 3D lidar (0 = depth camera alone)
+        'roller_edge_margin_m': 0.15,     # spots this close to a tile edge do not count (the roller lies mid-tile)
     },
 
     'mission': {
         # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
         # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
-        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'stairs', 'scene', 'mppi', 'backtracking',
-                  'recovery', 'complete'],
+        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'stairs', 'roller', 'scene', 'mppi',
+                  'backtracking', 'recovery', 'complete'],
         'initial_mode': 'idle',
         'start_mode': 'scanning',         # where set_active(true) / auto start goes
         'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
@@ -174,6 +177,9 @@ DEFAULTS: Dict[str, Any] = {
             'stairs': False,              # use_stairs:=true: a staircase tile shares a side with the current tile -> stairs
             'stairs_mode': 'stairs',      # mode (AI mode on, climb over it into the tile beyond, AI mode off, wall it off)
             'stair_min_facing': 0.5,      # climb only from a side the steps go up from (cos of ascent vs the way across)
+            'rollers': False,             # use_rollers:=true: a roller tile shares a side with the current tile (or the robot
+            'roller_mode': 'roller',      # stands in front of its roller) -> roller mode (square up, h-step gait, cross it)
+            'roller_min_facing': 0.8,     # cross only when the roller lies across the way (|cos| of its normal vs the side)
             'backtracking': True,         # two or more tiles to travel to -> the tile is the last split; no exploration
                                           # target left but tiles unexplored -> backtracking mode (else retry_wait)
             'backtracking_mode': 'backtracking',
@@ -276,6 +282,36 @@ DEFAULTS: Dict[str, Any] = {
             'climber_search_timeout_s': 15.0,   # stair_climber still searching: its lidar sees no stairs, give up (no climb)
             'climber_timeout_s': 180.0,   # whole stair_climber run
             'climber_lost_s': 5.0,        # no /stair_climber/state this long: not running, give up
+        },
+        'roller': {
+            'type': 'roller',
+            'next_mode': 'exploring',     # over the roller: exploring again (the roller tile is marked explored)
+            'fail_mode': 'recovery',      # gave up with the robot past the edge (on / at the roller): recovery
+            'gait_settle_s': 2.0,         # stand still this long after asking for the h-step gait (and after releasing it)
+            'center_tol_m': 0.10,         # first drive (turn, then vx / wz) to within this of where it squares up
+            'center_speed_mps': 0.15,
+            'center_min_speed_mps': 0.05,
+            'center_gain': 1.0,
+            'center_turn_deg': 30.0,
+            'center_heading_gain': 1.5,
+            'center_timeout_s': 15.0,     # not there by then: square up from where it is
+            'align_tol_deg': 4.0,         # square to the roller within this before stepping over it
+            'align_timeout_s': 15.0,      # could not square up: give up (never crossed), back to the mode before
+            'min_turn_rad_s': 0.2,
+            'max_turn_rad_s': 0.6,
+            'turn_gain': 1.0,
+            'speed_mps': 0.20,            # forward speed (vx) over the roller in the h-step gait
+            'heading_gain': 1.0,          # wz that holds the heading while crossing
+            'lateral_gain': 0.5,          # vy that keeps the robot on the line through the tile centres (0 = off)
+            'lateral_max_mps': 0.08,
+            'extra_m': 0.0,               # stop this much beyond the centre of the tile beyond the roller
+            'cross_timeout_s': 40.0,
+            'stall_m': 0.05,              # crossing: less progress than this ...
+            'stall_s': 6.0,               # ... in this long = stuck at the roller: back off and try again
+            'max_attempts': 2,            # crossing tries (back off to where it squared up, square up again, cross)
+            'back_speed_mps': 0.12,       # backing off after a stuck try
+            'back_timeout_s': 10.0,
+            'pose_lost_s': 3.0,           # no pose while crossing: keep walking straight this long, then stop
         },
         'backtracking': {
             'type': 'backtracking',

@@ -33,7 +33,9 @@ Interfaces
   pub  ~/tile_markers, ~/markers  visualization_msgs/MarkerArray   tiles, trail, target / tile descriptions
   pub  /spin_crawl, /spin_flat  std_msgs/Bool     gait holds for gait_switcher while turning
   sub  /curtain/points, /stairs/points   std_msgs/String   curtain / stair detectors (use_curtains, use_stairs)
-  pub  /cmd_vel                 geometry_msgs/Twist   direct velocity (curtain, stairs and mppi modes)
+  sub  /roller/points           std_msgs/String   roller detector (use_rollers): roller tiles
+  pub  /roller_mode             std_msgs/Bool     (latched) true while the roller mode holds the h-step gait (roller_detector pauses)
+  pub  /cmd_vel                 geometry_msgs/Twist   direct velocity (curtain, stairs, roller and mppi modes)
   pub  /simple_cmd              transfer_interfaces/MotionSimpleCMD   robot AI mode on / off (stairs mode)
   pub  /ai_mode                 std_msgs/Bool     (latched) true while AI mode is on: gait_switcher and stair_detector pause
   pub  /stair_climber/enable    std_msgs/Bool     stairs mode with climber: true: hand the climb to stair_climber
@@ -72,6 +74,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
 from lite3_explorer import map_grid as G
+from lite3_explorer import roller_core as RC
 from lite3_explorer import tiles as T
 from lite3_explorer import turn_check as TC
 from lite3_explorer import nav2_traversal  # noqa: F401  (registers nav2_pose / nav2_route)
@@ -85,7 +88,7 @@ from lite3_explorer.tile_tracker import TileTracker
 SIDE_NAMES = {'N': 'north', 'E': 'east', 'S': 'south', 'W': 'west'}
 TILE_COLOURS = {'visited': (0.2, 0.5, 1.0, 0.45), 'to_visit': (0.1, 0.8, 0.2, 0.35),
                 'blocked': (0.8, 0.1, 0.1, 0.25), 'unreachable': (0.6, 0.0, 0.6, 0.35),
-                'staircase': (1.0, 0.85, 0.0, 0.6)}
+                'staircase': (1.0, 0.85, 0.0, 0.6), 'roller': (0.95, 0.95, 0.95, 0.6)}
 
 
 # ------------------------------------------------------------------------------- Nav2 helpers
@@ -256,10 +259,13 @@ class MissionManager(Node):
         self.tiles = TileTracker(float(tcfg['size_m']), float(tcfg['reach_radius_m']), int(tcfg['max_failures']),
                                  on_reached=self._on_tile_reached,
                                  min_known=float(tcfg.get('min_known', 0.5)),
-                                 scene_min_known=float(tcfg.get('scene_min_known', 0.95)),
+                                 scene_min_known=float(tcfg.get('scene_min_known', 0.85)),
                                  scene_max_free=float(tcfg.get('scene_max_free', 0.80)))
         self.tiles.skip_scene = bool(mode_cfg(cfg, 'exploring').get('scenes', False))   # scene tiles are looked at, never entered
         self.tiles.stair_min_points = int(tcfg.get('stair_min_points', 4))
+        self.tiles.roller_min_points = int(tcfg.get('roller_min_points', 4))
+        self.tiles.roller_min_lidar = int(tcfg.get('roller_min_lidar', 2))
+        self.tiles.roller_edge_margin_m = float(tcfg.get('roller_edge_margin_m', 0.15))
         self.target = None                     # (label, goal_xy) for the RViz highlight
         self._published_tiles = -1
 
@@ -323,6 +329,9 @@ class MissionManager(Node):
         self.flat_pub = self.create_publisher(Bool, '/spin_flat', 10)
         self.step_up_pub = self.create_publisher(Bool, '/step_up', latched)      # h-step gait while driving to a higher tile
         self._step_up = None
+        self._hstep_hold = False                                                 # roller mode: h-step gait while crossing
+        self.roller_mode_pub = self.create_publisher(Bool, '/roller_mode', latched)
+        self.roller_mode_pub.publish(Bool(data=False))
         self._rise_target, self._rise_from, self._rise_max = None, 0.0, None
         self.complete_pub.publish(Bool(data=False))
 
@@ -346,6 +355,8 @@ class MissionManager(Node):
         self.create_timer(0.05, self._publish_cmd)
         # stairs mode (use_stairs): the stair detector's confirmed stair cells, and the robot's AI mode on / off
         self.create_subscription(String, '/stairs/points', self._on_stair_points, latched)
+        # roller mode (use_rollers): the roller detector's confirmed roller spots
+        self.create_subscription(String, '/roller/points', self._on_roller_points, latched)
         self.ai_pub = self.create_publisher(Bool, '/ai_mode', latched)
         self.ai_pub.publish(Bool(data=False))
         # stairs mode with climber: true: the stair_climber package does the alignment + AI crossing
@@ -489,6 +500,25 @@ class MissionManager(Node):
             self.log('info', f'Staircase tile(s): {", ".join(T.tile_label(t) for t in sorted(self.tiles.stairs))}.')
             self.event('staircases', tiles=[T.tile_label(t) for t in sorted(self.tiles.stairs)])
 
+    def _on_roller_points(self, msg):
+        try:
+            pts = RC.points_from_json(json.loads(msg.data))
+        except (ValueError, TypeError):
+            return
+        if self.tiles.set_roller_points(pts):
+            self.tiles.update()
+            self.log('info', f'Roller tile(s): {", ".join(self.tiles.rollers_left()) or "(all crossed)"}.')
+            self.event('rollers', tiles=self.tiles.rollers_left())
+
+    def hstep(self, on):
+        """Hold the h-step gait (/step_up true: gait_switcher sends rug_hstep) while the roller mode crosses a roller;
+        /roller_mode tells the roller detector to pause."""
+        on = bool(on)
+        if on != self._hstep_hold:
+            self._hstep_hold = on
+            self.roller_mode_pub.publish(Bool(data=on))
+            self._update_step_up()
+
     def ai_flag(self, on):
         """/ai_mode only (gait_switcher / stair_detector pause), no /simple_cmd: stair_climber sends the AI codes."""
         self.ai_pub.publish(Bool(data=bool(on)))
@@ -618,11 +648,14 @@ class MissionManager(Node):
             on = self._rise_max is not None and self._rise_max >= float(self.cfg.get('step_up_min_rise_m', 0.04))
         else:
             self._rise_target, self._rise_max = None, None
+        rise = on
+        on = on or getattr(self, '_hstep_hold', False)       # the roller mode crossing a roller
         if on != self._step_up:
             self._step_up = on
             self.step_up_pub.publish(Bool(data=on))
-            self.log('info', f'Target tile {self.target[0] if self.target else "-"}: '
-                             + (f'{self._rise_max:+.2f} m above the start tile: h-step gait.' if on else 'no step up: terrain gait.'))
+            self.log('info', 'Crossing a roller: h-step gait.' if on and not rise else
+                     f'Target tile {self.target[0] if self.target else "-"}: '
+                     + (f'{self._rise_max:+.2f} m above the start tile: h-step gait.' if on else 'no step up: terrain gait.'))
             self.event('step_up', on=on, tile=self.target[0] if self.target else None)
 
     def publish_goal(self, pose_stamped, profile):
@@ -1122,7 +1155,7 @@ class MissionManager(Node):
         return m
 
     def _scene_markers(self, stamp):
-        """Scene tiles (completely scanned, less than scene_max_free traversable) as blue hatched tiles."""
+        """Scene tiles (almost completely scanned, free/known < scene_max_free) as blue hatched tiles."""
         tg = self.tiles.grid
         return [self._hatch_marker(tg, tile, 100 + n, 'scene_tiles', stamp, z=0.05)
                 for n, tile in enumerate(self.tiles.scene_tiles())]
@@ -1145,7 +1178,7 @@ class MissionManager(Node):
         return [m]
 
     def _free_label_markers(self, stamp):
-        """Per-tile text: traversable share (compare with scene_max_free) and scanned share (compare with scene_min_known)."""
+        """Per-tile text: traversable share (free/known is compared with scene_max_free) and scanned share (compare with scene_min_known)."""
         tg = self.tiles.grid
         out = []
         for n, (tile, d) in enumerate(sorted(self.tiles.tiles.items())):

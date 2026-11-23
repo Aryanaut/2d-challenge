@@ -85,7 +85,7 @@ DEFAULTS = {
                      'x_offset_m': 0.30, 'height_m': 0.40, 'point_step_m': 0.02, 'noise_m': 0.004,
                      'map_cell_m': 0.10, 'confirm_hits': 3},
     # scene tiles ('0' in the layout): clutter mapped as fill share of occupied cells inside margin_m of the tile edges
-    # (with the defaults about a third of the tile is occupied: the mission manager's scene_max_free is 0.85)
+    # (with the defaults about a third of the tile is occupied: the mission manager's scene_max_free is 0.80 of the scanned part)
     'scene': {'margin_m': 0.15, 'fill': 0.6, 'seed': 0},
 }
 

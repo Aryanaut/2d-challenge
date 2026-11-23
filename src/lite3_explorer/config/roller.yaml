@@ -1,0 +1,49 @@
+roller_detector:
+  ros__parameters:
+    # Finds roller tiles: a cylinder (~0.17 m high) lying across the middle of a tile, which the 2D lidar sees as a wall (the
+    # tile looks like half a tile). Depth camera: a short, thin, long ridge with the floor hidden behind it; 3D lidar: only
+    # low returns there and open space behind (confirms each depth spot). Optional: use_rollers:=true on
+    # exploration.launch.py (explorer.sh --roller). The mission manager's 'roller' mode squares up to a roller tile beside
+    # the current tile and crosses it in the h-step gait (config/mission.yaml: modes.roller). Tuned on bags/data/roller.
+    depth_topic: /camera/depth/image_raw
+    camera_info_topic: /camera/depth/camera_info
+    depth_hfov_deg: 81.4        # only until camera_info arrives
+    depth_scale: 0.001          # 16UC1 millimetres -> metres
+    global_frame: map           # its z axis must point up
+    process_hz: 2.0             # LOW rate: depth frames processed per second
+    pause_topic: /roller_mode   # paused while the roller mode crosses a roller
+    stride: 4                   # use every 4th pixel
+    min_range_m: 0.25           # horizontal distance from the camera
+    max_range_m: 1.6
+    cell_m: 0.05
+    min_cell_points: 3
+    min_top_m: 0.12             # top of the roller above the floor (bag: 0.17 m) ...
+    max_top_m: 0.30             # ... standard walls are 0.5-0.6 m
+    tall_m: 0.35                # a point this high next to the ridge: a wall or a box, not a roller
+    link_cells: 2
+    min_cells: 6
+    min_length_m: 0.40          # along the roller
+    max_width_m: 0.25           # across it
+    behind_near_m: 0.05         # band behind the roller ...
+    behind_far_m: 0.40
+    behind_min_h_m: 0.03        # ... where points above the floor ...
+    max_behind_frac: 0.15       # ... are at most this fraction of the roller's points (the roller hides the floor behind)
+    min_points: 300             # depth points (after the stride) on the roller
+    floor_near_m: 0.6           # floor height = the lowest big flat level starting this close to the camera ...
+    floor_min_cells: 25
+    floor_window: 40            # ... over the last 40 frames ...
+    floor_quantile: 0.2
+    map_cell_m: 0.10            # remembered roller spots
+    confirm_hits: 3             # a spot counts after this many sightings
+    # 3D lidar confirmation (heights against the depth camera's floor, in the map frame)
+    use_lidar: true
+    cloud_topic: /livox/points
+    lidar_hz: 2.0
+    lidar_match_m: 0.15         # a lidar low-only cell this close to a roller spot confirms it
+    lidar_cell_m: 0.05
+    lidar_low_min_m: 0.04       # the roller's face: returns between these heights ...
+    lidar_low_max_m: 0.28
+    lidar_high_min_m: 0.32      # ... and none from this height on around it
+    lidar_min_low: 20           # low returns a cell needs (summed over scans)
+    lidar_max_high_behind: 10   # wall-height returns allowed 0.3-0.8 m behind it (a curtain has its wall there)
+    lidar_max_range_m: 2.5

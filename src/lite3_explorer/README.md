@@ -36,6 +36,7 @@ background what it looks like, and the answers are compiled into `~/2d/reports/t
 | `exploring` | **Checkpoint**: checks the end condition. Asks its exploration profiles in order (default `[tiles]`) for candidates, has Nav2 check a path to each, and drives to the best reachable one with a traversal profile. If a profile has nothing reachable, the next one is asked. Reached → `scanning`. Failed → the profile records it (tile failure / frontier blacklist) and it re-decides. | `decide`, `checking_paths`, `driving`, `wait_planner`, `wait_traversal` |
 | `quickscan` | Optional (`quickscan_on_edge`). Entered from `exploring` when the robot is within `quickscan_edge_margin_m` (0.15 m) of a tile boundary, once per tile. Cancels the Nav2 goal, waits `settle_s`, plays the `quickscan` robot animation and waits for it to end, then returns to `exploring`, which re-decides (the cancelled goal is normally re-chosen; it does not count as a failure). Skipped if `animation_player` doesn't start it within `start_timeout_s`; cancelled after `timeout_s`. | `settle`, `playing` |
 | `stairs` | Optional (`use_stairs:=true`, `./explorer.sh --stairs`). Entered from `exploring` at a decision when a **staircase tile** (found by `stair_detector` in the depth image) shares a side with the current tile and its steps go up away from it. Drives to the current tile's centre, squares up to that side, turns the robot's **AI mode on** (`/simple_cmd` `0x21010528`), walks forward over the staircase tile(s) to the centre of the tile beyond, turns **AI mode off** (`0x2101052B`), walls the staircase off (virtual walls on all four edges: never entered again) and returns to `exploring`. Stuck / timed out on the stairs: AI mode off, walled off, `fail_mode` (`recovery`). Any other exit (operator command, shutdown) also turns AI mode off. While AI mode is on, `/ai_mode` is true: `gait_switcher` sends no gait and `stair_detector` pauses. | `center`, `align`, `ai_on`, `cross`, `ai_off` |
+| `roller` | Optional (`use_rollers:=true`, `./explorer.sh --roller`). A **roller tile** has a cylinder (~0.17 m high) lying across its middle: the 2D lidar maps it as a wall, so the tile looks like half a tile. `roller_detector` finds it in the depth image (a short, thin, long ridge with the floor hidden behind it) and the 3D lidar confirms it (only low returns there, open space behind). Entered from `exploring` at a decision (before the end condition is checked) when a roller tile shares a side with the current tile and its roller lies across the way, or the robot stands in front of the roller on its tile. Drives to the centre of the tile in front, squares up to the roller, holds the **h-step gait** (`/step_up` true: `gait_switcher` sends `rug_hstep`; `/roller_mode` true pauses the detector), walks forward with vx over the roller to the centre of the tile beyond, releases the gait, marks the **roller tile explored** (on the trail, tile report written) and returns to `exploring`. Stuck at the roller: backs off, squares up and tries again (`max_attempts`); given up past the edge: `fail_mode` (`recovery`), before it: the mode before. Crossing a roller from a tile with other untravelled tiles beside it makes that tile the last split; `backtracking` comes back over the roller the same way it walks back through a curtain (drives to the tile before it, phase `to_roller`, hands over to `roller`, which hands back with `roller_ok`; not crossed: another way is looked for). | `center`, `align`, `gait_on`, `cross`, `back`, `gait_off` |
 | `recovery` | Clears the costmaps, then drives to the **nearest tile centre** (visited or to-visit tiles, excluding the tile it got stuck on and the centre it already stands on), trying up to `candidates` of them. Then `scanning`. After `give_up_after` recoveries in a row without reaching a new tile, the failing tiles are marked unreachable. | `clearing`, `driving`, `wait_traversal`, `give_up` |
 | `complete` | The end condition is met. Publishes `/exploration_complete`, writes `tiles.json` and the final tile report. `set_active(true)` starts again. | `done` |
 
@@ -53,7 +54,9 @@ and either trigger fires, it switches to `recovery` (if none remain, it checks t
 clear of the walls, `tiles.max_failures` failed attempts (Nav2 abort, stuck, timeout), or repeated recoveries.
 Reaching an eliminated tile by any route clears that status. `staircase` (drawn yellow): a tile holding at least
 `tiles.stair_min_points` confirmed stair cells: never a Nav2 target, never counted as unexplored; only the `stairs` mode
-enters it.
+enters it. `roller` (drawn white): a tile holding at least `tiles.roller_min_points` confirmed roller spots away from its
+edges, `tiles.roller_min_lidar` of them confirmed by the lidar: never a Nav2 target, never counted as unexplored, never on
+a Nav2 route back; once the `roller` mode has crossed it, it is `visited`.
 
 ## Robot animations
 
@@ -157,7 +160,8 @@ SERVER_URL=http://192.168.10.141:8000 GROUP_ID=team7 src/lite3_explorer/scripts/
 Launch arguments are the same as before (`use_slam`, `use_nav2`, `use_terrain`, `use_gait`, lidar TF, `use_ai`,
 `server_url`, ...), plus `mission_params:=<yaml>`, `auto_start:=true|false`, `use_mission:=false` and
 `quickscan_on_edge:=true` (see [Robot animations](#robot-animations)), `use_curtains:=true` and `use_stairs:=true`
-(starts `stair_detector`, `config/stairs.yaml`, and turns on `modes.exploring.stairs`).
+(starts `stair_detector`, `config/stairs.yaml`, and turns on `modes.exploring.stairs`), `use_rollers:=true` (starts
+`roller_detector`, `config/roller.yaml`, and turns on `modes.exploring.rollers`).
 `mission_only.launch.py` skips odom TF, cloud→scan, SLAM and Nav2 for robots that already run them.
 
 ### Local controller: pure pursuit or holonomic MPPI
@@ -260,8 +264,9 @@ missions in simulated corridors and rooms, including a fake lidar that reveals t
 | `config/nav2_params_mppi.yaml` | Nav2 parameters with the holonomic MPPI local controller (`controller:=mppi`). |
 | `nav2_traversal.py` | `nav2_pose` and `nav2_route` traversal types. |
 | `mission/core.py` | `Mode`, `Transition`, `ModeMachine` (switching, stuck supervisor, end-condition checks). |
-| `mission/modes.py` | `idle`, `scanning`, `exploring`, `quickscan`, `curtain`, `stairs`, `scene`, `mppi`, `backtracking`, `recovery`, `complete`. |
+| `mission/modes.py` | `idle`, `scanning`, `exploring`, `quickscan`, `curtain`, `stairs`, `roller`, `scene`, `mppi`, `backtracking`, `recovery`, `complete`. |
 | `stairs_core.py`, `stair_detector.py`, `config/stairs.yaml` | Staircase detection in the depth image (treads at evenly spaced heights, each farther than the one below; tuned on `bags/data/stairs`), staircase tiles, the side to climb from; the optional node publishing `/stairs/points`. |
+| `roller_core.py`, `roller_detector.py`, `config/roller.yaml` | Roller detection: depth camera (low, thin, long ridge with the floor hidden behind it) confirmed by the 3D lidar (low returns only, open behind); tuned on `bags/data/roller`. Roller tiles, the side to cross from; the optional node publishing `/roller/points`. |
 | `animations.py`, `animation_player.py`, `animation_test.py` | Robot animations (movement / pose), the node that plays them, and the one-shot test node (`launch/test_animation.launch.py`). |
 | `mission/exploration.py` | Exploration strategies (`tiles`, `frontier`) and their registry. |
 | `mission/stuck.py`, `mission/end_conditions.py`, `mission/traversal.py`, `mission/config.py` | Stuck detector, end conditions, traversal interface, config defaults. |

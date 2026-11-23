@@ -1,0 +1,11 @@
+# A corridor ending in a staircase ('M', tile 2,0) with two tiles behind it (3,0 and 4,0) that can only be reached over
+# it. The lidar cannot see past the staircase's riser, so those tiles are never identified from in front of it: once
+# tiles 0,0 and 1,0 are explored, 'all identified tiles explored' would be true. A staircase still to climb keeps the
+# mission open (lite3_explorer: ModeMachine.stairs_pending), so the stairs mode climbs it and tiles 3,0 / 4,0 get
+# explored before the mission completes.
+name: stairs_corridor
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+
+  | >       M         |
+  +---+---+---+---+---+
