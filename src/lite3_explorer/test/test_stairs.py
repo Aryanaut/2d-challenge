@@ -250,3 +250,98 @@ def test_a_tile_the_robot_stood_on_never_becomes_a_staircase():
     run_until(ctx, m, lambda: ctx.tiles.ready and len(ctx.tiles.trail) >= 2, n=50)
     walked = ctx.tiles.trail[1]
     assert not ctx.tiles.set_stair_points(stair_pts(walked)) and walked not in ctx.tiles.stairs
+
+
+# ------------------------------------------------------------------------------------------ climber: true
+class FakeClimber:
+    """A stair_climber node: after enable, walks through `script` (state, ticks), one state per tick-count."""
+    def __init__(self, ctx, script, cross_to_x=2.5):
+        self.ctx, self.script, self.cross_to_x = ctx, list(script), cross_to_x
+        self.enables, self.flags, self.state, self.left = [], [], None, 0
+        self.drives_while_on = 0
+        ctx.stair_climber_enable = self.enable
+        ctx.ai_flag = self.flags.append
+        ctx.stair_climber_state = self.get
+        self.on = False
+
+    def enable(self, on):
+        self.enables.append(on)
+        self.on = on
+        if on:
+            self.queue, self.state, self.left = list(self.script), None, 0
+        else:
+            self.state = 'IDLE' if self.state is not None else None
+
+    def get(self):
+        if self.on:
+            if self.left <= 0 and self.queue:
+                self.state, self.left = self.queue.pop(0)
+                if self.state == 'DONE':
+                    self.ctx.pose_[0] = self.cross_to_x            # it walked over the stairs
+            self.left -= 1
+        return (self.state, 0.05) if self.state is not None else (None, float('inf'))
+
+
+CROSS = [('SEARCH', 2), ('ALIGN', 3), ('WALK_TO_AI_ZONE', 1), ('ENTER_AI', 2), ('CROSS_AI', 5), ('EXIT_AI', 2),
+         ('SWITCH_TO_FLAT_GAIT', 2), ('DONE', 100)]
+
+
+def build_climber(script, flat=None):
+    cfg = {'modes.stairs.climber': True}
+    cfg.update(flat or {})
+    ctx, m, d, ai = build(cfg)
+    return ctx, m, d, ai, FakeClimber(ctx, script)
+
+
+def test_climber_does_the_climb_and_the_staircase_is_walled_off():
+    ctx, m, d, ai, cl = build_climber(CROSS)
+    assert run_until(ctx, m, lambda: any(k == 'stairs_crossed' for k, _ in ctx.events), n=200), modes_seen(m)
+    assert ai == []                                      # the mission sent no AI codes: stair_climber did
+    assert cl.enables == [True, False] and cl.flags == [True, False]
+    in_climber = [i for i, (mode, ph) in enumerate(ctx.phases) if mode == 'stairs' and ph == 'climber']
+    assert in_climber
+    tiles = ctx.tiles
+    assert (1, 0) in tiles.stairs_crossed and (2, 0) in tiles.trail
+    assert modes_seen(m)[-1] == 'exploring'
+
+
+def test_climber_sends_no_cmd_vel_while_it_climbs():
+    ctx, m, d, ai, cl = build_climber(CROSS)
+    assert run_until(ctx, m, lambda: m.current.name == 'stairs' and m.current.phase == 'climber', n=100)
+    k = len(d.cmds)
+    for _ in range(8):
+        ctx.t += 1.0
+        m.tick()
+    assert all(c == 'stop' for c in d.cmds[k:]), d.cmds[k:]
+
+
+def test_climber_abort_in_ai_mode_turns_ai_off_and_walls_it_off():
+    ctx, m, d, ai, cl = build_climber([('SEARCH', 1), ('ALIGN', 2), ('ENTER_AI', 2), ('CROSS_AI', 2), ('ABORT', 100)])
+    assert run_until(ctx, m, lambda: any(k == 'stairs_failed' for k, _ in ctx.events), n=200)
+    failed = next(dd for k, dd in ctx.events if k == 'stairs_failed')
+    assert failed['ai_was_on'] and failed['back_to'] == 'recovery'
+    assert [(on, code) for on, code, _ in ai] == [(False, AI_OFF)]
+    assert cl.enables == [True, False] and (1, 0) in ctx.tiles.stairs_crossed
+
+
+def test_climber_that_never_sees_the_stairs_gives_up_without_climbing():
+    ctx, m, d, ai, cl = build_climber([('SEARCH', 1000)], {'modes.stairs.climber_search_timeout_s': 6.0})
+    assert run_until(ctx, m, lambda: any(k == 'stairs_failed' for k, _ in ctx.events), n=200)
+    failed = next(dd for k, dd in ctx.events if k == 'stairs_failed')
+    assert not failed['ai_was_on'] and failed['back_to'] == 'exploring' and 'did not see' in failed['why']
+    assert ai == [] and (1, 0) not in ctx.tiles.stairs_crossed and (1, 0) in m.stairs_tried
+
+
+def test_climber_not_running_gives_up():
+    ctx, m, d, ai, cl = build_climber([])
+    assert run_until(ctx, m, lambda: any(k == 'stairs_failed' for k, _ in ctx.events), n=200)
+    failed = next(dd for k, dd in ctx.events if k == 'stairs_failed')
+    assert 'no state' in failed['why'] and not failed['ai_was_on'] and ai == []
+
+
+def test_leaving_mid_climber_disables_it_and_turns_ai_off():
+    ctx, m, d, ai, cl = build_climber([('ENTER_AI', 1), ('CROSS_AI', 1000)])
+    assert run_until(ctx, m, lambda: cl.state == 'CROSS_AI', n=100)
+    ok, _ = m.request('idle', 'operator command')
+    assert ok and cl.enables[-1] is False and cl.flags[-1] is False
+    assert [(on, code) for on, code, _ in ai] == [(False, AI_OFF)]

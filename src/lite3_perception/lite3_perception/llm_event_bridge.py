@@ -27,7 +27,14 @@ The onboard detector flagged: {label} (conf {confidence}), other objects in view
 Mission tasks: {mission}
 Look at the image and answer ONLY with JSON:
 {{"object": str, "agrees_with_detector": bool, "room_type": str|null,
-  "hazard_symbol": str|null, "is_survivor": bool, "confidence": 0-1, "notes": str}}"""
+  "hazard_symbol": str|null, "is_survivor": bool, "confidence": 0-1, "notes": str,
+  "medical_kit_visible": bool, "medical_kit_hint": str|null}}
+Medical kits are a priority. Look carefully for ANY first-aid / medical item even if small,
+partly hidden or not the flagged object: a box or bag with a red/green/white cross, a white or
+red case, bandages, pill bottles, medicine boxes. Set "medical_kit_visible" accordingly.
+If none is visible, use "medical_kit_hint" to say where in THIS scene one is most likely
+(e.g. "wall-mounted box left of the door", "shelf behind the counter", "next to the survivor"),
+otherwise null."""
 
 
 def query_llm(prompt: str, jpeg_b64: str, timeout_s: float) -> dict:
@@ -107,6 +114,9 @@ class LlmEventBridge(Node):
                 obj = answer.get("object")
                 answer["object"] = obj if obj in [l for l in g("object_labels") if l] else None
                 result["label"] = answer["object"] or ev["label"]
+            if answer:
+                result["medical_kit_visible"] = bool(answer.get("medical_kit_visible"))
+                result["medical_kit_hint"] = answer.get("medical_kit_hint")
             if answer:
                 result["accepted"] = bool(answer.get("agrees_with_detector")) or \
                     float(answer.get("confidence", 0)) >= float(g("min_accept_confidence"))

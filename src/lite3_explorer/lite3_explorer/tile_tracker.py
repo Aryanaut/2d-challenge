@@ -38,6 +38,7 @@ class TileTracker:
         self.init_info: Optional[dict] = None
         self.terrain: Dict[str, dict] = {}              # tile label -> what the terrain classifier said about it
         self._look_rugged = set()                      # tiles that were called non-flat during their current terrain look
+        self._look_elev: Dict[str, dict] = {}          # tile -> the highest elevation answer of its current terrain look
         self.start_wall = None                         # ((x, y), (x, y)): virtual wall behind the robot at the start
         self.tiles: Dict[tuple, dict] = {}
         self.trail: List[tuple] = []
@@ -166,6 +167,7 @@ class TileTracker:
     def begin_terrain_look(self, label: str):
         """The classifier is asked about this tile again: answers of this look are compared with each other only."""
         self._look_rugged.discard(label)
+        self._look_elev.pop(label, None)
 
     def set_terrain(self, label: str, result: dict) -> bool:
         """Store the terrain classifier's answer for a tile. True if the kind changed.
@@ -178,10 +180,33 @@ class TileTracker:
             return False
         if kind and kind != 'flat':
             self._look_rugged.add(label)
+        result = self._keep_highest_elevation(label, result)
         changed = self.terrain.get(label, {}).get('kind') != kind
         self.terrain[label] = result
         self.version += 1                      # republish the tile map
         return changed
+
+    _ELEV_KEYS = ('elevation_m', 'elevation_class', 'slope_deg', 'elevation_spread_m', 'elevation_points')
+
+    def _keep_highest_elevation(self, label: str, result: dict) -> dict:
+        """Within one look a lower elevation never replaces a higher one (same idea as flat vs not flat): on the approach the
+        robot's own floor and the body tilt move into the measured patch and the raised tile reads 'level' a moment after it
+        read 'higher', which switched the h-step gait off just before the step. A new look (begin_terrain_look) starts afresh."""
+        if 'elevation_m' not in result:
+            return result
+        best = self._look_elev.get(label)
+        if best is not None and best['elevation_m'] - result['elevation_m'] > 0.04:
+            return dict(result, **{k: best[k] for k in self._ELEV_KEYS if k in best})
+        self._look_elev[label] = {k: result[k] for k in self._ELEV_KEYS if k in result}
+        return result
+
+    def elevation(self, label: str) -> Optional[dict]:
+        """Elevation of a tile against the start-of-run ground reference ({elevation_m, elevation_class, slope_deg, ...}),
+        or None when the classifier's elevation option is off or has not measured that tile yet."""
+        res = self.terrain.get(label) or {}
+        if 'elevation_m' not in res:
+            return None
+        return {k: res[k] for k in ('elevation_m', 'elevation_class', 'slope_deg', 'elevation_spread_m') if k in res}
 
     def invalidate(self):
         self._classified_version = -1

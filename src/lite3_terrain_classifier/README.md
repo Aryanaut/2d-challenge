@@ -152,6 +152,31 @@ named (kind `unknown`), only not called slats. Colour rungs are the weak spot (s
 the view (rungs) only depth can confirm them, and that is not validated on a recording. Tune on runs that cross slats,
 uneven and flat tiles.
 
+## Elevation against a start-of-run ground reference (optional)
+
+`elevation.enabled: true` (or `elevation:=true` on the launch file) makes the classifier measure how high or low the floor
+is compared with the floor the robot started on. It is off by default.
+
+1. **Reference.** After start, the robot is assumed to stand on flat floor. For `elevation.calibrate_s` (2 s) the lidar floor
+   in front of it is collected in a fixed, gravity-aligned frame and one plane is fitted (`elevation.py`). A start floor that is
+   not flat (`max_rms_m`) or not level (`max_tilt_deg`) is refused and collected again. The result is on the latched
+   `~/ground_reference` topic. `~/recalibrate_ground` (Trigger) takes a new reference where the robot stands now.
+2. **Patch elevation.** The floor points of the patch the kind is computed from (the same patch `~/classify` starts) are
+   compared with the reference plane. The dominant floor level of the patch counts, so a wall or a step edge inside the area
+   does not move it.
+3. **Output.** `/terrain_kind` gets `elevation_m` (+ higher, - lower than the start floor), `elevation_class`
+   (`higher` / `lower` / `level` within `level_tolerance_m`, 4 cm), `slope_deg` (patch against the reference, for ramps),
+   `elevation_spread_m`, `elevation_points` and `elevation_ready` (false while there is no reference yet).
+
+`elevation.frame: odom` (default) is absolute and needs an odometry whose z is real; on a raised tile the robot's own height
+is part of odom, so the tile ahead is still measured against the start floor. With planar odometry (z always 0) use `gravity`:
+only the robot's pitch and roll are removed, so on a raised tile everything reads lower by that height. It needs the
+`odom -> base_link` TF and `kinds.enabled`. Not tested on the real robot: check `elevation_m` on flat floor (should be about 0) and
+in front of a block of known height first.
+
+The explorer's mission manager asks for the target tile, so the answer (elevation included) is stored on that tile: it is in the
+tile's terrain in `/tile_map` and `tiles.json`, logged, sent as an `elevation` event, and shown on the tile in RViz (`~/terrain_markers`, second line of its label, level tiles too).
+
 ## Build
 
 ```bash

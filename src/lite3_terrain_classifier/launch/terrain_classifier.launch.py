@@ -31,6 +31,10 @@ def _classifier(context):
             overrides[param] = lc(arg)
     if lc('trigger_mode'):
         overrides['trigger_mode'] = lc('trigger_mode').lower() == 'true'
+    if lc('elevation'):
+        overrides['elevation.enabled'] = lc('elevation').lower() == 'true'
+    if lc('elevation_frame'):
+        overrides['elevation.frame'] = lc('elevation_frame')
     if lc('use_depth'):
         overrides['use_depth'] = lc('use_depth').lower() == 'true'
     return [Node(package=PKG, executable='terrain_classifier', name='terrain_classifier',
@@ -50,6 +54,9 @@ def generate_launch_description():
         DeclareLaunchArgument('fusion_mode', default_value='',
                               description='lidar_primary | require_agreement | any_rugged'),
         DeclareLaunchArgument('base_frame', default_value=''),
+        DeclareLaunchArgument('elevation', default_value='',
+                              description='true/false, overrides elevation.enabled (elevation vs a start-of-run ground reference)'),
+        DeclareLaunchArgument('elevation_frame', default_value='', description='odom | gravity, overrides elevation.frame'),
         DeclareLaunchArgument('trigger_mode', default_value='',
                               description='true: classify only on service ~/classify; false: continuous'),
         # base_link -> lidar (only if nothing else publishes it)

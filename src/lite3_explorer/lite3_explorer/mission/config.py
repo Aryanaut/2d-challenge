@@ -26,6 +26,10 @@ DEFAULTS: Dict[str, Any] = {
     'use_ai': True,                       # AI tile descriptions via lite3_llm_tools/llm_client
     'terrain_classify_service': '/terrain_classifier/classify',   # asked for the tile being driven to ('' = never)
     'terrain_wait_s': 3.0,            # no terrain answer this long after asking = the floor of that tile cannot be seen
+    'step_up_gait': True,             # target tile higher than the current one (classifier elevation option): gait_switcher uses h-step
+    'prefer_flat_tiles': True,        # classifier elevation option on: go to the reachable tile with the least elevation change (up or down) from the current one
+    'flat_tile_tolerance_m': 0.03,    # ... elevation changes within this of the best count as equal (the strategy's ranking decides)
+    'step_up_min_rise_m': 0.04,       # ... when it is at least this much higher
     'llm_report_timeout_s': 180.0,
     'llm_report_retries': 5,
     'robot_length_m': 0.61,               # turn-room check (match the local costmap footprint)
@@ -268,6 +272,10 @@ DEFAULTS: Dict[str, Any] = {
             'stall_m': 0.05,              # climbing: less progress than this ...
             'stall_s': 10.0,              # ... in this long = stuck on the stairs
             'pose_lost_s': 3.0,           # no pose (SLAM lost on the stairs): keep walking straight this long, then stop
+            'climber': False,             # true: hand the climb to the stair_climber package (/stair_climber/enable, /state)
+            'climber_search_timeout_s': 15.0,   # stair_climber still searching: its lidar sees no stairs, give up (no climb)
+            'climber_timeout_s': 180.0,   # whole stair_climber run
+            'climber_lost_s': 5.0,        # no /stair_climber/state this long: not running, give up
         },
         'backtracking': {
             'type': 'backtracking',

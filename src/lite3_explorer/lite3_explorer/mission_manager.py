@@ -36,6 +36,8 @@ Interfaces
   pub  /cmd_vel                 geometry_msgs/Twist   direct velocity (curtain, stairs and mppi modes)
   pub  /simple_cmd              transfer_interfaces/MotionSimpleCMD   robot AI mode on / off (stairs mode)
   pub  /ai_mode                 std_msgs/Bool     (latched) true while AI mode is on: gait_switcher and stair_detector pause
+  pub  /stair_climber/enable    std_msgs/Bool     stairs mode with climber: true: hand the climb to stair_climber
+  sub  /stair_climber/state     std_msgs/String   ... and watch it (DONE = crossed, ABORT = failed)
   act  spin, compute_path_to_pose, navigate_to_pose, follow_waypoints   (Nav2 clients)
   srv  /global_costmap/clear_entirely_global_costmap, /local_costmap/clear_entirely_local_costmap  (recovery)
 """
@@ -234,6 +236,7 @@ class MissionManager(Node):
         flat = {name: p.value for name, p in self.get_parameters_by_prefix('').items()}
         self.cfg = cfg = merge_flat(DEFAULTS, flat)
         self.global_frame, self.robot_frame = cfg['global_frame'], cfg['robot_frame']
+        self.odom_frame = cfg.get('odom_frame', 'odom')
         self.t0 = time.monotonic()
 
         # run files + tile report
@@ -318,6 +321,9 @@ class MissionManager(Node):
         self.marker_pub = self.create_publisher(MarkerArray, '~/markers', latched)
         self.crawl_pub = self.create_publisher(Bool, '/spin_crawl', 10)
         self.flat_pub = self.create_publisher(Bool, '/spin_flat', 10)
+        self.step_up_pub = self.create_publisher(Bool, '/step_up', latched)      # h-step gait while driving to a higher tile
+        self._step_up = None
+        self._rise_target, self._rise_from, self._rise_max = None, 0.0, None
         self.complete_pub.publish(Bool(data=False))
 
         self.machine = ModeMachine(self, cfg)
@@ -342,6 +348,10 @@ class MissionManager(Node):
         self.create_subscription(String, '/stairs/points', self._on_stair_points, latched)
         self.ai_pub = self.create_publisher(Bool, '/ai_mode', latched)
         self.ai_pub.publish(Bool(data=False))
+        # stairs mode with climber: true: the stair_climber package does the alignment + AI crossing
+        self.climber_enable_pub = self.create_publisher(Bool, '/stair_climber/enable', 10)
+        self._climber_state = (None, 0.0)
+        self.create_subscription(String, '/stair_climber/state', self._on_climber_state, 10)
         self.simple_cmd_pub, self._simple_cmd_type = None, None
         try:
             from transfer_interfaces.msg import MotionSimpleCMD
@@ -368,15 +378,39 @@ class MissionManager(Node):
         else:
             logger.info(msg)
 
+    @staticmethod
+    def _yaw_of(q):
+        return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
     def pose(self):
+        """[x, y, yaw] of the robot in the global frame.
+
+        Composed from the NEWEST map->odom and the NEWEST odom->base_link, each looked up separately. A single
+        lookup_transform(map, base_link, Time()) returns the pose at the latest time the WHOLE chain has data for, i.e. the
+        stamp of map->odom, and SLAM publishes that late (up to several seconds under load in the bags): the pose then
+        froze for seconds and the omni recovery drove straight through its goal."""
+        odom_frame = getattr(self, 'odom_frame', 'odom')
+        try:
+            if odom_frame in (self.global_frame, self.robot_frame):
+                raise TransformException('no separate odom frame')
+            a = self.tf_buffer.lookup_transform(self.global_frame, odom_frame, Time(), timeout=Duration(seconds=0.1))
+            b = self.tf_buffer.lookup_transform(odom_frame, self.robot_frame, Time(), timeout=Duration(seconds=0.1))
+            ya, yb = self._yaw_of(a.transform.rotation), self._yaw_of(b.transform.rotation)
+            ca, sa = math.cos(ya), math.sin(ya)
+            bx, by = b.transform.translation.x, b.transform.translation.y
+            x = a.transform.translation.x + ca * bx - sa * by
+            y = a.transform.translation.y + sa * bx + ca * by
+            yaw = math.atan2(math.sin(ya + yb), math.cos(ya + yb))
+            return [round(x, 3), round(y, 3), round(yaw, 4)]
+        except TransformException:
+            pass
         try:
             t = self.tf_buffer.lookup_transform(self.global_frame, self.robot_frame, Time(),
                                                 timeout=Duration(seconds=0.1))
         except TransformException:
             return None
-        q = t.transform.rotation
-        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        return [round(t.transform.translation.x, 3), round(t.transform.translation.y, 3), round(yaw, 4)]
+        return [round(t.transform.translation.x, 3), round(t.transform.translation.y, 3),
+                round(self._yaw_of(t.transform.rotation), 4)]
 
     def local_map_ready(self, pose, radius_m=1.5, min_known=0.5):
         if self.tiles.map is None:
@@ -454,6 +488,26 @@ class MissionManager(Node):
             self.tiles.update()
             self.log('info', f'Staircase tile(s): {", ".join(T.tile_label(t) for t in sorted(self.tiles.stairs))}.')
             self.event('staircases', tiles=[T.tile_label(t) for t in sorted(self.tiles.stairs)])
+
+    def ai_flag(self, on):
+        """/ai_mode only (gait_switcher / stair_detector pause), no /simple_cmd: stair_climber sends the AI codes."""
+        self.ai_pub.publish(Bool(data=bool(on)))
+
+    def stair_climber_enable(self, on):
+        """Enable / disable the stair_climber node. Enabling sends false first, so it restarts from IDLE after an
+        earlier DONE / ABORT."""
+        if on:
+            self.climber_enable_pub.publish(Bool(data=False))
+            self._climber_state = (None, 0.0)          # ignore the state from before
+        self.climber_enable_pub.publish(Bool(data=bool(on)))
+
+    def _on_climber_state(self, msg):
+        self._climber_state = (msg.data, time.monotonic())
+
+    def stair_climber_state(self):
+        """(last /stair_climber/state or None, seconds since it arrived)."""
+        state, t = self._climber_state
+        return (state, time.monotonic() - t) if state is not None else (None, math.inf)
 
     def ai_mode(self, on, cmd_code):
         """Robot AI mode on / off: MotionSimpleCMD {cmd_code, type: 0} on /simple_cmd (what `ros2 topic pub --once
@@ -540,8 +594,36 @@ class MissionManager(Node):
         self.target = new
         self.intent_pub.publish(String(data=f'tile {label} at ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) '
                                              f'[{self.machine.current.name}]' if label else '(none)'))
+        self._update_step_up()
         if self.tiles.ready:
             self._publish_tile_markers()
+
+    def _update_step_up(self):
+        """/step_up is true while the robot drives to a target tile that is higher than the tile it started from. Both elevations
+        are absolute, against the ground plane fitted at the start of the run (terrain classifier elevation option; a start tile
+        with no measurement counts as the start floor, 0 m). The start elevation is taken once, when the target is set, and the
+        largest elevation measured for the target is kept, so neither the robot moving over the step edge nor a later low reading
+        of the raised tile switches the h-step gait off. It stays on until the target changes (the tile is reached, or given up)."""
+        on = False
+        if self.cfg.get('step_up_gait', True) and self.target and self.tiles.ready:
+            if self._rise_target != self.target[0]:
+                self._rise_target, self._rise_max = self.target[0], None
+                pose = self.pose()
+                here = self.tiles.elevation(T.tile_label(self.tiles.grid.tile_of(pose[0], pose[1]))) if pose is not None else None
+                self._rise_from = here['elevation_m'] if here else 0.0
+            goal = self.tiles.elevation(self.target[0])
+            if goal:
+                rise = goal['elevation_m'] - self._rise_from
+                self._rise_max = rise if self._rise_max is None else max(self._rise_max, rise)
+            on = self._rise_max is not None and self._rise_max >= float(self.cfg.get('step_up_min_rise_m', 0.04))
+        else:
+            self._rise_target, self._rise_max = None, None
+        if on != self._step_up:
+            self._step_up = on
+            self.step_up_pub.publish(Bool(data=on))
+            self.log('info', f'Target tile {self.target[0] if self.target else "-"}: '
+                             + (f'{self._rise_max:+.2f} m above the start tile: h-step gait.' if on else 'no step up: terrain gait.'))
+            self.event('step_up', on=on, tile=self.target[0] if self.target else None)
 
     def publish_goal(self, pose_stamped, profile):
         self.goal_pub.publish(pose_stamped)
@@ -796,12 +878,26 @@ class MissionManager(Node):
                                    f'rough {result.get("rough_fraction")}), but this look already found it {kept.upper()}: keeping that.')
             self.event('terrain_kept', tile=label, kept=kept, ignored='flat')
             return
+        before = self.tiles.elevation(label)
         if self.tiles.set_terrain(label, result):
             self.get_logger().info(f'Tile {label}: terrain {result["kind"].upper()} '
                                    f'(spread {result.get("spread_median_m")} m, cells {result.get("n_cells")}).')
             self.event('terrain', tile=label, terrain=result['kind'], info={k: v for k, v in result.items()
                                                                           if k not in ('marker', 'kind')})
+        self._report_elevation(label, before, self.tiles.elevation(label))
+        self._update_step_up()
         self._publish_terrain_markers()
+
+    def _report_elevation(self, label, before, now):
+        """The classifier's elevation of tile `label` (the tile the robot chose to go to) against the ground reference taken at
+        the start of the run (classifier option elevation.enabled). Logged and sent as an event when it appears or changes."""
+        if not now or (before and before.get('elevation_class') == now.get('elevation_class')
+                       and abs(before['elevation_m'] - now['elevation_m']) < 0.02):
+            return
+        rel = 'level with' if now['elevation_class'] == 'level' else f'{now["elevation_class"]} than'
+        self.get_logger().info(f'Tile {label}: elevation {now["elevation_m"]:+.2f} m ({rel} the start floor), '
+                               f'slope {now.get("slope_deg")} deg.')
+        self.event('elevation', tile=label, **now)
 
     def _on_tile_reached(self, tile, pose, source):
         label = T.tile_label(tile)
@@ -943,6 +1039,9 @@ class MissionManager(Node):
             m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, a
             markers.append(m)
             text = (res['marker']).get('label')
+            elevation = self.tiles.elevation(label)
+            if elevation:                                  # second line: elevation against the start floor, level tiles too
+                text = f'{text or str(res.get("kind", "")).upper()}\n{elevation["elevation_m"]:+.2f} m'
             if text:
                 t = Marker()
                 t.header.frame_id, t.header.stamp, t.ns, t.action = self.global_frame, stamp, 'terrain', Marker.ADD

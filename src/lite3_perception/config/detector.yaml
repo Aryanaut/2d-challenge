@@ -19,7 +19,7 @@ object_detector:
     device: "cpu"
     imgsz: 640                                    # must match the export size (only used by the OpenCV fallback)
     conf_threshold: 0.35
-    class_conf_overrides: '{"survivor": 0.35, "hand_tools": 0.30}'
+    class_conf_overrides: '{"survivor": 0.35, "hand_tools": 0.30, "medical_kit": 0.20}'   # lower = more sensitive
     ignore_classes: ["cart", "market_stall", "tool_bench"]   # context only, never reported as a label
 
     # anything detected as these labels is reported as "survivor"
@@ -38,6 +38,7 @@ object_detector:
     detect_hz: 3.0
     confirm_hits: 3
     confirm_window_s: 2.0
+    class_confirm_overrides: '{"medical_kit": 2}'  # medical kits confirmed after 2 frames instead of 3
     dedup_radius_m: 1.0
     dedup_cooldown_s: 20.0
     max_range_m: 4.0

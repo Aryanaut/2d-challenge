@@ -105,6 +105,7 @@ class ObjectDetectorNode(Node):
         # --- trigger logic
         p("detect_hz", 3.0)
         p("confirm_hits", 3)                                   # need >= N hits ...
+        p("class_confirm_overrides", '{"medical_kit": 2}')     # per-label N (lower = more sensitive)
         p("confirm_window_s", 2.0)                             # ... within this window
         p("dedup_radius_m", 1.0)                               # same label within this distance = same object
         p("dedup_cooldown_s", 20.0)                            # used when no map position is available
@@ -119,6 +120,7 @@ class ObjectDetectorNode(Node):
         self.class_conf = json.loads(g("class_conf_overrides"))
         self.ignore = set(g("ignore_classes"))
         self.confirm_hits = int(g("confirm_hits"))
+        self.class_confirm = {k: int(v) for k, v in json.loads(g("class_confirm_overrides")).items()}
         self.confirm_window = float(g("confirm_window_s"))
         self.dedup_r = float(g("dedup_radius_m"))
         self.dedup_cooldown = float(g("dedup_cooldown_s"))
@@ -256,7 +258,7 @@ class ObjectDetectorNode(Node):
             lst = [h for h in self.hits.get(hkey, []) if now - h[0] < self.confirm_window]
             lst.append((now, d))
             self.hits[hkey] = lst
-            if len(lst) < self.confirm_hits:
+            if len(lst) < self.class_confirm.get(key, self.confirm_hits):
                 continue
 
             loc = self.localise(d, img.shape, header)

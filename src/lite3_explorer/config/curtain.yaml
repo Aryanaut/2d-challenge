@@ -18,3 +18,13 @@ curtain_detector:
     min_columns: 0.30           # fraction of the image width that must show the curtain
     cell_m: 0.05
     confirm_hits: 3             # a spot of curtain counts after this many sightings
+    # 3D lidar pointcloud (no depth camera needed): the standard walls are 0.5-0.6 m tall, a curtain returns only floor-level
+    # points (its hem) with the tall wall seen further on. Works when the camera sits too close / too low to see the bar.
+    use_lidar: true
+    cloud_topic: /livox/points
+    lidar_hz: 2.0               # pointclouds processed per second
+    lidar_cell_m: 0.05
+    lidar_low_max_m: 0.20       # returns up to this height are "floor level"
+    lidar_high_min_m: 0.30      # returns from this height are "wall height"
+    lidar_min_low: 20           # floor-level returns a cell needs (summed over scans)
+    lidar_min_high_behind: 10   # wall-height returns needed beyond the cell, along the robot's view

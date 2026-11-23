@@ -2,6 +2,8 @@
 
   sub  /camera/depth/image_raw      depth image (16UC1 millimetres or 32FC1 metres)
   sub  /camera/depth/camera_info    intrinsics (else depth_hfov_deg is used)
+  sub  <cloud_topic>                3D lidar pointcloud (default /livox/points; use_lidar): a curtain edge returns only floor-level
+                                    points while a standard wall (0.5-0.6 m) returns them up to its top (curtain_core.LidarCurtainMap)
   pub  /curtain/points   std_msgs/String   JSON {"points": [[x, y, ux, uy], ...]} in the map frame (latched): confirmed
                                            curtain spots and the unit direction the camera was looking at each
   pub  /curtain/markers  MarkerArray       the remembered curtain, for RViz
@@ -20,7 +22,8 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image
+import sensor_msgs_py.point_cloud2 as pc2
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
@@ -50,7 +53,18 @@ class CurtainDetector(Node):
             max_step_m=float(p('max_step_m', 0.03).value), min_jump_m=float(p('min_jump_m', 0.25).value),
             min_range_m=float(p('min_range_m', 0.30).value), max_range_m=float(p('max_range_m', 3.5).value),
             min_columns=float(p('min_columns', 0.30).value))
+        self.top_height_m = float(p('curtain_top_height_m', 1.0).value)    # a wall whose top is this high is a curtain; 0 = off
+        self.top_tol_m = float(p('curtain_top_tol_m', 0.15).value)
+        self.floor_z = float(p('floor_z', 0.0).value)                     # map-frame z of the floor
         self.curtain = cc.CurtainMap(cell_m=float(p('cell_m', 0.05).value), confirm_hits=int(p('confirm_hits', 3).value))
+        self.use_lidar = bool(p('use_lidar', True).value)
+        self.cloud_topic = p('cloud_topic', '/livox/points').value
+        self.lidar_hz = float(p('lidar_hz', 2.0).value)
+        self.lidar_last = 0.0
+        self.lidar = cc.LidarCurtainMap(
+            cell_m=float(p('lidar_cell_m', 0.05).value), low_max_m=float(p('lidar_low_max_m', 0.20).value),
+            high_min_m=float(p('lidar_high_min_m', 0.30).value), min_low=int(p('lidar_min_low', 20).value),
+            min_high_behind=int(p('lidar_min_high_behind', 10).value), floor_z=self.floor_z)
         self.tf = Buffer()
         self.tf_listener = TransformListener(self.tf, self)
         self.intrinsics = None
@@ -61,6 +75,8 @@ class CurtainDetector(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.points_pub = self.create_publisher(String, '/curtain/points', latched)
         self.marker_pub = self.create_publisher(MarkerArray, '/curtain/markers', latched)
+        if self.use_lidar:
+            self.create_subscription(PointCloud2, self.cloud_topic, self._on_cloud, qos_profile_sensor_data)
         self.create_timer(1.0, self._publish)
         self.get_logger().info(f'curtain detector on {self.depth_topic} at {self.rate_hz:g} Hz')
 
@@ -80,7 +96,8 @@ class CurtainDetector(Node):
         else:
             return
         det = cc.detect_curtain(depth, self.params)
-        if det is None:
+        top = cc.detect_wall_top(depth, self.params) if self.top_height_m > 0 else None
+        if det is None and top is None:
             return
         fx = fy = (msg.width / 2) / math.tan(self.hfov / 2)
         k = self.intrinsics or (fx, fy, msg.width / 2, msg.height / 2)
@@ -90,24 +107,59 @@ class CurtainDetector(Node):
             self.get_logger().warn(f'no TF {self.global_frame} <- {msg.header.frame_id}: {e}', throttle_duration_sec=5.0)
             return
         tr = t.transform.translation
-        pts = cc.project_to_map(det, k, quat_to_matrix(t.transform.rotation), (tr.x, tr.y, tr.z))
-        if self.curtain.add(pts, (tr.x, tr.y)):
+        rot = quat_to_matrix(t.transform.rotation)
+        if det is not None:
+            pts = cc.project_to_map(det, k, rot, (tr.x, tr.y, tr.z))
+            if self.curtain.add(pts, (tr.x, tr.y)):
+                self.version += 1
+                self.get_logger().info(f'curtain seen: {len(self.curtain)} spots, {len(det.columns)} columns now, '
+                                       f'{float(np.median(det.ranges)):.2f} m ahead')
+        if top is not None:
+            # a wall whose top edge is ~1 m above the floor is a curtain (curtains hang from a bar at that height)
+            p3 = cc.project_to_map_3d(top, k, rot, (tr.x, tr.y, tr.z))
+            z = p3[:, 2] - self.floor_z
+            ok = np.abs(z - self.top_height_m) <= self.top_tol_m
+            if ok.sum() >= self.params.min_columns * max(1, len(top.columns)) and self.curtain.add(p3[ok, :2], (tr.x, tr.y)):
+                self.version += 1
+                self.get_logger().info(f'curtain seen (wall top at {float(np.median(z[ok])):.2f} m): {len(self.curtain)} spots')
+
+    def _on_cloud(self, msg):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self.lidar_last < 1.0 / self.lidar_hz:
+            return
+        self.lidar_last = now
+        try:
+            t = self.tf.lookup_transform(self.global_frame, msg.header.frame_id, Time(), Duration(seconds=0.2))
+        except Exception as e:  # noqa: BLE001 - TF not ready yet
+            self.get_logger().warn(f'no TF {self.global_frame} <- {msg.header.frame_id}: {e}', throttle_duration_sec=5.0)
+            return
+        r = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+        pts = np.stack([r['x'], r['y'], r['z']], axis=1).astype(float)
+        tr = t.transform.translation
+        pts = pts @ quat_to_matrix(t.transform.rotation).T + np.array([tr.x, tr.y, tr.z])
+        before = len(self.lidar)
+        self.lidar.add(pts, (tr.x, tr.y))
+        if len(self.lidar) != before:
             self.version += 1
-            self.get_logger().info(f'curtain seen: {len(self.curtain)} spots, {len(det.columns)} columns now, '
-                                   f'{float(np.median(det.ranges)):.2f} m ahead')
+            self.get_logger().info(f'curtain seen by the lidar (floor-level returns, no wall height): '
+                                   f'{len(self.lidar)} spots')
+
+    def _all_points(self):
+        return np.vstack([self.curtain.confirmed(), self.lidar.confirmed()]) if self.use_lidar else self.curtain.confirmed()
 
     def _publish(self):
         if self.version == self.sent_version:
             return
         self.sent_version = self.version
-        pts = self.curtain.confirmed()
-        self.points_pub.publish(String(data=json.dumps(self.curtain.to_json())))
+        pts = self._all_points()
+        self.points_pub.publish(String(data=json.dumps({'points': [[round(float(v), 3) for v in r] for r in pts]})))
         m = Marker()
         m.header.frame_id = self.global_frame
-        m.ns, m.id, m.type, m.action = 'curtain', 0, Marker.POINTS, Marker.ADD
-        m.scale.x = m.scale.y = 0.08
-        m.color.r, m.color.g, m.color.b, m.color.a = 0.9, 0.2, 0.9, 1.0
-        m.points = [Point(x=float(x), y=float(y), z=0.05) for x, y, _, _ in pts]
+        m.ns, m.id, m.type, m.action = 'curtain', 0, Marker.CUBE_LIST, Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x, m.scale.y, m.scale.z = 0.06, 0.06, 0.6          # a curtain-high strip of magenta per confirmed spot
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.9, 0.2, 0.9, 0.6
+        m.points = [Point(x=float(x), y=float(y), z=0.3) for x, y, _, _ in pts]
         self.marker_pub.publish(MarkerArray(markers=[m]))
 
 

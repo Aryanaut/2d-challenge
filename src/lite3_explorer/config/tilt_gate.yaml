@@ -10,3 +10,8 @@ tilt_gate:
     max_tilt_deg: 6.0               # drop scans when either IMU's gravity is this far from its reference
     hold_s: 1.0                     # keep dropping this long after the tilt is back under the limit
     filter_alpha: 0.2               # low-pass on the gravity vector (gait vibration)
+    keepalive_hz: 20.0              # while scans are dropped, republish slam_toolbox's last map->odom at this rate (0 = off) so Nav2 does not
+                                    # fail with "extrapolation into the future" on odom->map; stamped keepalive_lead_s ahead of now
+    keepalive_lead_s: 0.3
+    map_frame: map
+    odom_frame: odom

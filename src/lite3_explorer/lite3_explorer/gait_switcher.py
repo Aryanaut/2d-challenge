@@ -1,11 +1,13 @@
 """Switch the Lite3 gait from the terrain classifier.
 
-  /terrain_type rugged     -> rug_general  (0x21010401, same as lite3_rug_general)
+  /terrain_type rugged     -> rug_hstep    (0x21010407)
   /terrain_type non_rugged -> flat_medium  (0x21010307, same as lite3_flat_medium)
 
 Subscribes /terrain_type (std_msgs/String, latched) and publishes a
 transfer_interfaces/MotionSimpleCMD {cmd_code, type: 0} on /simple_cmd, the same
 message the lite3_<gait> shell aliases send with `ros2 topic pub --once`.
+/step_up (Bool, from the mission manager): true while the robot drives to a tile that is higher than the one it stands on
+(terrain classifier elevation option): the step_up_gait (rug_hstep) is used instead of the terrain gait.
 Switching rules (flat delay, minimum interval) live in terrain_gait.py. The gait only changes when the robot starts
 for a new tile (/mission_manager/next_target names a tile) or when a new terrain is classified (/terrain_type changes);
 a finished spin / animation brings the terrain gait back. While the robot is in AI mode (/ai_mode true: the mission
@@ -26,7 +28,7 @@ class GaitSwitcher(Node):
         p = lambda name, default: self.declare_parameter(name, default).value  # noqa: E731
         self.switcher = TerrainGaitSwitcher(
             flat_gait=p('flat_gait', 'flat_medium'),
-            rugged_gait=p('rugged_gait', 'rug_general'),
+            rugged_gait=p('rugged_gait', 'rug_hstep'),
             flat_delay_s=p('flat_delay_s', 2.0),
             min_switch_interval_s=p('min_switch_interval_s', 1.0))
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -47,6 +49,8 @@ class GaitSwitcher(Node):
         self._burst = None                                # (MotionSimpleCMD, publishes left)
         # the robot is attempting a new tile: a gait switch is allowed
         self.create_subscription(String, p('target_topic', '/mission_manager/next_target'), self._on_target, latched)
+        self.step_up_gait = p('step_up_gait', 'rug_hstep')
+        self.create_subscription(Bool, p('step_up_topic', '/step_up'), self._on_step_up, latched)
         self.create_subscription(Bool, '/spin_crawl', self._on_crawl_hold, 10)
         self.create_subscription(Bool, '/spin_flat', self._on_flat_request, 10)
         self.animating = False                            # no gait commands while a robot animation runs
@@ -71,6 +75,10 @@ class GaitSwitcher(Node):
         if msg.data.startswith('tile '):          # '(none)' = no target
             self.switcher.arm()
 
+    def _on_step_up(self, msg):
+        if self.switcher.set_override(self.step_up_gait if msg.data else None):
+            self.get_logger().info(f'higher tile ahead: {"h-step gait" if msg.data else "terrain gait again"}')
+
     def _send(self, cmd, now):
         out = MotionSimpleCMD()
         out.cmd_code, out.type = cmd.cmd_code, 0
@@ -79,6 +87,7 @@ class GaitSwitcher(Node):
         self.switcher.mark_sent(cmd, now)
         self.get_logger().info(f'gait -> {cmd.gait} (0x{cmd.cmd_code:08X})')
         self._publish_gait('crawl hold: spinning' if self.crawl_hold else 'animation' if self.animating
+                           else f'step up {self.step_up_gait}' if self.switcher.override
                            else f'terrain {self.switcher.terrain}')
 
     def _on_crawl_hold(self, msg):

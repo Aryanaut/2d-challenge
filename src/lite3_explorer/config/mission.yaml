@@ -198,7 +198,7 @@ mission_manager:
         type: scene
         next_mode: exploring
         rest_s: 1.5                          # stand still first (a scan spin just before is still coasting)
-        center_tol_m: 0.06                   # then drive (vx / vy, heading held) to within this of the current tile's centre ...
+        center_tol_m: 0.10                   # then drive (vx / vy, heading held) to within this of the current tile's centre ...
         center_timeout_s: 15.0               # (not there by then: face it from where it is) ...
         commit_deg: 150.0                    # ... and only then turn to face the scene tile; target further round than this: keep the turn's direction
         align_tol_deg: 6.0
@@ -224,7 +224,10 @@ mission_manager:
       curtain:
         type: curtain                        # a curtain along the current tile's edge: go to the tile centre, square up, walk through with vx, go back to exploring
         next_mode: exploring                 # through it (backtracking: back to backtracking); given up: back to the mode that was running before
-        center_tol_m: 0.06                   # first drive (vx / vy) to within this of the centre of the tile in front of the curtain
+        center_tol_m: 0.40                  # first drive (turn, then vx / wz: no vy) to within this of the centre of the tile in front of the curtain
+        center_drift_m: 0.04                 # centring ends when within 2x the tolerance and this much farther than the closest it got
+        center_turn_deg: 30.0                # centring: turn in place while the centre is more than this off the heading
+        center_heading_gain: 1.5             # centring: wz per rad of bearing error while driving
         center_speed_mps: 0.15
         center_min_speed_mps: 0.05
         center_gain: 1.0
@@ -236,6 +239,7 @@ mission_manager:
         max_attempts: 3                      # tries (back to the centre, square up, walk) before giving up
         speed_mps: 0.25                      # forward speed (vx) through the curtain
         align_tol_deg: 5.0                   # square to the edge within this before walking
+        align_cross_deg: 30.0                # ... or when the heading swept through the target (error changed sign) within this
         align_timeout_s: 15.0
         min_turn_rad_s: 0.2
         max_turn_rad_s: 0.6
@@ -250,7 +254,7 @@ mission_manager:
         ai_on_code: "0x21010528"             # /simple_cmd MotionSimpleCMD {cmd_code, type: 0}: enter AI mode
         ai_off_code: "0x2101052B"            # ... leave AI mode
         ai_settle_s: 2.0                     # stand still this long after each AI mode command
-        center_tol_m: 0.06                   # first drive (vx / vy) to within this of the centre of the tile in front of the staircase
+        center_tol_m: 0.10                   # first drive (vx / vy) to within this of the centre of the tile in front of the staircase
         center_timeout_s: 15.0
         align_tol_deg: 5.0                   # square up to the staircase's side within this before AI mode goes on
         align_timeout_s: 15.0                # could not square up: give up (AI mode never turned on), back to exploring
@@ -263,6 +267,13 @@ mission_manager:
         stall_m: 0.05                        # climbing: less progress than this ...
         stall_s: 10.0                        # ... in this long = stuck on the stairs
         pose_lost_s: 3.0                     # no pose on the stairs: keep walking straight this long, then stop
+        # climber: true = after centre + align, hand the climb to the stair_climber package (its own lidar alignment on
+        # the real steps, AI on, IMU-based crossing, AI off, RUG gait) and wait for /stair_climber/state DONE / ABORT.
+        # The stair_climber node must be running (autostart: false). speed_mps / stall_* / cross_timeout_s are then unused.
+        climber: true
+        climber_search_timeout_s: 15.0       # still searching after this long: the lidar does not see stairs, give up (no climb)
+        climber_timeout_s: 180.0             # whole climb, alignment included
+        climber_lost_s: 5.0                  # no /stair_climber/state for this long: the node is not running, give up
       backtracking:                          # no target left: back to the last split tile, on to its untravelled tile, then exploring
         type: backtracking
         traversal: route                     # FollowWaypoints through the tile centres of the way back (a nav2_route profile)

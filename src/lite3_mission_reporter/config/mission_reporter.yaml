@@ -1,6 +1,6 @@
 mission_reporter:
   ros__parameters:
-    group_id: "group01_A7K2"          # YOUR group id, copied exactly from the organisers
+    group_id: "group01_s3xy"          # YOUR group id, copied exactly from the organisers
 
     # Mission tasks, as parallel lists (same index = same task). Fill these in on the day.
     #   task_types : object | hazard | survivor | qr
@@ -21,3 +21,8 @@ mission_reporter:
     report_each_task_once: true       # a task is answered by its first matching event, then closed
     output_dir: "~/lite3_mission_results"   # results.jsonl + results.json are written here
     republish_hz: 0.0                 # >0 = re-send all results periodically (late subscribers)
+
+    # Send each result to the organisers' server as well (JSON POST). "" = off (topic + file only).
+    # e.g. "http://<server-ip>:8001/task_report" - use the address the organisers give you.
+    server_url: " "
+    server_timeout_s: 5.0

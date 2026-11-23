@@ -14,6 +14,9 @@ Output: /terrain_type (std_msgs/String, latched): "rugged", "non_rugged" or "unk
 /terrain_kind (JSON, latched): the terrain KIND of the floor around the robot (flat / uneven / slats / ...) from the
 configurable strategies in terrain_kinds.py (config/terrain_kinds.yaml). It knows nothing about tiles: whoever calls
 ~/classify (the explorer, when it looks at a tile) matches the answer to the place it was looking at via "seq".
+Optional (elevation.enabled): a ground reference plane is fitted from the lidar floor while the robot is assumed to stand
+on flat floor at the start; /terrain_kind then also carries elevation_m (+ higher / - lower than that floor),
+elevation_class (higher / lower / level) and slope_deg of the patch (elevation.py).
 Details for tuning: ~/details (JSON string), ~/lidar_points and ~/depth_points
 (PointCloud2, intensity = height above the fitted ground plane in metres).
 
@@ -41,6 +44,7 @@ from std_msgs.msg import Header, String
 from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
+from lite3_terrain_classifier import elevation as elev
 from lite3_terrain_classifier import terrain_core as tc
 from lite3_terrain_classifier.terrain_kinds import KindClassifier
 from lite3_terrain_classifier import slat_lines
@@ -107,6 +111,16 @@ class TerrainClassifier(Node):
         self.color_max_age_s = p('color.max_age_s', 1.0)
         self.color_msg, self.color_recv_s, self.color_seen = None, None, None
 
+        # ---- elevation against a ground reference taken at the start (optional) ----
+        self.elev_enabled = p('elevation.enabled', False)
+        self.elev_frame = p('elevation.frame', 'odom')           # odom: absolute | gravity: rotation only (see elevation.py)
+        if self.elev_frame not in ('odom', 'gravity'):
+            raise ValueError("elevation.frame must be 'odom' or 'gravity'")
+        elev_cfg = {k: type(v)(p(f'elevation.{k}', v)) for k, v in elev.DEFAULTS.items()}
+        self.elev_ref = elev.GroundReference(elev_cfg)
+        self.elev_est = elev.ElevationEstimator(self.elev_ref, elev_cfg)
+        self.elev_issue = ''
+
         # ---- state ----
         self.rng = np.random.default_rng(0)
         self.clouds = deque()           # (recv_s, frame, points)
@@ -126,6 +140,7 @@ class TerrainClassifier(Node):
         self.details_pub = self.create_publisher(String, '~/details', 10)
         self.kind_pub = self.create_publisher(String, '/terrain_kind', latched)
         # debug: what the Hough line detection sees (only computed while someone subscribes)
+        self.ground_pub = self.create_publisher(String, '~/ground_reference', latched)
         self.slats_depth_pub = self.create_publisher(Image, '~/slats_depth_debug', 2)
         self.slats_color_pub = self.create_publisher(Image, '~/slats_color_debug', 2)
         self.slats_json_pub = self.create_publisher(String, '~/slats_detections', 10)
@@ -143,6 +158,7 @@ class TerrainClassifier(Node):
             self.create_subscription(CameraInfo, self.info_topic, self._on_info, qos_profile_sensor_data)
         self.create_service(SetBool, '~/set_enabled', self._on_set_enabled)
         self.create_service(Trigger, '~/classify', self._on_classify)
+        self.create_service(Trigger, '~/recalibrate_ground', self._on_recalibrate)
         self.create_timer(1.0 / max(rate_hz, 0.1), self._tick)
 
         # terrain kinds (strategies): which kind of floor is this? independent of any tile grid
@@ -212,6 +228,7 @@ class TerrainClassifier(Node):
     def _new_patch(self):
         """Start collecting a new patch of floor for the terrain kind."""
         self.kinds.reset()
+        self.elev_est.reset()
         self.kinds_seq += 1
         self.kinds_started_s = self._now_s()
         self.kind_last = None
@@ -224,6 +241,19 @@ class TerrainClassifier(Node):
         else:
             response.message = 'continuous mode: already classifying'
         response.success = True
+        return response
+
+    def _on_recalibrate(self, request, response):
+        """Take a new ground reference NOW: the robot must stand on the floor that is to count as elevation 0."""
+        if not self.elev_enabled:
+            response.success, response.message = False, 'elevation.enabled is false'
+            return response
+        self.elev_ref.reset()
+        self.elev_est.reset()
+        self.elev_issue = ''
+        response.success = True
+        response.message = f'collecting a new ground reference for {self.elev_ref.cfg["calibrate_s"]:g} s'
+        self.get_logger().info(response.message)
         return response
 
     def _on_color_compressed(self, msg):
@@ -249,7 +279,8 @@ class TerrainClassifier(Node):
     def _on_cloud(self, msg):
         if not self.enabled:
             return
-        if self.trigger_mode and (self.active_until_s is None or self._now_s() > self.active_until_s + 0.5):
+        if self.trigger_mode and (self.active_until_s is None or self._now_s() > self.active_until_s + 0.5) \
+                and not self._calibrating():
             return                       # idle: do not even convert the cloud
         recv_s = self._now_s()
         try:
@@ -354,6 +385,8 @@ class TerrainClassifier(Node):
         if not self.enabled:
             return
         now_s = self._now_s()
+        if self._calibrating():
+            self._calibrate_ground(now_s)
         if self.trigger_mode and (self.active_until_s is None or now_s > self.active_until_s):
             return                       # idle: the last label stays latched on the terrain topic
         lidar, lidar_dbg = self._assess_lidar(now_s)
@@ -402,8 +435,13 @@ class TerrainClassifier(Node):
                 fixed = tc.transform_points(used, *to_odom)[:, :2]
             self.kinds.add(used[:, :2], res, fixed)
         self._feed_images(now_s)
+        self._add_elevation(lidar_dbg)
         result = self.kinds.classify()
-        key = (result['kind'], result.get('n_cells', 0) // 25)       # republish as the evidence grows
+        if self.elev_enabled:
+            result.update(self.elev_est.estimate())
+            result['elevation_ready'] = self.elev_ref.ready
+        key = (result['kind'], result.get('n_cells', 0) // 25,       # republish as the evidence grows
+               round(result.get('elevation_m', 0.0) / 0.02), result.get('elevation_class'))
         if key != self.kind_last:
             self.kind_last = key
             if result['kind'] != 'unknown':
@@ -442,6 +480,53 @@ class TerrainClassifier(Node):
                                 self.color_msg.header)
             except ValueError as exc:
                 self.get_logger().warn(f'colour image for slats: {exc}', throttle_duration_sec=10.0)
+
+    # ------------------------------------------------------------------ elevation
+    def _calibrating(self):
+        return self.elev_enabled and self.enabled and not self.elev_ref.ready
+
+    def _to_fixed(self, base_points):
+        """base_link points -> the frame the elevation is measured in (z up), or None while there is no odom TF."""
+        if not self.odom_frame or len(base_points) == 0:
+            return None
+        to_odom = self._lookup(self.odom_frame, self.base_frame)
+        if to_odom is None:
+            return None
+        rot, trans = to_odom
+        return tc.transform_points(base_points, rot, trans if self.elev_frame == 'odom' else np.zeros(3))
+
+    def _calibrate_ground(self, now_s):
+        """At the start (robot assumed flat on level floor): collect the lidar floor for calibrate_s, fit the reference."""
+        pts, issue = self._lidar_points(now_s)
+        fixed = self._to_fixed(pts) if pts is not None else None
+        if fixed is None:
+            self.elev_issue = issue or (f'no lidar points in the area' if pts is not None and len(pts) == 0
+                                        else f'no TF {self.odom_frame} <- {self.base_frame}')
+            self.elev_ref.started_s = None                  # the timer runs only while points come in
+            self.get_logger().warn(f'Ground reference waiting: {self.elev_issue}', throttle_duration_sec=5.0)
+            return
+        self.elev_ref.add(fixed, now_s)
+        outcome = self.elev_ref.finish(now_s)
+        if outcome is True:
+            self.elev_issue = ''
+            info = dict(self.elev_ref.info, frame=self.elev_frame, odom_frame=self.odom_frame)
+            self.ground_pub.publish(String(data=json.dumps(info)))
+            self.get_logger().info(f'Ground reference taken ({self.elev_frame} frame): {info}')
+        elif outcome:
+            self.elev_issue = outcome
+            self.get_logger().warn(f'Ground reference refused: {outcome}; collecting again.')
+
+    def _add_elevation(self, lidar_dbg):
+        """Feed this assessment's floor points (not walls / objects) to the elevation estimator."""
+        if not (self.elev_enabled and self.elev_ref.ready and lidar_dbg is not None):
+            return
+        _frame, used, res = lidar_dbg
+        if len(used) == 0:
+            return
+        floor = used[(res > -0.15) & (res < 0.25)]
+        fixed = self._to_fixed(floor)
+        if fixed is not None:
+            self.elev_est.add(fixed)
 
     def _publish_label(self, label):
         self.terrain_pub.publish(String(data=label))

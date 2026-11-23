@@ -13,6 +13,8 @@ Rules:
   * EVENT-DRIVEN: the gait is only changed after arm() (the robot starts for a new tile, or a hold such as the spin
     ended and the terrain gait must come back) or when the terrain label changes (a new terrain was classified).
     Between those events the gait is left alone, whatever the label says.
+  * OVERRIDE (set_override): a gait that wins over the terrain, e.g. rug_hstep while the robot drives onto a higher tile.
+    Setting or clearing it arms a switch; cleared, the terrain decides again.
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -44,7 +46,7 @@ class GaitCommand:
 
 
 class TerrainGaitSwitcher:
-    def __init__(self, flat_gait: str = 'flat_slow', rugged_gait: str = 'rug_general',
+    def __init__(self, flat_gait: str = 'flat_slow', rugged_gait: str = 'rug_hstep',
                  flat_delay_s: float = 2.0, min_switch_interval_s: float = 1.0):
         for gait in (flat_gait, rugged_gait):
             if gait not in GAIT_CODES:
@@ -58,6 +60,16 @@ class TerrainGaitSwitcher:
         self.gait: Optional[str] = None          # last gait sent (None = nothing sent yet)
         self.last_sent_at: Optional[float] = None
         self.armed = False                       # a switch is allowed (see the module docstring)
+        self.override: Optional[str] = None      # gait that wins over the terrain (None = the terrain decides)
+
+    def set_override(self, gait: Optional[str]) -> bool:
+        """Force `gait` (None = back to the terrain gait). True when it changed."""
+        if gait is not None and gait not in GAIT_CODES:
+            raise ValueError(f'unknown gait {gait!r}; use one of {sorted(GAIT_CODES)}')
+        if gait == self.override:
+            return False
+        self.override, self.armed = gait, True
+        return True
 
     def arm(self):
         """Allow the next switch: the robot is attempting a new tile."""
@@ -78,6 +90,8 @@ class TerrainGaitSwitcher:
 
     def desired_gait(self, now: float) -> Optional[str]:
         """Gait the robot should be in now, or None to keep whatever it has."""
+        if self.override is not None:
+            return self.override
         if self.terrain == RUGGED:
             return self.rugged_gait
         if self.terrain == FLAT:

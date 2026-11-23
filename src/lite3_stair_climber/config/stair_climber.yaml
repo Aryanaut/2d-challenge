@@ -1,0 +1,143 @@
+# stair_climber parameters
+# NOTE: write floats WITH a decimal point (0.0 not 0) or ROS will reject them.
+# Values marked  # MEASURE  need to be checked at the practice arena.
+
+stair_climber:
+  ros__parameters:
+    # ---------------- topics ----------------
+    cloud_topic: /livox/points      # confirmed on robot (group1, 11 Nov). Alt: /camera/depth/points
+    imu_topic: /imu/data
+    odom_topic: /leg_odom2
+    cmd_vel_topic: /cmd_vel
+    simple_cmd_topic: /simple_cmd
+    base_frame: base_link
+
+    # ---------------- lidar pose ----------------
+    use_tf: true                    # use the TF tree if it has the lidar frame
+    lidar_xyz: [0.18678, 0.0, 0.12498]   # lidar frame on robot = livox_frame (10 Hz). fallback, from Lab Exercise 7 table
+    lidar_rpy_deg: [0.0, 15.0, 0.0]      # +15 pitch = tilted down (ROS convention)
+
+    # ---------------- run control ----------------
+    autostart: false                # true = start searching as soon as the node starts
+    dry_run: false                  # true = no /cmd_vel or /simple_cmd output (bag testing)
+    control_rate: 20.0
+    detect_rate: 5.0
+    detect_smooth_n: 3
+    auto_calibrate_floor: false     # lidar cannot see the floor near the robot (blind zone)
+    floor_z: -0.39                  # measured with cloud_probe.py, robot standing (12 Nov)
+    gait_cmd_repeats: 3
+
+    # ---------------- gait codes (hex strings) ----------------
+    # From DEEP Robotics "Motion Host Communication Interface" V1.1.0-0, sec 1.2.5:
+    #   Flat Slow   0x21010300   Flat Medium 0x21010307   Flat Fast 0x21010303
+    #   Flat Crawl  0x21010406
+    #   RUG General 0x21010401   (stairs, steps <= 12 cm, slopes <= 30 deg)
+    #   RUG Grip    0x21010402   (steep slopes <= 40 deg)
+    #   RUG H-Step  0x21010407   (higher stairs, steps <= 15 cm)
+    # Gaits can only change in Move Mode (0x21010D06), never in AI state.
+    # Gait sequence from the manual run (12 Nov, stairs_run2):
+    #   H-Step up -> flat gait across the top -> Grip down -> flat gait again.
+    stair_gait_code: "0x21010407"   # H-Step, for climbing (risers 19.5-20 cm)
+    top_gait_code: "0x21010300"     # Flat Slow ("normal"), once the front legs are on top
+    descend_gait_code: "0x21010402" # Grip, for going down
+    flat_gait_code: "0x21010401"    # RUG General ("rugged"), after the stairs (18 Nov)
+    move_mode_code: "0x21010D06"    # sent just before every gait switch; "0x0" = don't send
+    move_mode_on_enable: true       # 18 Nov: robot ignored /cmd_vel until Move Mode was sent
+    require_gait_codes: true
+
+    # ---------------- AI gait (organisers' update, 17 Nov) ----------------
+    # Allowed ONLY from 1 cell before to 1 cell after the stairs (cell ~1 m x 1 m).
+    # Keep false until your robot is unlocked AND a manual Enter AI / slow cmd_vel /
+    # Exit AI test on flat floor has worked. false = old H-Step / flat / Grip path.
+    use_ai_gait: true
+    ai_enter_code: "0x21010528"     # Enter AI (sent WITHOUT Move Mode first)
+    ai_exit_code: "0x2101052B"      # Exit AI; then Move Mode + flat_gait_code as usual
+    move_mode_after_ai_enter: false # set true if AI mode also needs Move Mode before it walks
+    ai_cmd_repeats: 1               # send Enter/Exit AI once, like the manual test that walked
+    ai_switch_wait: 5.0             # s to wait after Enter / Exit AI
+    ai_enter_distance: 0.6          # Enter AI when the first step is 0.6 m ahead (inside the 1 m cell)
+    ai_walk_speed: 0.3            # flat gait, from the 1.7 m align point to 0.6 m
+    ai_walk_timeout: 40.0
+    ai_speed: 0.28
+    ai_down_speed: 0.25
+    ai_max_wz: 0.25                 # 18 Nov: 0.08 did not move it in AI mode; 0.1 did (manual test)
+    # In AI mode the node only drives forward. IMU + time only (odometry may freeze in AI):
+    ai_reach_timeout: 20.0          # no tilt at all within 20 s -> abort
+    ai_flat_after_down_s: 1.0       # flat 1 s after it tilted nose-down = off the stairs
+    ai_flat_any_s: 3.0              # or flat 3 s after any tilt (in case AI keeps the body level)...
+    ai_min_cross_time: 12.0         # ...but only 12+ s after the first tilt (top step is only 18 cm)
+    ai_clear_time: 3.0              # then 3 s more forward (0.3 m at 0.1 m/s, < 1 cell), Exit AI
+    ai_cross_timeout: 90.0
+
+    # ---------------- state machine ----------------
+    nose_up_sign: -1.0              # CONFIRMED on robot 12 Nov: nose up -> positive nose_up_deg
+    search_speed: 0.0               # 0 = stand still; >0 = creep forward looking for stairs
+    engage_distance: 2.4            # lidar sees the stairs from ~1.4 to ~2.6 m (probe, 12 Nov)
+    confirm_detections: 5
+    use_vlm: false
+    vlm_timeout: 10.0
+    vlm_accept_on_timeout: true
+
+    align_standoff: 0.8            # lidar blind zone: floor only visible beyond ~1.3 m (probe, 12 Nov)
+    approach_max_distance: 2.3      # blind walk from 1.7 m to the first step, + margin
+    align_yaw_tol_deg: 5.0
+    align_center_tol: 0.10
+    align_dist_tol: 0.30
+    align_min_vx: 0.1
+    align_min_vy: 0.1
+    align_min_wz: 0.15
+    align_lost_timeout: 5.0
+    align_hold_time: 0.3
+    align_max_vx: 0.08
+    align_max_vy: 0.08
+    align_max_wz: 0.25
+
+    gait_switch_wait: 2.0
+    approach_speed: 0.06            # slowest-safe speeds (user choice, 12 Nov)
+    climb_start_pitch_deg: 8.0      # MEASURE from a manual-run rosbag
+    climb_speed: 0.06
+    level_pitch_deg: 4.0            # MEASURE
+    level_hold_time: 1.0
+    use_odom_height: false          # stairs_run2: /leg_odom2 z does NOT follow the climb
+    min_height_gain: 0.15           # MEASURE: well below the real stair height
+    expect_descent: true
+    platform_speed: 0.05
+    platform_max_distance: 1.0      # arena top step is only 18 cm deep (3 up, 3 down)
+    descend_start_pitch_deg: 12.0   # run2: on top ~+10, going down -20..-40
+    crest_min_peak_deg: 20.0        # run2: nose-up 30-38 deg on the steps
+    crest_pitch_deg: 15.0           # run2: drops to ~7-11 deg when the front legs are on top
+    crest_hold_time: 1.0            # run2 dipped to ~20 deg mid-climb for <0.5 s
+    pulse_move_s: 2.0               # stop-and-go on the stairs: move 2 s...
+    pulse_pause_s: 1.0              # ...then stand still 1 s
+    descend_speed: 0.05
+    clear_distance: 0.5
+    clear_speed: 0.06
+    # timeouts scaled for the slow speeds above
+    approach_timeout: 50.0
+    climb_timeout: 60.0
+    platform_timeout: 30.0
+    descend_timeout: 60.0
+    clear_timeout: 20.0
+    stuck_window: 12.0
+
+    max_roll_deg: 25.0              # run2 peaked at 14.8 for 3 s (a leg hanging on step 2)
+    max_pitch_deg: 48.0             # run2 peaked at 38.6 up / 40.5 down
+    stuck_check: true
+    sensor_timeout: 1.5
+
+    # ---------------- detector ----------------
+    detector.roi_x_min: 1.2         # skip blind zone + lidar self-hits at 0.1-0.3 m
+    detector.roi_x_max: 2.6
+    detector.roi_half_width: 0.6    # MEASURE: a bit MORE than half the stair width (to see both ends, for centring)
+    detector.corridor_half_width: 0.25  # central strip used for the height profile (ignores handrails)
+    detector.min_step_height: 0.06
+    detector.max_step_height: 0.24  # arena risers 19.5 / 20 / 12 cm
+    detector.min_edge_width: 0.35
+    detector.max_stair_slope_deg: 45.0
+    detector.close_range: true
+
+vlm_stair_checker:
+  ros__parameters:
+    image_topic: /image_raw/compressed
+    server: http://192.168.10.141:8000
+    group: groupXX                  # your group id (group01-group16)

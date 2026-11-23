@@ -128,6 +128,9 @@ def generate_launch_description():
                               description='Optional: detect hanging curtains in the depth image (low rate); one along the '
                                           "current tile's edge is squared up to and walked through with vx commands"),
         DeclareLaunchArgument('curtain_params', default_value=cfg('curtain.yaml')),
+        DeclareLaunchArgument('use_elevation', default_value='false',
+                              description='true: the terrain classifier fits a ground-plane reference at start and the mission '
+                                          'prefers the tile with the least elevation change (mission prefer_flat_tiles)'),
         DeclareLaunchArgument('use_stairs', default_value='false',
                               description='Optional: detect staircases in the depth image (low rate); one on a tile '
                                           'beside the current tile is climbed over in the robot AI mode, then walled off'),
@@ -177,7 +180,8 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(os.path.join(
                 get_package_share_directory('lite3_terrain_classifier'), 'launch', 'terrain_classifier.launch.py')),
             launch_arguments={'use_sim_time': lc('use_sim_time'), 'cloud_topic': lc('cloud_topic'),
-                              'trigger_mode': lc('terrain_on_tile_entry')}.items(),
+                              'trigger_mode': lc('terrain_on_tile_entry'),
+                              'elevation': lc('use_elevation')}.items(),
             condition=IfCondition(lc('use_terrain'))),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(
@@ -186,7 +190,7 @@ def generate_launch_description():
             condition=IfCondition(lc('use_slam'))),
         OpaqueFunction(function=_nav2),
         Node(package=PKG, executable='gait_switcher', name='gait_switcher', output='screen',
-             parameters=[{'flat_gait': 'flat_slow', 'rugged_gait': 'rug_general'}],
+             parameters=[{'flat_gait': 'flat_slow', 'rugged_gait': 'rug_hstep'}],
              condition=IfCondition(lc('use_gait'))),
         Node(package=PKG, executable='animation_player', name='animation_player', output='screen'),
         OpaqueFunction(function=_llm_client),

@@ -343,19 +343,21 @@ class ExploringMode(Mode):
 
     # -- decide: end condition, then ask the strategies in order
     def _decide(self):
-        if self.index == 0:
-            end = self.machine.check_end()
-            if end:
-                return self.go(self.machine.complete_mode, end)
         pose = self.ctx.pose()
         if pose is None:
             return None
+        edge = self._curtain_on_edge(pose) if self.index == 0 else None
         if self.index == 0:
+            # a curtain on an edge of the tile the robot stands on (e.g. the opening tile) hides what is behind it: the map
+            # shows a wall there, so the end condition must not see the mission as finished before the curtain is checked
+            end = None if edge is not None else self.machine.check_end()
+            if end:
+                return self.go(self.machine.complete_mode, end)
             hop = self._stairs_beside(pose) or self._scene_beside(pose)
             if hop is not None:
                 return hop
-            edge = self._curtain_on_edge(pose)
             if edge is not None:
+                self.ctx.log('info', f'Curtain on the {edge["side"]} edge of the current tile: end condition not checked yet.')
                 if not self._can_defer_curtain():
                     return self._through_curtain(edge)
                 self.curtain = edge                  # look for another way first (_choose)
@@ -386,7 +388,8 @@ class ExploringMode(Mode):
         return self._nothing_left('no exploration target left')
 
     def _nothing_left(self, why):
-        end = self.machine.check_end()
+        pose = self.ctx.pose()
+        end = None if pose is not None and self._curtain_on_edge(pose) is not None else self.machine.check_end()
         if end:
             return self.go(self.machine.complete_mode, end)
         tiles = self.ctx.tiles
@@ -533,7 +536,30 @@ class ExploringMode(Mode):
         return self.go(mode, f'{why}; {left} tile(s) still unexplored', split=label)
 
     def choose_target(self, reachable):
-        """Hook for other selection strategies (e.g. an AI choice): default is the strategy's top-ranked target."""
+        """Hook for other selection strategies (e.g. an AI choice): default is the strategy's top-ranked target.
+
+        With the classifier's elevation (ground plane) option on and prefer_flat_tiles set, the tile whose elevation
+        differs least from the current tile's (up or down) wins; ties (within flat_tile_tolerance_m) keep the strategy's
+        ranking. Tiles with no elevation yet count as the start floor (0 m), like the current tile."""
+        if not self.ctx.cfg.get('prefer_flat_tiles', True):
+            return reachable[0]
+        tiles = self.ctx.tiles
+        if not tiles.ready or tiles.current is None or not any(
+                tiles.elevation(l) for l in {T.tile_label(tiles.current)} | {t['tile'] for t in reachable if t.get('tile')}):
+            return reachable[0]
+
+        def elev(label):
+            e = tiles.elevation(label) if label else None
+            return e['elevation_m'] if e else 0.0
+        here = elev(T.tile_label(tiles.current))
+        tol = float(self.ctx.cfg.get('flat_tile_tolerance_m', 0.03))
+        best = min(abs(elev(t.get('tile')) - here) if t.get('kind') == 'tile' else 0.0 for t in reachable)
+        for t in reachable:
+            diff = abs(elev(t.get('tile')) - here) if t.get('kind') == 'tile' else 0.0
+            if diff <= best + tol:
+                if t is not reachable[0]:
+                    self.ctx.log('info', f'Elevation: tile {t.get("tile")} chosen (change {diff:.2f} m from here).')
+                return t
         return reachable[0]
 
     def traversal_for(self, target) -> str:
@@ -1019,7 +1045,7 @@ class CurtainMode(Mode):
     """A curtain hangs along the edge of the current tile: get to the tile's centre, face the curtain squarely, then walk
     through it with forward (vx) commands (vy keeps the robot on the line from the tile centre through the edge).
 
-    Phases: center (vx / vy straight to the centre of the tile in front of the curtain, heading held) -> align (turn in
+    Phases: center (turn towards the centre of the tile in front of the curtain, drive there with vx / wz only: no vy) -> align (turn in
     place until square to the edge) -> cross (vx forward, small wz / vy to hold the line) until the robot is `through_m`
     past the edge line (the centre of the next tile). A cross that stalls (blocked: progress under stall_m for stall_s),
     times out, or an align that times out counts as a failed try: back to center -> align -> cross, up to
@@ -1058,6 +1084,7 @@ class CurtainMode(Mode):
     def _start_center(self):
         pose = self.ctx.pose()
         self.hold_yaw = pose[2] if pose is not None and len(pose) >= 3 else self.edge['yaw']
+        self.closest = None                                # nearest the robot has been to the tile centre this try
         self.set_phase('center')
 
     def _yaw_error(self, pose, yaw=None):
@@ -1116,8 +1143,12 @@ class CurtainMode(Mode):
         if self.phase == 'center':
             dx, dy = self.tile_centre[0] - pose[0], self.tile_centre[1] - pose[1]
             dist = math.hypot(dx, dy)
-            if dist <= float(c.get('center_tol_m', 0.06)):
+            tol = float(c.get('center_tol_m', 0.10))
+            self.closest = dist if self.closest is None else min(self.closest, dist)
+            # a legged robot cannot hold the centre to a few cm: close enough, or already closest and drifting off again
+            if dist <= tol or (self.closest <= 2.0 * tol and dist > self.closest + float(c.get('center_drift_m', 0.04))):
                 self.ctx.stop()
+                self.prev_err = None
                 self.set_phase('align')
                 return None
             if self.in_phase_s() > float(c.get('center_timeout_s', 15.0)):
@@ -1127,12 +1158,22 @@ class CurtainMode(Mode):
                 return None
             v = max(float(c.get('center_min_speed_mps', 0.05)),
                     min(float(c.get('center_speed_mps', 0.15)), float(c.get('center_gain', 1.0)) * dist))
-            wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * self._yaw_error(pose, self.hold_yaw)))
-            self._drive_map(pose, v * dx / dist, v * dy / dist, wz)
+            # no omni motion: turn towards the centre, then drive there with vx and wz only (the way a Nav2 goal is driven)
+            bearing = self._yaw_error(pose, math.atan2(dy, dx))
+            if abs(bearing) > math.radians(float(c.get('center_turn_deg', 30.0))):
+                w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+                                                                  float(c.get('turn_gain', 1.0)) * abs(bearing)))
+                self.ctx.drive(0.0, math.copysign(w, bearing))
+            else:
+                wz = max(-0.6, min(0.6, float(c.get('center_heading_gain', 1.5)) * bearing))
+                self.ctx.drive(v * math.cos(bearing), wz)
             return None
         err = self._yaw_error(pose)
         if self.phase == 'align':
-            if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))):
+            prev, self.prev_err = getattr(self, 'prev_err', None), err
+            # square within the tolerance, or the heading swept through the target (the pose lags the turn: overshoot)
+            crossed = prev is not None and prev * err < 0 and abs(err) < math.radians(float(c.get('align_cross_deg', 30.0)))
+            if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))) or crossed:
                 self.ctx.stop()
                 self.best, self.best_at = self._progress(pose), self.ctx.now()
                 self.set_phase('cross')
@@ -1189,6 +1230,13 @@ class StairsMode(CurtainMode):
     second try) and goes to fail_mode. Leaving the mode any other way (an operator mode command, shutdown) also turns
     AI mode off. Each staircase is gone for once (machine.stairs_tried). While AI mode is on, the mission manager also
     publishes /ai_mode true: the gait switcher sends no gait and the stair detector pauses.
+
+    climber: true hands the climb to the stair_climber package (lidar alignment on the real steps, AI mode, IMU-based
+    crossing): after centre + align, phase 'climber' publishes /ai_mode true (gait switcher and stair detector pause),
+    sends no /cmd_vel, enables /stair_climber/enable and watches /stair_climber/state. DONE = crossed (as 'cross'
+    reaching the tile beyond). ABORT / NOT_STAIRS / timeouts = failed; if the climber had entered AI mode, AI mode is
+    turned off here as well. If the climber never sees the stairs (still SEARCH after climber_search_timeout_s) the
+    staircase is given up without climbing (lidar and depth camera must agree).
     The centring / squaring-up / line-following helpers are the curtain mode's: the geometry is the same (walk straight
     through one edge of the current tile and on to the centre of a tile further along)."""
 
@@ -1199,11 +1247,63 @@ class StairsMode(CurtainMode):
     def is_driving(self):
         return self.phase in ('center', 'cross')
 
+    # stair_climber states once the robot is (about to be) in AI mode: a failure from here on walls the staircase off
+    CLIMBER_AI_STATES = ('ENTER_AI', 'CROSS_AI', 'EXIT_AI', 'SWITCH_TO_FLAT_GAIT', 'DONE')
+
+    def _start_climber(self):
+        self.ctx.stop()
+        self.ctx.ai_flag(True)                       # gait switcher + stair detector pause; no /simple_cmd from here
+        self.ctx.stair_climber_enable(True)
+        self.climber_on, self.climber_states, self.climber_ai = True, [], False
+        self.ctx.log('info', f'Stairs: handing staircase tile(s) {self._labels()} to stair_climber.')
+        self.ctx.event('stair_climber', on=True)
+        self.set_phase('climber')
+
+    def _stop_climber(self):
+        if getattr(self, 'climber_on', False):
+            self.ctx.stair_climber_enable(False)
+            self.ctx.ai_flag(False)
+            self.climber_on = False
+            self.ctx.event('stair_climber', on=False, states=list(self.climber_states))
+
+    def _climber_tick(self):
+        c = self.cfg
+        state, age = self.ctx.stair_climber_state()
+        if state is not None and age < 2.0:
+            if not self.climber_states or self.climber_states[-1] != state:
+                self.climber_states.append(state)
+                self.ctx.log('info', f'Stairs: stair_climber {state}.')
+            if state in self.CLIMBER_AI_STATES:
+                self.climber_ai = True
+                self.climbed = True
+        else:
+            state = None
+        fail = None
+        if state == 'DONE':
+            self._stop_climber()
+            return self._finish('stair_climber crossed it', through=True)
+        if state in ('ABORT', 'NOT_STAIRS'):
+            fail = f'stair_climber {state}'
+        elif state is None and self.in_phase_s() > float(c.get('climber_lost_s', 5.0)):
+            fail = 'no state from stair_climber (is it running?)'
+        elif (not self.climber_ai and self.climber_states and self.climber_states[-1] in ('IDLE', 'SEARCH')
+              and self.in_phase_s() > float(c.get('climber_search_timeout_s', 15.0))):
+            fail = 'stair_climber did not see the stairs'
+        elif self.in_phase_s() > float(c.get('climber_timeout_s', 180.0)):
+            fail = f'stair_climber timed out in {state}'
+        if fail is None:
+            return None
+        self._stop_climber()
+        if self.climber_ai:                          # it may have left the robot in AI mode: turn it off from here
+            self._ai(False)
+        return self._finish(fail)
+
     def enter(self, reason, crossing=None, **kw):
         self.edge, self.then, self.then_kwargs = crossing, None, {}
         prev = self.machine.previous
         self.came_from = prev if prev and prev != self.name else self.cfg.get('next_mode', 'exploring')
         self.ai_on, self.climbed, self.attempts, self.pose_lost_at = False, False, 0, None
+        self.climber_on, self.climber_states, self.climber_ai = False, [], False
         self.ctx.set_target(None, None, None)
         if not crossing:
             self.set_phase('abort')
@@ -1264,6 +1364,8 @@ class StairsMode(CurtainMode):
         c = self.cfg
         if self.phase == 'abort':
             return self._finish('no staircase to climb')
+        if self.phase == 'climber':
+            return self._climber_tick()              # no pose / no /cmd_vel needed: stair_climber drives
         if self.phase == 'ai_on':
             self.ctx.stop()
             if self.in_phase_s() >= float(c.get('ai_settle_s', 2.0)):
@@ -1303,13 +1405,23 @@ class StairsMode(CurtainMode):
                 return None
             v = max(float(c.get('center_min_speed_mps', 0.05)),
                     min(float(c.get('center_speed_mps', 0.15)), float(c.get('center_gain', 1.0)) * dist))
-            wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * self._yaw_error(pose, self.hold_yaw)))
-            self._drive_map(pose, v * dx / dist, v * dy / dist, wz)
+            # no omni motion: turn towards the centre, then drive there with vx and wz only (the way a Nav2 goal is driven)
+            bearing = self._yaw_error(pose, math.atan2(dy, dx))
+            if abs(bearing) > math.radians(float(c.get('center_turn_deg', 30.0))):
+                w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+                                                                  float(c.get('turn_gain', 1.0)) * abs(bearing)))
+                self.ctx.drive(0.0, math.copysign(w, bearing))
+            else:
+                wz = max(-0.6, min(0.6, float(c.get('center_heading_gain', 1.5)) * bearing))
+                self.ctx.drive(v * math.cos(bearing), wz)
             return None
         err = self._yaw_error(pose)
         if self.phase == 'align':
             if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))):
                 self.ctx.stop()
+                if c.get('climber', False):
+                    self._start_climber()
+                    return None
                 self._ai(True)
                 self.set_phase('ai_on')
                 return None
@@ -1342,7 +1454,9 @@ class StairsMode(CurtainMode):
 
     def exit(self, next_mode, reason):
         self.ctx.stop()
-        if self.ai_on:                                   # left mid-climb (operator command, shutdown): AI mode off
+        was_climbing = getattr(self, 'climber_on', False) and getattr(self, 'climber_ai', False)
+        self._stop_climber()                             # left while stair_climber had it: disable it
+        if self.ai_on or was_climbing:                   # left mid-climb (operator command, shutdown): AI mode off
             self._ai(False)
 
 
@@ -1685,6 +1799,13 @@ class BacktrackingMode(Mode):
             self._start(ok[0][1], 'to_option', via=self._option_via(ok[0][1]))
             return None
         if self.phase in ('to_split', 'to_curtain', 'to_option'):
+            tiles = self.ctx.tiles
+            if self.phase == 'to_option' and tiles.skip_scene and self.target is not None \
+                    and tiles.is_scene(tuple(int(v) for v in self.target['tile'].split(','))):
+                self.traversal.cancel()                           # turned out to be a scene tile on the way: never entered
+                self.ctx.event('target_dropped', label=self.target['tile'], why='scene tile')
+                self._abort(f'tile {self.target["tile"]} turned out to be a scene tile')
+                return None
             res = self.traversal.poll()
             if not res.done:
                 if self.in_phase_s() > float(c.get('goal_timeout_s', 120.0)):

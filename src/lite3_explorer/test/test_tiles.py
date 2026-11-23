@@ -185,3 +185,26 @@ def test_start_tile_without_walls_nearby_is_centred_on_the_robot():
     a = T.initial_candidates(g, INFO, robot, size=1.02)[0]
     cx, cy = a['grid'].center((0, 0))
     assert abs(cx) < 0.04 and abs(cy) < 0.04               # no back wall: centred along the heading
+
+
+from lite3_explorer.tile_tracker import TileTracker  # noqa: E402
+
+
+def test_tile_elevation_comes_from_the_terrain_answer():
+    t = TileTracker()
+    assert t.elevation('1,0') is None
+    t.set_terrain('1,0', {'kind': 'flat'})
+    assert t.elevation('1,0') is None                      # classifier elevation option off
+    t.set_terrain('1,0', {'kind': 'flat', 'elevation_m': 0.12, 'elevation_class': 'higher', 'slope_deg': 1.0, 'n_cells': 9})
+    assert t.elevation('1,0') == {'elevation_m': 0.12, 'elevation_class': 'higher', 'slope_deg': 1.0}
+
+
+def test_lower_elevation_does_not_replace_a_higher_one_within_a_look():
+    from lite3_explorer.tile_tracker import TileTracker
+    t = TileTracker(1.0, 0.3, 2)
+    t.set_terrain('0,-1', {'kind': 'flat', 'elevation_m': 0.30, 'elevation_class': 'higher'})
+    t.set_terrain('0,-1', {'kind': 'flat', 'elevation_m': 0.002, 'elevation_class': 'level'})   # the approach: own floor in the patch
+    assert t.elevation('0,-1')['elevation_class'] == 'higher' and t.elevation('0,-1')['elevation_m'] == 0.30
+    t.begin_terrain_look('0,-1')                                                                  # a new look measures again
+    t.set_terrain('0,-1', {'kind': 'flat', 'elevation_m': 0.002, 'elevation_class': 'level'})
+    assert t.elevation('0,-1')['elevation_class'] == 'level'

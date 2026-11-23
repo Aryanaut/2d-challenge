@@ -13,10 +13,14 @@ Publishes
       {"group_id": "...", "task_id": "M01", "task_type": "object", "scene_type": "clinic",
        "label": "medical_kit", "pos": [3.06, 2.04], "message": ""}
   qr results have "pos": null and the decoded text in "message".
+
+Optional: server_url (e.g. http://<server>:8001/task_report) -> each result is also POSTed there as JSON;
+the reply is logged and appended to results.jsonl.
 """
 import json
 import os
 import threading
+import urllib.request
 
 import rclpy
 from rclpy.node import Node
@@ -88,6 +92,8 @@ class MissionReporter(Node):
         self.once = p("report_each_task_once", True).value
         self.out_dir = os.path.expanduser(p("output_dir", "~/lite3_mission_results").value)
         hz = float(p("republish_hz", 0.0).value)
+        self.server_url = p("server_url", "").value
+        self.server_timeout = float(p("server_timeout_s", 5.0).value)
 
         if not self.group_id:
             self.get_logger().warn("group_id is empty - results will be rejected. Set it in mission_reporter.yaml")
@@ -108,7 +114,8 @@ class MissionReporter(Node):
             self.create_timer(1.0 / hz, self.republish)
         self.get_logger().info(
             f"mission_reporter up: group={self.group_id!r} tasks={[t['id'] + ':' + t['type'] for t in self.tasks]} "
-            f"source={'llm_result' if self.use_llm else 'event'} out={self.out_dir}")
+            f"source={'llm_result' if self.use_llm else 'event'} out={self.out_dir} "
+            f"server={self.server_url or 'off (topic + file only)'}")
 
     # ---- inputs -------------------------------------------------------------------------------
     def on_scene(self, msg):
@@ -120,7 +127,7 @@ class MissionReporter(Node):
             ev = json.loads(msg.data)
         except json.JSONDecodeError:
             return
-        self.process(ev, ev.get("label", ""), True)
+        self.process(ev, ev.get("label", ""), True, None)
 
     def on_llm(self, msg):
         try:
@@ -132,7 +139,10 @@ class MissionReporter(Node):
         confirmed = True
         if ev.get("label") == "survivor" and self.need_confirmed and res.get("llm") is not None:
             confirmed = bool(res.get("survivor_confirmed"))
-        self.process(ev, label, confirmed)
+        if res.get("llm") is not None and not res.get("accepted", True):
+            confirmed = False                     # LLM disagreed with the detector
+        room = (res.get("llm") or {}).get("room_type")
+        self.process(ev, label, confirmed, room)
 
     def on_manual(self, msg):
         try:
@@ -150,7 +160,7 @@ class MissionReporter(Node):
             self._emit(res)
 
     # ---- core ---------------------------------------------------------------------------------
-    def process(self, ev, label, confirmed):
+    def process(self, ev, label, confirmed, room=None):
         if not confirmed or float(ev.get("confidence", 1.0)) < self.min_conf:
             return
         ttype = event_task_type(ev, label)
@@ -167,7 +177,7 @@ class MissionReporter(Node):
                 pos, out_label, message = event_position(ev), "", ""
             else:
                 pos, out_label, message = event_position(ev), label, ""
-            res = build_result(self.group_id, task["id"], ttype, task["scene"] or self.scene,
+            res = build_result(self.group_id, task["id"], ttype, task["scene"] or room or self.scene,
                                out_label, pos, message)
             self._emit(res)
 
@@ -182,6 +192,25 @@ class MissionReporter(Node):
                 json.dump(self.results, f, indent=2)
         except OSError as e:
             self.get_logger().error(f"could not write results: {e}")
+        if self.server_url:
+            threading.Thread(target=self._post, args=(dict(res),), daemon=True).start()
+
+    def _post(self, res):
+        """Send one result to the organisers' server; never blocks the node."""
+        req = urllib.request.Request(self.server_url, data=json.dumps(res).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.server_timeout) as r:
+                reply = {"status": r.status, "body": r.read().decode(errors="replace")[:500]}
+            self.get_logger().info(f"server {res['task_id']}: {reply}")
+        except Exception as e:  # noqa: BLE001
+            reply = {"error": repr(e)}
+            self.get_logger().error(f"server {res['task_id']}: send FAILED {e} - result is still in results.json")
+        try:
+            with open(os.path.join(self.out_dir, "results.jsonl"), "a") as f:
+                f.write(json.dumps({"server_reply_for": res["task_id"], **reply}) + "\n")
+        except OSError:
+            pass
 
     def republish(self):
         with self.lock:

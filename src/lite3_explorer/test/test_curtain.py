@@ -136,7 +136,7 @@ def test_curtain_mode_goes_to_the_tile_centre_before_walking_through():
         return orig(mode, phase)
     ctx.on_mode_change = spy
     assert run_until(ctx, m, lambda: 'curtain' in modes_seen(m) and ctx.pose_[0] >= 1.5)
-    assert at_align and math.hypot(at_align[0][0] - 0.5, at_align[0][1] - 0.5) <= 0.06 + 1e-6   # centred first
+    assert at_align and math.hypot(at_align[0][0] - 0.5, at_align[0][1] - 0.5) <= 0.15   # centred first (center_tol_m 0.10, the fake robot moves in 1 s steps)
     assert abs(ctx.pose_[1] - 0.5) < 0.05                        # and stayed on the centre line through the curtain
 
 
@@ -391,3 +391,30 @@ def test_curtain_is_walked_through_at_once_without_another_way():
     ctx, m, d = build(pose_yaw=0.0)                       # corridor: the curtain is the only way on
     assert run_until(ctx, m, lambda: 'curtain' in modes_seen(m))
     assert not any(k == 'curtain_deferred' for k, _ in ctx.events)
+
+
+def _wall_cloud(x, y0, y1, zs, n=40):
+    ys = np.linspace(y0, y1, n)
+    return np.array([[x, y, z] for y in ys for z in zs])
+
+
+def test_lidar_curtain_is_floor_level_only_with_a_tall_wall_behind():
+    robot = (0.0, 0.5)
+    floor_hem = [0.02, 0.05, 0.10, 0.15]
+    tall = [0.05, 0.2, 0.35, 0.5, 0.6]
+    m = cc.LidarCurtainMap()
+    for _ in range(3):
+        m.add(np.vstack([_wall_cloud(1.0, 0.0, 1.0, floor_hem), _wall_cloud(1.5, 0.0, 1.0, tall)]), robot)
+    pts = m.confirmed()
+    assert len(pts) > 10 and np.all(np.abs(pts[:, 0] - 1.0) < 0.1) and np.all(pts[:, 2] > 0.9)
+    # a solid 0.6 m panel in the same place is a wall, not a curtain
+    w = cc.LidarCurtainMap()
+    for _ in range(3):
+        w.add(np.vstack([_wall_cloud(1.0, 0.0, 1.0, tall), _wall_cloud(1.5, 0.0, 1.0, tall)]), robot)
+    assert len(w.confirmed()) == 0
+    # floor-level returns with nothing tall behind them: no curtain either
+    f = cc.LidarCurtainMap()
+    for _ in range(3):
+        f.add(_wall_cloud(1.0, 0.0, 1.0, floor_hem), robot)
+    assert len(f.confirmed()) == 0
+    assert cc.edge_curtain(GRID, (0, 0), pts) is not None
