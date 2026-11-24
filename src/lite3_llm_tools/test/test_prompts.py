@@ -25,7 +25,7 @@ def test_parse_tile_choice(desc, evidence, choice, sides):
 
 
 def test_every_task_has_a_prompt_file():
-    assert set(P.PROMPT_FILES) == {'describe_view', 'describe_tile', 'place_initial_tile', 'choose_tile', 'choose_frontier'}
+    assert set(P.PROMPT_FILES) == {'describe_view', 'describe_tile', 'describe_scene', 'place_initial_tile', 'choose_tile', 'choose_frontier'}
     for task in P.PROMPT_FILES:
         assert pathlib.Path(P.prompt_path(task)).resolve().is_file()
     assert P.prompt_path('choose_tile', '/x/custom.txt') == '/x/custom.txt'
@@ -94,3 +94,11 @@ def test_tile_report_prompt_keeps_the_four_key_schema_and_asks_about_the_tile():
     assert '$' not in text and 'TILE CONTEXT' in text and 'what THIS tile looks like' in ' '.join(text.split())
     for key in ('scene_description', 'relevant_to_mission', 'evidence', 'confidence'):
         assert f'"{key}"' in text
+
+
+def test_parse_scene_type():
+    assert P.parse_scene_type('kitchen: stove and pots') == 'kitchen'
+    assert P.parse_scene_type('Furniture_shop: chairs') == 'furniture_shop'
+    assert P.parse_scene_type('traversable: only a dark wall panel') == 'traversable'
+    assert P.parse_scene_type('wall close-up: a dark panel') is None
+    assert P.parse_scene_type('') is None

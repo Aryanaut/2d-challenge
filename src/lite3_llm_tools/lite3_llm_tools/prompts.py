@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 PROMPT_FILES = {
     'describe_view': 'environment_report.txt',
     'describe_tile': 'tile_report.txt',
+    'describe_scene': 'scene_report.txt',
     'place_initial_tile': 'tile_init.txt',
     'choose_tile': 'tile_choice.txt',
     'choose_frontier': 'frontier_choice.txt',
@@ -32,6 +33,16 @@ def prompts_dir() -> str:
 
 def prompt_path(task: str, override: str = '') -> str:
     return override or os.path.join(prompts_dir(), PROMPT_FILES[task])
+
+SCENE_TYPES = ('clothes_shop', 'fitness_centre', 'kitchen', 'market', 'workshop', 'clinic', 'cleaning_room', 'furniture_shop')
+_SCENE = re.compile(r'^\W*(' + '|'.join(SCENE_TYPES + ('traversable',)) + r')\b', re.IGNORECASE)
+
+
+def parse_scene_type(scene_description: str) -> Optional[str]:
+    """One of SCENE_TYPES, 'traversable' (none of them fits), or None if the answer does not start with either."""
+    m = _SCENE.match(str(scene_description).strip())
+    return m.group(1).lower() if m else None
+
 
 _CHOICE = re.compile(r'\b(?:frontier|target)\s*(?:#|no\.?|number)?\s*(\d+)', re.IGNORECASE)
 

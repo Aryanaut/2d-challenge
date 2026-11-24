@@ -179,6 +179,9 @@ def test_roller_tiles_need_spots_mid_tile_and_the_lidar():
     assert rc.roller_tiles(GRID, roller_pts(n=3)) == {}                           # too few spots
     assert rc.roller_tiles(GRID, roller_pts(lidar=0)) == {}                       # the lidar does not confirm it ...
     assert set(rc.roller_tiles(GRID, roller_pts(lidar=0), min_lidar=0)) == {(1, 0)}   # ... unless it is not needed
+    long_ridge = roller_pts(lidar=0, n=14)                                        # a long, well-seen ridge: no lidar needed
+    assert set(rc.roller_tiles(GRID, long_ridge, depth_only_points=12)) == {(1, 0)}
+    assert rc.roller_tiles(GRID, long_ridge) == {} and rc.roller_tiles(GRID, roller_pts(lidar=0, n=8), depth_only_points=12) == {}
     edge = roller_pts()
     edge[:, 0] = 1.05                                                             # along the edge: spill-over
     assert rc.roller_tiles(GRID, edge) == {}
@@ -209,7 +212,7 @@ def test_roller_crossing_from_its_own_tile():
 def build(flat=None, lidar=1, yaw=1.0):
     """4 m corridor (tiles 0..3 along x), robot on tile 0,0, a roller across the middle of tile 1,0."""
     cfg = {'modes.exploring.rollers': True, 'modes.exploring.scan_after_reach': False,
-           'modes.roller.gait_settle_s': 1.0}
+           'modes.roller.gait_settle_s': 1.0, 'modes.roller.approach_angle_deg': 0.0}
     cfg.update(flat or {})
     ctx, m = make(cfg, length_m=4.0)
     ctx.pose_[:] = [0.5, 0.5, yaw]
@@ -322,6 +325,8 @@ def roller_tee_world():
 def build_tee(flat=None):
     """Roller across tile 2,0; tile 1,0 is a split (the branch north, or over the roller to tile 3,0)."""
     cfg = {'modes.exploring.rollers': True, 'modes.roller.gait_settle_s': 1.0,
+           'modes.roller.approach_angle_deg': 0.0,
+           'modes.roller.min_turn_rad_s': 0.05,       # the fake robot steps 1 s a tick: 0.2 rad/s overshoots the 4 deg tolerance
            'explorations.tiles.neighbours_fallback': False}
     cfg.update(flat or {})
     ctx, m = make(cfg, world=roller_tee_world())
@@ -368,3 +373,44 @@ def test_backtracking_looks_for_another_way_when_the_roller_cannot_be_crossed_ba
     run_until(ctx, m, lambda: m.current.name != 'backtracking', n=20)
     assert any('looking for another way' in msg for _, msg in ctx.logs)
     assert gait[-1][0] is False
+
+
+def test_recentres_on_the_edge_after_the_roller_tile_with_omni():
+    ctx, m, d, gait = build({'modes.roller.min_turn_rad_s': 0.05}, yaw=0.0)
+    ctx.pose_[1] += 0.12                                    # off the line through the tile centres
+    assert run_until(ctx, m, lambda: ctx.complete is not None or any(k == 'roller_crossed' for k, _ in ctx.events), n=300)
+    ev = [dd for k, dd in ctx.events if k == 'roller_recenter']
+    assert len(ev) == 1
+    assert any(k == 'roller_crossed' for k, _ in ctx.events)
+
+
+def test_approach_keeps_an_angle_to_the_roller_and_walks_the_straight_line_then_squares_up():
+    ctx, m, d, gait = build({'modes.roller.approach_angle_deg': 20.0, 'modes.roller.min_turn_rad_s': 0.05}, yaw=0.0)
+    run_until(ctx, m, lambda: any(k == 'roller_crossed' for k, _ in ctx.events), n=300)
+    assert any(k == 'roller_crossed' for k, _ in ctx.events)
+    on_pose = gait[0][1]                                    # h-step on: still before the roller tile's edge line
+    assert abs(math.degrees(on_pose[2]) - 20.0) < 6.0, on_pose
+    ys = [p[1] for p in d.path]
+    assert max(ys) - min(ys) < 0.15                         # the track stays on the tile line, only the body is turned
+    assert abs(math.degrees(ctx.pose_[2])) < 8.0            # squared up after the edge line
+
+
+def _cross_with_original_heading(flat, original_deg):
+    ctx, m, d, gait = build(dict(flat, **{'modes.roller.min_turn_rad_s': 0.05}), yaw=0.0)
+    for _ in range(400):
+        ctx.t += 1.0
+        if m.current.name == 'exploring' or m.current.name == 'roller':
+            ctx.initial_heading = math.radians(original_deg)      # the scanning mode saved the start heading before
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        if any(k == 'roller_crossed' for k, _ in ctx.events):
+            break
+    return ctx
+
+
+def test_heading_goes_back_to_the_original_heading_at_the_midpoint_after_the_roller():
+    ctx = _cross_with_original_heading({'modes.roller.approach_angle_deg': 20.0}, -12.0)
+    assert any(k == 'roller_recenter' for k, _ in ctx.events)
+    assert abs(math.degrees(ctx.pose_[2]) + 12.0) < 6.0, math.degrees(ctx.pose_[2])
+    ctx = _cross_with_original_heading({'modes.roller.restore_heading': False}, -12.0)
+    assert abs(math.degrees(ctx.pose_[2])) < 6.0                # off: stays square to the roller

@@ -68,7 +68,7 @@ def test_edge_curtain_with_a_rotated_grid():
 class Drive:
     """Add a robot that obeys drive(vx, wz) to a FakeCtx."""
     def __init__(self, ctx, pts):
-        self.ctx, self.pts, self.cmds = ctx, pts, []
+        self.ctx, self.pts, self.cmds, self.path = ctx, pts, [], []
         self.wall_x = None
         self.blocked = lambda: False
         ctx.curtain_points = lambda: self.pts
@@ -85,11 +85,12 @@ class Drive:
         p[2] += wz * dt
         if (self.wall_x is None or nx < self.wall_x) and not self.blocked():   # a wall stops it (bumped)
             p[0], p[1] = nx, ny
+        self.path.append((p[0], p[1]))
 
 
-def build(pose_yaw):
+def build(pose_yaw, flat=None):
     ctx, m = make({'modes.exploring.curtains': True, 'modes.exploring.scan_after_reach': False,
-                   'modes.curtain.speed_mps': 0.25}, length_m=4.0)
+                   'modes.curtain.speed_mps': 0.25, **(flat or {})}, length_m=4.0)
     ctx.pose_[:] = [0.5, 0.5, pose_yaw]
     d = Drive(ctx, spots(1.05, 0.1, 0.9))
     return ctx, m, d
@@ -140,8 +141,17 @@ def test_curtain_mode_goes_to_the_tile_centre_before_walking_through():
     assert abs(ctx.pose_[1] - 0.5) < 0.05                        # and stayed on the centre line through the curtain
 
 
-def test_blocked_curtain_is_retried_then_hands_back_to_the_mode_before_it():
+def test_blocked_curtain_is_given_up_at_once_it_is_a_wall():
     ctx, m, d = build(pose_yaw=0.0)
+    d.wall_x = 0.8
+    assert run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=300)
+    failed = next(dd for k, dd in ctx.events if k == 'curtain_failed')
+    assert failed['attempts'] == 0 and 'a wall' in failed['why'] and failed['back_to'] == 'exploring'
+    assert not [1 for k, _ in ctx.events if k == 'curtain_retry']
+
+
+def test_blocked_curtain_is_retried_then_hands_back_to_the_mode_before_it():
+    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.blocked_gives_up': False})
     d.wall_x = 0.8                                               # a wall in front of the curtain: never gets through
     assert run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=300)
     retries = [dd for k, dd in ctx.events if k == 'curtain_retry']
@@ -270,7 +280,8 @@ def test_mppi_mode_holds_the_heading_it_entered_with():
 # ---------------------------------------------------------------------------------------- backtracking through a curtain
 def test_backtracking_walks_back_through_a_curtain_with_its_virtual_wall_lifted():
     from test_mission import T, tee_world
-    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25},
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25,
+                   'modes.curtain.blocked_gives_up': False},
                   world=tee_world())
     d = Drive(ctx, np.zeros((0, 4)))
     branch = None
@@ -328,7 +339,8 @@ def test_curtain_edges_are_left_out_of_the_virtual_walls_only_while_open():
 
 def test_backtracking_carries_on_when_the_curtain_cannot_be_walked_through():
     from test_mission import T, tee_world
-    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25},
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25,
+                   'modes.curtain.blocked_gives_up': False},
                   world=tee_world())
     d = Drive(ctx, np.zeros((0, 4)))
     branch = None

@@ -198,6 +198,16 @@ def test_describe_tile_uses_the_tile_prompt_with_context_and_lidar(tools):
     assert (tools.dir / 'tile_0_0_q1.json').exists()
 
 
+def test_describe_scene_prompt_lists_the_scene_types_and_returns_the_type(tools):
+    tools.store_capture('scene_1_0_q2', b'\xff\xd8jpeg', str(tools.dir))
+    r = tools.handle({'task': 'describe_tile', 'prompt': 'describe_scene', 'name': 'scene_1_0_q2', 'tile': '1,0',
+                      'save_dir': str(tools.dir)})
+    assert r['ok'], r
+    sent = tools.state['prompts'][-1]
+    assert 'furniture_shop' in sent and 'traversable' in sent
+    assert r['result']['scene_type'] == 'traversable'                    # the test answer names no scene type
+
+
 def test_describe_tile_failures_come_back_as_errors(tools):
     r = tools.handle({'task': 'describe_tile', 'name': 'never-captured', 'tile': '1,1', 'save_dir': str(tools.dir)})
     assert r['ok'] is False and 'no captured frame' in r['error']

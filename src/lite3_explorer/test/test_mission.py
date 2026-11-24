@@ -646,6 +646,15 @@ def test_scene_tile_beside_the_current_tile_is_looked_at_never_entered():
     assert 'scene' in modes_seen(m) and ctx.complete
 
 
+def test_scene_tile_the_ai_calls_traversable_is_an_ordinary_tile_again():
+    ctx, m = make(world=scene_world())
+    run(ctx, m, 300)
+    assert (2, 0) in ctx.tiles.described
+    ctx.tiles.mark_traversable((2, 0))
+    assert not ctx.tiles.is_scene((2, 0)) and (2, 0) not in ctx.tiles.described
+    assert ctx.tiles.tiles[(2, 0)]['status'] in ('to_visit', 'visited') and (2, 0) not in ctx.tiles.scene_tiles()
+
+
 def test_scene_tile_is_marked_explored_even_when_the_ai_fails():
     ctx, m = make(world=scene_world())
     ctx.ai_fails = {'2,0'}
@@ -949,3 +958,25 @@ def test_scene_mode_reaches_the_tile_centre_before_turning_to_the_scene():
     assert turning and all(vx == 0 and vy == 0 for vx, vy, _ in turning)      # ... then only turned in place
     looked = ctx.asked[0][1]
     assert abs(math.atan2(math.sin(looked[2]), math.cos(looked[2]))) <= math.radians(6) + 1e-6   # facing east, at it
+
+
+def test_scene_found_while_driving_recovers_to_the_previous_tile_then_looks_at_it():
+    ctx, m = make(length_m=4.0)
+    ctx.drive_ticks = 8
+    for _ in range(300):                                          # until driving to a tile
+        ctx.t += 1.0
+        m.tick()
+        ctx.tiles.track(ctx.pose_)
+        if m.current.name == 'exploring' and m.current.phase == 'driving':
+            break
+    target = m.current.target['tile']
+    here = ctx.tiles.current
+    n_before = len(m.transitions)
+    real = ctx.tiles._scene_flag
+    ctx.tiles._scene_flag = lambda t: tuple(t) == tuple(int(v) for v in target.split(',')) or real(t)   # detected on the way
+    run(ctx, m, steps=60, until_complete=False)
+    seen = [t[2] for t in m.transitions[n_before:]]
+    assert seen[:2] == ['recovery', 'scene']
+    assert any(k == 'scene_while_driving' for k, _ in ctx.events)
+    assert target in m.scenes_done
+    assert ctx.tiles.current == here and tuple(int(v) for v in target.split(',')) not in ctx.tiles.trail

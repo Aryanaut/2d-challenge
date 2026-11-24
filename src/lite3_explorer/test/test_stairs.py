@@ -160,6 +160,10 @@ def build(flat=None, ascent=(1.0, 0.0), yaw=1.0):
         ai.append((on, code, list(ctx.pose_)))
         return True
     ctx.ai_mode = ai_mode
+    ctx.rebases = []
+    ctx.stair_climber_ai_on = lambda on: ctx.ai_on_flags.append(on)
+    ctx.ai_on_flags = []
+    ctx.rebase_odom = lambda x, y, yaw: ctx.rebases.append((x, y, yaw))
     ctx.tiles.set_stair_points(stair_pts(ascent=ascent))               # before the tile grid exists, like a latched topic
     return ctx, m, d, ai
 
@@ -345,3 +349,32 @@ def test_leaving_mid_climber_disables_it_and_turns_ai_off():
     ok, _ = m.request('idle', 'operator command')
     assert ok and cl.enables[-1] is False and cl.flags[-1] is False
     assert [(on, code) for on, code, _ in ai] == [(False, AI_OFF)]
+
+
+def test_odom_is_rebased_to_the_tile_beyond_after_the_climb():
+    ctx, m, d, ai, cl = build_climber(CROSS)
+    assert run_until(ctx, m, lambda: any(k == 'stairs_crossed' for k, _ in ctx.events), n=200), modes_seen(m)
+    assert len(ctx.rebases) == 1
+    x, y, yaw = ctx.rebases[0]
+    assert (x, y) == tuple(ctx.tiles.grid.center((2, 0))) and abs(yaw) < 1e-6
+    assert any(k == 'odom_rebase' for k, _ in ctx.events)
+
+
+def test_no_rebase_when_the_climb_failed():
+    ctx, m, d, ai, cl = build_climber([('SEARCH', 2), ('ABORT', 100)])
+    run_until(ctx, m, lambda: any(k == 'stairs_failed' for k, _ in ctx.events), n=200)
+    assert ctx.rebases == []
+
+
+def test_ai_before_climber_enters_ai_first_and_the_climber_is_told():
+    ctx, m, d, ai, cl = build_climber(CROSS, {'modes.stairs.ai_before_climber': True})
+    assert run_until(ctx, m, lambda: any(k == 'stairs_crossed' for k, _ in ctx.events), n=300), modes_seen(m)
+    assert [on for on, _, _ in ai] == [True]                  # mission sent Enter AI once; stair_climber exits it itself
+    assert ctx.ai_on_flags[0] is True and ctx.ai_on_flags[-1] is False
+    assert cl.enables == [True, False]
+
+
+def test_ai_before_climber_failure_turns_ai_off_once():
+    ctx, m, d, ai, cl = build_climber([('SEARCH', 2), ('ABORT', 100)], {'modes.stairs.ai_before_climber': True})
+    run_until(ctx, m, lambda: any(k == 'stairs_failed' for k, _ in ctx.events), n=300)
+    assert [on for on, _, _ in ai] == [True, False]

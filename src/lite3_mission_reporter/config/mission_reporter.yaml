@@ -2,14 +2,19 @@ mission_reporter:
   ros__parameters:
     group_id: "group01_s3xy"          # YOUR group id, copied exactly from the organisers
 
-    # Mission tasks, as parallel lists (same index = same task). Fill these in on the day.
+    # Mission tasks, as parallel lists (same index = same task). Fixed for practice AND competition.
     #   task_types : object | hazard | survivor | qr
     #   task_labels: required label for that task ("" = accept any label of that type)
-    #   task_scenes: scene_type to force for that task ("" = use the current scene, see below)
-    task_ids:    ["M01", "M02", "M03", "M04", "M05"]
-    task_types:  ["object", "hazard", "survivor", "qr", "survivor"]
-    task_labels: ["medical_kit", "", "", "", ""]
-    task_scenes: ["", "", "", "", ""]
+    #                M01 -> object label (medical_kit, hand_tools, food, water, utensils)
+    #                M02 -> hazard label (high_voltage, radioactive, chemical, biological, flammable)
+    #   task_scenes: "" = report the room perception says the robot is in (normal);
+    #                a name = force/require that room (not needed for the fixed missions)
+    #   task_conditions (survivor tasks): "qr" = survivor WITH a QR code beside it, "no_qr" = without
+    task_ids:        ["M01", "M02", "M03", "M04", "M05"]
+    task_types:      ["object", "hazard", "survivor", "qr", "survivor"]
+    task_labels:     ["hand_tools", "", "", "", ""]      # M02 "" = whichever of the 5 hazards is found
+    task_scenes:     ["", "", "", "", ""]                # "" = report the room the robot is in
+    task_conditions: ["", "", "qr", "", "no_qr"]         # M03 = survivor WITH a QR beside it, M05 = without
 
     # Room the robot is in. Update live with:
     #   ros2 topic pub --once /mission/scene_type std_msgs/String "{data: kitchen}"
@@ -18,11 +23,16 @@ mission_reporter:
     use_llm_result: false             # true = wait for /perception/llm_result and use its verified label
     require_survivor_confirmed: true  # (use_llm_result only) skip survivors the LLM says are not survivors
     min_confidence: 0.0
+    same_survivor_radius_m: 1.0       # a survivor this close to one already reported = the same one
+    hold_unknown_scene_survivors: true
+    qr_near_survivor_m: 1.5           # a QR seen within this distance of a survivor = that survivor has a QR
+    no_qr_min_bbox_h_frac: 0.25       # M05 only if the survivor fills >= 25% of image height (close enough to see a QR)  # while M03 is open, don't report survivors whose room is unknown
+    require_position: false            # don't answer a task with "pos": null (except qr); wait for a located sighting, change to true once confirm with aryan how to get the position
     report_each_task_once: true       # a task is answered by its first matching event, then closed
     output_dir: "~/lite3_mission_results"   # results.jsonl + results.json are written here
     republish_hz: 0.0                 # >0 = re-send all results periodically (late subscribers)
 
     # Send each result to the organisers' server as well (JSON POST). "" = off (topic + file only).
     # e.g. "http://<server-ip>:8001/task_report" - use the address the organisers give you.
-    server_url: " "
+    server_url: ""
     server_timeout_s: 5.0

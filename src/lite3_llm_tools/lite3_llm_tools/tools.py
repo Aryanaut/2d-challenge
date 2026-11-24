@@ -162,10 +162,16 @@ class LlmTools:
             raise TaskError('describe_tile needs "name"')
         with self._lock:
             capture = self.captures.pop((folder, name), None)
-        view = self._describe_one(folder, {'name': name}, capture, task='describe_tile', context=request.get('context', ''))
+        prompt = request.get('prompt') or 'describe_tile'          # 'describe_scene': classify a scene tile (scene_report.txt)
+        if prompt not in ('describe_tile', 'describe_scene'):
+            raise TaskError(f'describe_tile: unknown prompt {prompt!r}')
+        view = self._describe_one(folder, {'name': name}, capture, task=prompt, context=request.get('context', ''))
         if 'error' in view:
             raise PerceptionError(view['error'])
-        return {'tile': request.get('tile'), **{k: v for k, v in view.items() if k != 'name'}}
+        out = {'tile': request.get('tile'), **{k: v for k, v in view.items() if k != 'name'}}
+        if prompt == 'describe_scene':
+            out['scene_type'] = P.parse_scene_type(out.get('scene_description', '')) or 'traversable'
+        return out
 
     def _describe_one(self, folder: str, view: dict, capture: Optional[dict], task: str = 'describe_view',
                       context: str = '') -> dict:

@@ -77,14 +77,17 @@ class MissionReporter(Node):
         types = list(p("task_types", ["object"]).value)
         labels = list(p("task_labels", [""] * len(ids)).value)
         scenes = list(p("task_scenes", [""] * len(ids)).value)
+        conds = list(p("task_conditions", [""] * len(ids)).value)
         n = len(ids)
         labels += [""] * (n - len(labels))
         scenes += [""] * (n - len(scenes))
+        conds += [""] * (n - len(conds))
         self.tasks = []
         for i in range(n):
             if types[i] not in TASK_TYPES:
                 self.get_logger().error(f"task {ids[i]}: unknown task_type '{types[i]}' (use {TASK_TYPES})")
-            self.tasks.append({"id": ids[i], "type": types[i], "label": labels[i], "scene": scenes[i], "done": False})
+            self.tasks.append({"id": ids[i], "type": types[i], "label": labels[i], "scene": scenes[i],
+                               "cond": conds[i], "done": False})
         self.scene = p("default_scene_type", "").value
         self.use_llm = p("use_llm_result", False).value
         self.need_confirmed = p("require_survivor_confirmed", True).value
@@ -93,6 +96,13 @@ class MissionReporter(Node):
         self.out_dir = os.path.expanduser(p("output_dir", "~/lite3_mission_results").value)
         hz = float(p("republish_hz", 0.0).value)
         self.server_url = p("server_url", "").value
+        self.require_pos = p("require_position", True).value
+        self.same_survivor_r = float(p("same_survivor_radius_m", 1.0).value)
+        self.hold_unknown = p("hold_unknown_scene_survivors", True).value
+        self.survivors = []                      # (task_id, [x, y]) already reported
+        self.qr_positions = []                   # where QR codes were seen ([x, y])
+        self.qr_near_r = float(p("qr_near_survivor_m", 1.5).value)
+        self.no_qr_min_h = float(p("no_qr_min_bbox_h_frac", 0.25).value)
         self.server_timeout = float(p("server_timeout_s", 5.0).value)
 
         if not self.group_id:
@@ -126,6 +136,11 @@ class MissionReporter(Node):
         try:
             ev = json.loads(msg.data)
         except json.JSONDecodeError:
+            return
+        if ev.get("type") == "hazard" and ev.get("hazard_certain") is False:
+            # unsure which sign it is: only the LLM (use_llm_result) may decide those
+            self.get_logger().info(f"hazard {ev.get('hazard_top3')}: not sure which sign, not reported",
+                                   throttle_duration_sec=5.0)
             return
         self.process(ev, ev.get("label", ""), True, None)
 
@@ -164,9 +179,23 @@ class MissionReporter(Node):
         if not confirmed or float(ev.get("confidence", 1.0)) < self.min_conf:
             return
         ttype = event_task_type(ev, label)
+        if ttype != "qr" and self.require_pos and event_position(ev) is None:
+            # don't use up a task on a sighting with no position; wait for one that has it
+            self.get_logger().warn(
+                f"event {ttype}/{label}: no position (no depth and no map->base TF?) - task kept open",
+                throttle_duration_sec=5.0)
+            return
         with self.lock:
-            task = next((t for t in self.tasks if t["type"] == ttype and not (self.once and t["done"])
-                         and (not t["label"] or t["label"] == label)), None)
+            scene_now = room or ev.get("scene_type") or self.scene
+            if ttype == "qr" and event_position(ev) is not None:
+                self.qr_positions.append(event_position(ev))
+            if ttype == "survivor":
+                task = self.pick_survivor_task(event_position(ev), scene_now, ev)
+                if task is False:
+                    return                               # same survivor again, or waiting for the scene
+            else:
+                task = next((t for t in self.tasks if t["type"] == ttype and not (self.once and t["done"])
+                             and (not t["label"] or t["label"] == label)), None)
             if task is None:
                 self.get_logger().info(f"event {ttype}/{label}: no open matching task, not reported")
                 return
@@ -177,9 +206,67 @@ class MissionReporter(Node):
                 pos, out_label, message = event_position(ev), "", ""
             else:
                 pos, out_label, message = event_position(ev), label, ""
-            res = build_result(self.group_id, task["id"], ttype, task["scene"] or room or self.scene,
-                               out_label, pos, message)
+            if ttype == "survivor":
+                self.survivors.append((task["id"], pos))
+                scene_out = task["scene"] or scene_now           # M03: the mission's exact room name; M05: the room it was in
+            else:
+                scene_out = task["scene"] or scene_now
+            res = build_result(self.group_id, task["id"], ttype, scene_out, out_label, pos, message)
             self._emit(res)
+
+    @staticmethod
+    def _norm(s):
+        return (s or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+    def _has_qr(self, ev, pos):
+        """True if a QR code was seen beside this survivor (same moment, or a QR seen near this spot)."""
+        if ev.get("qr_in_view"):
+            return True
+        if pos is not None:
+            for q in self.qr_positions:
+                if ((pos[0] - q[0]) ** 2 + (pos[1] - q[1]) ** 2) ** 0.5 < self.qr_near_r:
+                    return True
+        return False
+
+    def pick_survivor_task(self, pos, scene_now, ev=None):
+        """Survivor -> task.  task_conditions: "qr" = survivor WITH a QR beside it (M03),
+        "no_qr" = survivor WITHOUT one (M05), "" = any.  task_scenes (optional) = room it must be in.
+        Returns task, None (no open task) or False (skip for now)."""
+        ev = ev or {}
+        if pos is not None:
+            for tid, p in self.survivors:
+                if p is not None and ((pos[0] - p[0]) ** 2 + (pos[1] - p[1]) ** 2) ** 0.5 < self.same_survivor_r:
+                    self.get_logger().info(f"survivor at {pos}: same one already reported as {tid}, skipped",
+                                           throttle_duration_sec=5.0)
+                    return False
+        has_qr = self._has_qr(ev, pos)
+        scene = self._norm(scene_now)
+        open_ = [t for t in self.tasks if t["type"] == "survivor" and not (self.once and t["done"])]
+
+        def fits(t):
+            if t["cond"] == "qr" and not has_qr:
+                return False
+            if t["cond"] == "no_qr" and has_qr:
+                return False
+            if t["scene"] and not (scene and self._norm(t["scene"]) == scene):
+                return False
+            return True
+
+        cands = [t for t in open_ if fits(t)]
+        if not cands:
+            return None
+        task = cands[0]
+        if task["cond"] == "no_qr":
+            # only call it "no QR" if we were close enough that a QR beside it would have been seen
+            h = float(ev.get("bbox_h_frac", 1.0))
+            if h < self.no_qr_min_h:
+                self.get_logger().info(
+                    f"survivor at {pos}: no QR seen but too far to be sure (size {h:.2f} < {self.no_qr_min_h}) "
+                    f"- not reported as {task['id']} yet", throttle_duration_sec=5.0)
+                return False
+        if task["scene"] and not scene and self.hold_unknown:
+            return False
+        return task
 
     def _emit(self, res):
         self.results.append(res)
