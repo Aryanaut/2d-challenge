@@ -181,6 +181,13 @@ class FakeCtx:
     def animation_cancel(self):
         self._anim_left = 0
 
+    def animation_markers(self):                 # a scenescan reports its three stops once it is under way
+        if getattr(self, 'played', [])[-1:] == ['scenescan'] and getattr(self, '_anim_left', 2) < 2 \
+                and not getattr(self, '_views_sent', False):
+            self._views_sent = True
+            return ['left', 'centre', 'right']
+        return []
+
     def traversal(self, name):
         if name not in self.cfg['traversals']:
             raise KeyError(name)
@@ -212,8 +219,9 @@ class FakeCtx:
     def on_complete(self, reason):
         self.complete = reason
 
-    def describe_scene(self, label, pose):
+    def describe_scene(self, label, pose, view=None):
         self.asked = getattr(self, 'asked', []) + [(label, list(pose))]
+        self.views = getattr(self, 'views', []) + [view]
         return FakeCall(ok=label not in getattr(self, 'ai_fails', set()))
 
     def record_scene(self, label, pose, call):
@@ -638,12 +646,20 @@ def test_scene_tile_beside_the_current_tile_is_looked_at_never_entered():
     ctx, m = make(world=scene_world())
     run(ctx, m, 300)
     assert ctx.tiles.tiles[(2, 0)]['scene'] is True
-    assert [a[0] for a in ctx.asked] == ['2,0']
+    assert {a[0] for a in ctx.asked} == {'2,0'}
     assert ctx.recorded == [('2,0', True)]
     assert (2, 0) not in ctx.tiles.trail and (2, 0) in ctx.tiles.described      # explored, not entered
     assert ctx.tiles.tiles[(2, 0)]['status'] == 'visited'
     assert all(lab != '2,0' for name, lab in ctx.drives if name != 'cmd')       # never driven to
     assert 'scene' in modes_seen(m) and ctx.complete
+
+
+def test_scene_tile_takes_three_views_one_per_angle():
+    ctx, m = make(world=scene_world())
+    run(ctx, m, 300)
+    assert ctx.played.count('scenescan') == 1
+    assert ctx.views == ['left', 'centre', 'right'] and [a[0] for a in ctx.asked] == ['2,0'] * 3
+    assert ctx.recorded == [('2,0', True)] and (2, 0) in ctx.tiles.described
 
 
 def test_scene_tile_the_ai_calls_traversable_is_an_ordinary_tile_again():
@@ -659,7 +675,7 @@ def test_scene_tile_is_marked_explored_even_when_the_ai_fails():
     ctx, m = make(world=scene_world())
     ctx.ai_fails = {'2,0'}
     run(ctx, m, 300)
-    assert len(ctx.asked) == 2 and (2, 0) in ctx.tiles.described and ctx.complete
+    assert len(ctx.asked) == 4 and (2, 0) in ctx.tiles.described and ctx.complete   # 3 views, then 1 single try
 
 
 def test_no_scene_mode_when_scenes_are_off():

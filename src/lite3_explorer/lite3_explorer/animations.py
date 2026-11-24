@@ -39,6 +39,7 @@ class RobotAnimation:
     def __init__(self):
         self.started_at: Optional[float] = None
         self.finished = False
+        self._markers: List[str] = []           # named moments reached since the last pop_markers()
 
     @property
     def running(self) -> bool:
@@ -50,6 +51,11 @@ class RobotAnimation:
 
     def tick(self, now: float) -> List[Command]:
         raise NotImplementedError
+
+    def pop_markers(self) -> List[str]:
+        """Names of the marker moments (see PoseAnimation.markers) reached since the last call."""
+        out, self._markers = self._markers, []
+        return out
 
     def cancel(self, now: float) -> List[Command]:
         """Stop early; returns the commands needed to leave the robot in a safe state."""
@@ -85,9 +91,14 @@ class PoseAnimation(RobotAnimation):
         self._sent_exit = 0
         self._last_mode_t = 0.0
         self._exiting_at: Optional[float] = None
+        self._marker_todo: List[Tuple[float, str]] = []
 
     def keyframes(self) -> List[Tuple[float, Dict[int, int]]]:
         raise NotImplementedError
+
+    def markers(self) -> List[Tuple[float, str]]:
+        """[(seconds into the animated part, name)]: moments the owner is told about (e.g. to take a picture)."""
+        return []
 
     def _build_timeline(self):
         """[(t_start, t_end, from_pose, to_pose)] with absolute pose dicts."""
@@ -123,6 +134,8 @@ class PoseAnimation(RobotAnimation):
         super().start(now)
         self._sent_enter = self._sent_exit = 0
         self._exiting_at = None
+        self._marker_todo = sorted(self.markers())
+        self._markers = []
 
     def tick(self, now: float) -> List[Command]:
         if not self.running:
@@ -133,6 +146,8 @@ class PoseAnimation(RobotAnimation):
             body_t = t - self.mode_settle_s
             if body_t >= 0.0:
                 cmds += list(self.pose_at(body_t).items())
+                while self._marker_todo and self._marker_todo[0][0] <= body_t:
+                    self._markers.append(self._marker_todo.pop(0)[1])
             if body_t >= self.duration + self.end_settle_s:
                 self._exiting_at = now
             return cmds
@@ -148,14 +163,14 @@ class PoseAnimation(RobotAnimation):
 
 
 class QuickScan(PoseAnimation):
-    """Lean forward, look left and right while staying leaned, then back up (level, centred).
+    """Yaw the body left and right (level, no lean by default), then back to centre.
 
-    Pauses for pause_s at the forward lean and at the right extreme (no pause at the left: the
+    lean > 0 optionally leans forward during the scan. Pauses for pause_s at the start pose and at the right extreme (no pause at the left: the
     look left flows straight into the sweep right).
     """
     name = 'quickscan'
 
-    def __init__(self, pause_s: float = 0.5, move_s: float = 1.0, lean: int = 32767, yaw: int = 32767,
+    def __init__(self, pause_s: float = 1.0, move_s: float = 1.0, lean: int = 0, yaw: int = 32767,
                  **kw):
         if not 0 <= abs(lean) <= LEAN_MAX or not YAW_DEAD_ZONE < abs(yaw) <= YAW_MAX:
             raise ValueError(f'lean must be within +-{LEAN_MAX} and yaw beyond the dead zone '
@@ -175,4 +190,32 @@ class QuickScan(PoseAnimation):
         ]
 
 
-ANIMATIONS = {cls.name: cls for cls in (QuickScan,)}
+class SceneScan(PoseAnimation):
+    """Yaw to the left, back to the centre, then to the right, stopping at each for pause_s (level, no lean).
+
+    The markers 'left', 'centre' and 'right' are reached at the end of each pause: the scene mode takes a picture
+    at each. Ends level and centred.
+    """
+    name = 'scenescan'
+
+    def __init__(self, pause_s: float = 1.0, move_s: float = 1.0, yaw: int = 20000, **kw):
+        if not YAW_DEAD_ZONE < abs(yaw) <= YAW_MAX:
+            raise ValueError(f'yaw must be beyond the dead zone ({YAW_DEAD_ZONE}) up to {YAW_MAX}')
+        self.pause_s, self.move_s, self.yaw = pause_s, move_s, yaw
+        super().__init__(**kw)
+
+    def keyframes(self):
+        p, m, yaw = self.pause_s, self.move_s, self.yaw
+        return [
+            (m, {YAW: -yaw}), (p, {}),          # look left, hold
+            (m, {YAW: 0}), (p, {}),             # back to the centre, hold
+            (m, {YAW: yaw}), (p, {}),           # look right, hold
+            (m, {YAW: 0}),                      # centred again
+        ]
+
+    def markers(self):
+        p, m = self.pause_s, self.move_s
+        return [(m + p, 'left'), (2 * (m + p), 'centre'), (3 * (m + p), 'right')]
+
+
+ANIMATIONS = {cls.name: cls for cls in (QuickScan, SceneScan)}

@@ -54,6 +54,7 @@ class GaitSwitcher(Node):
         self.create_subscription(Bool, '/spin_crawl', self._on_crawl_hold, 10)
         self.create_subscription(Bool, '/spin_flat', self._on_flat_request, 10)
         self.animating = False                            # no gait commands while a robot animation runs
+        self.pre_animation_gait = None                    # the gait in use when the animation started: sent again after
         self.create_subscription(Bool, '/animation_active', self._on_animation, 10)
         self.ai_mode = False                              # no gait commands while the robot is in AI mode (stairs)
         self.create_subscription(Bool, '/ai_mode', self._on_ai_mode, latched)
@@ -117,8 +118,16 @@ class GaitSwitcher(Node):
 
     def _on_animation(self, msg):
         was, self.animating = self.animating, bool(msg.data)
-        if was and not self.animating:
-            self.switcher.restore()                       # move mode is back: restore the terrain gait
+        if self.animating and not was:
+            self.pre_animation_gait = self.switcher.gait
+        elif was and not self.animating:
+            # Move mode is back and the robot has dropped its gait: send the one it had before the animation again
+            # (the terrain loop takes over from there at the next event, as before).
+            gait, self.pre_animation_gait = self.pre_animation_gait, None
+            if gait in GAIT_CODES:
+                self._send(GaitCommand(gait, GAIT_CODES[gait]), self._now())
+            else:
+                self.switcher.restore()                   # none sent before: the terrain gait
 
     def _on_ai_mode(self, msg):
         was, self.ai_mode = self.ai_mode, bool(msg.data)

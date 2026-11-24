@@ -198,7 +198,10 @@ class HeadlessCtx:
         pass
 
     # scene mode: no AI in the simulation -> a call that has already failed (as mission_manager with use_ai false)
-    def describe_scene(self, label, pose):
+    def animation_markers(self):
+        return []
+
+    def describe_scene(self, label, pose, view=None):
         self.scenes_described.append((label, list(pose) if pose else None))
         return _NoAiCall()
 

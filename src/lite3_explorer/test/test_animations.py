@@ -55,3 +55,17 @@ def test_cancel_goes_to_move_mode():
     a.tick(0.0)
     cmds = a.cancel(1.0)
     assert cmds and all(c == (MOVE_MODE, 0) for c in cmds) and a.finished
+
+
+def test_scenescan_markers_left_centre_right_once_each():
+    from lite3_explorer.animations import SceneScan
+    a = SceneScan(pause_s=1.0, move_s=1.0, yaw=20000, mode_settle_s=0.0)
+    assert 'scenescan' in ANIMATIONS and a.pose_at(1.0)[YAW] == -20000 and a.pose_at(5.0)[YAW] == 20000
+    assert a.pose_at(a.duration)[YAW] == 0
+    a.start(0.0)
+    seen, t = [], 0.0
+    while not a.finished and t < 60:
+        a.tick(t)
+        seen += a.pop_markers()
+        t += 0.1
+    assert seen == ['left', 'centre', 'right']

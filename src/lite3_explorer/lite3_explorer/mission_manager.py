@@ -300,6 +300,8 @@ class MissionManager(Node):
         # robot animations (animation_player): /play_animation starts one, /animation_active says when it is over
         self.animation_pub = self.create_publisher(String, '/play_animation', 10)
         self.create_subscription(Bool, '/animation_active', self._on_animation_active, 10)
+        self._markers = []                     # /animation_marker names not read yet
+        self.create_subscription(String, '/animation_marker', lambda m: self._markers.append(m.data), 10)
         self._animation = 'done'               # pending (asked, not started) | running | done
         self.terrain_client = self.create_client(Trigger, cfg['terrain_classify_service']) \
             if cfg['terrain_classify_service'] else None
@@ -454,8 +456,14 @@ class MissionManager(Node):
 
     def animation_play(self, name):
         self._animation = 'pending'
+        self._markers = []
         self.animation_pub.publish(String(data=name))
         return True
+
+    def animation_markers(self):
+        """The animation's marker names reached since the last call."""
+        out, self._markers = self._markers, []
+        return out
 
     def animation_state(self):
         return self._animation
@@ -975,7 +983,7 @@ class MissionManager(Node):
         self.report_calls[label] = self.llm.request('describe_tile', **self.report_args[label])
         self._write_book()
 
-    def describe_scene(self, label, pose):
+    def describe_scene(self, label, pose, view=None):
         """Scene mode: ask the AI what the scene tile (the robot stands on a neighbour, facing it) looks like.
         Returns an LlmCall (done / ok / result / failure()); an AI that is off gives a call that has already failed."""
         self.query_count += 1
@@ -985,8 +993,11 @@ class MissionManager(Node):
                    f'(a scanned, mostly non-traversable tile the robot does not enter). The robot stands on the '
                    f'neighbouring tile {here} at ({pose[0]:.2f}, {pose[1]:.2f}) in the map frame and is facing tile {label}. '
                    f'Classify what is on tile {label}: one of the eight scene types, or traversable.')
+        if view:
+            context += (f' This picture is the {view} view of three (left, centre, right: the robot yaws its body to '
+                        f'each), so part of the tile may be out of frame.')
         return self.llm.request('describe_tile', timeout_s=float(self.cfg['llm_report_timeout_s']),
-                                name=f'scene_{label.replace(",", "_")}_q{self.query_count:04d}', tile=label, pose=pose,
+                                name=f'scene_{label.replace(",", "_")}_q{self.query_count:04d}' + (f'_{view}' if view else ''), tile=label, pose=pose,
                                 context=context, save_dir=self.scene_images_dir, prompt='describe_scene')
 
     def record_scene(self, label, pose, call):
@@ -999,6 +1010,8 @@ class MissionManager(Node):
                 self.event('scene_traversable', tile=label)
             if result.get('image'):
                 result['image'] = os.path.join(self.scene_images_dir, result['image'])   # the report joins run_dir: absolute wins
+            if result.get('images'):
+                result['images'] = {k: os.path.join(self.scene_images_dir, v) for k, v in result['images'].items()}
             self.book.set_result(label, result)
             self.get_logger().info(f'Scene tile {label}: {call.result.get("scene_description")}')
         elif not self.use_ai:

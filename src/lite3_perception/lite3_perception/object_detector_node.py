@@ -131,6 +131,7 @@ class ObjectDetectorNode(Node):
         p("survivor_new_if_moved_m", 1.5)                        # no-depth de-dup: same survivor if robot moved less than this
         p("survivor_new_if_bearing_deg", 25.0)                   # ... and the bearing differs by less than this
         # --- scene (room type) from what is in view: scene -> labels that suggest it
+        p("scene_enable", False)                               # off: a separate scene package provides the room
         p("scene_rules", '{"workshop": ["tool_bench", "hand_tools"], "kitchen": ["kitchen", "utensils"], '
                          '"market": ["market_stall", "cart", "food"], "clinic": ["medical_kit"]}')
         p("scene_decisive", '{"utensils": "kitchen", "kitchen": "kitchen", "tool_bench": "workshop", '
@@ -142,6 +143,8 @@ class ObjectDetectorNode(Node):
         p("scene_topic", "/mission/scene_type")
         # --- QR beside a survivor (M03 = survivor WITH a QR, M05 = survivor without)
         p("qr_assoc_s", 3.0)                                   # QR seen within N s of the survivor = "has QR"
+        p("qr_report", False)                                  # False: QR codes are only identified (for M03/M05),
+                                                               #        never sent as events / M04 reports
         p("qr_text_topic", "/perception/qr_text")
         # --- mission reporter hand-off (lite3_mission_reporter)
         p("publish_observations", True)                        # set false if llm_event_bridge publishes them instead
@@ -219,6 +222,7 @@ class ObjectDetectorNode(Node):
         self.survivor_max_h = float(g("survivor_max_height_m"))
         self.survivor_moved = float(g("survivor_new_if_moved_m"))
         self.survivor_bearing = float(g("survivor_new_if_bearing_deg"))
+        self.scene_enable = bool(g("scene_enable"))
         self.scene_rules = json.loads(g("scene_rules"))
         self.scene_window = float(g("scene_window_s"))
         self.scene_decisive = json.loads(g("scene_decisive"))
@@ -228,6 +232,7 @@ class ObjectDetectorNode(Node):
         self.scene_hist = []                                   # (t, label, conf)
         self.scene = ""
         self.qr_assoc = float(g("qr_assoc_s"))
+        self.qr_report = bool(g("qr_report"))
         self.last_qr_seen = -1e9                               # any QR in view (decoded or not)
         self.last_qr_text = ""
         self.hz_min_area = int(g("hazard_min_area"))
@@ -300,7 +305,8 @@ class ObjectDetectorNode(Node):
         self.pub_dets.publish(String(data=json.dumps({"stamp": now, "detections": dets, "hazards": hazards})))
 
         self.check_qr(img, header, dets)
-        self.update_scene(dets, now)
+        if self.scene_enable:
+            self.update_scene(dets, now)
 
         candidates = []
         for d in dets:
@@ -496,6 +502,8 @@ class ObjectDetectorNode(Node):
                 continue
             self.reported_qr.add(text)
             self.pub_qr_text.publish(String(data=text))        # exact decoded string, for other packages
+            if not self.qr_report:
+                continue                                       # identified only, not reported
             xs, ys = pts[:, 0], pts[:, 1]
             d = {"label": "qr code", "confidence": 1.0,
                  "bbox_xyxy": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]}

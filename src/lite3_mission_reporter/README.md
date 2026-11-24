@@ -1,140 +1,123 @@
 # lite3_mission_reporter
 
-Turns perception events into the result messages the organisers require (one JSON per answered task, `M01`…`Mxx`). It publishes them on a topic, writes them to disk, and optionally POSTs them to the organisers' server.
-
-Everything lives in one node: [mission_reporter_node.py](lite3_mission_reporter/mission_reporter_node.py).
-
-## Data flow
-
-```
-/perception/event ──────────┐   (default)
-/perception/llm_result ─────┤   (use_llm_result:=true, replaces /perception/event)
-/mission/scene_type ────────┼──► mission_reporter ──► /mission/result  (std_msgs/String, JSON)
-/mission/manual_report ─────┘                    ├──► <output_dir>/results.jsonl + results.json
-                                                 └──► POST server_url  (optional)
-```
-
-### Topics
-
-| Topic | Dir | Type | Notes |
-|---|---|---|---|
-| `/perception/event` | in | String (JSON) | From the object detector. `type` is `object`, `hazard` or `qr`. |
-| `/perception/llm_result` | in | String (JSON) | Only subscribed when `use_llm_result` is true. Uses the LLM's verified label/room. |
-| `/mission/scene_type` | in | String | Current room name, e.g. `kitchen`. Last message wins. |
-| `/mission/manual_report` | in | String (JSON) | Manual override. Any of `task_id`, `task_type`, `scene_type`, `label`, `pos`, `message`. Marks that task done and emits immediately. |
-| `/mission/result` | out | String (JSON) | One message per answered task. QoS is reliable and transient-local, so late subscribers get them. |
-
-### Result format
+Turns what the robot finds into the organisers' result messages, **one per mission (M01–M05)**. It publishes them on ROS, saves them to a file, and (optionally) POSTs them to the task server.
 
 ```json
-{"group_id": "group01_s3xy", "task_id": "M01", "task_type": "object",
- "scene_type": "clinic", "label": "hand_tools", "pos": [3.06, 2.04], "message": ""}
+{"group_id": "group01_s3xy", "task_id": "M01", "task_type": "object", "scene_type": "workshop",
+ "label": "hand_tools", "pos": [3.06, 2.04], "message": ""}
 ```
 
-- `pos` is the map-frame `[x, y]`, rounded to 2 decimals. The reporter tries `location.xy`, then `location.position_map`, then falls back to `robot_pose`.
-- `qr` results have `pos: null`, an empty `label`, and the decoded text in `message`.
-- `survivor` results have an empty `label`.
+## Where each part comes from
 
-## How a task gets answered
+| Input topic (all `std_msgs/String`) | From | Used for |
+|---|---|---|
+| `/perception/event` (JSON) | `lite3_perception` | hand tools, hazard signs, survivors (with `qr_in_view`) |
+| `scene_topic` (default `/mission/scene_type`) | **your scene package** | `scene_type` of every report (the last message received). Plain text `kitchen` or JSON `{"scene_type": "kitchen"}` |
+| `position_topic` (default `""` = off) | **your position package** | `pos` of every report except M04 (the last position received). Type set by `position_msg_type` |
+| `qr_message_topic` (default `/perception/qr_text`) | **your QR package** | answers M04; its text becomes `message`. Plain text, or JSON with `message` / `text` / `decoded` |
+| `/mission/manual_report` (JSON) | you, by hand | send or override any field of a result |
+| `/perception/llm_result` (JSON) | `llm_event_bridge` | only with `use_llm_result: true` |
 
-Tasks are defined in the YAML as parallel lists (same index = same task). They are fixed for both practice and competition.
-
-| Parameter | Meaning |
+| Output | Content |
 |---|---|
-| `task_ids` | `M01`… |
-| `task_types` | `object`, `hazard`, `survivor` or `qr` |
-| `task_labels` | Required label. `""` accepts any label of that type. |
-| `task_scenes` | `""` reports the room perception says the robot is in. A name forces or requires that room. |
-| `task_conditions` | Survivor tasks only. `qr` = survivor with a QR beside it. `no_qr` = survivor without one. |
+| `/mission/result` (`std_msgs/String`, latched) | each result JSON, once per mission |
+| `~/lite3_mission_results/results.json` | all results this run (rewritten each time) |
+| `~/lite3_mission_results/results.jsonl` | every result from every run, plus the server's replies |
+| `POST server_url` | each result, if `server_url` is set |
 
-For each incoming event (`process()`):
+## The five missions (fixed)
 
-1. **Filter.**
-   - Drop it if the source is not confirmed or `confidence < min_confidence`.
-   - On the `/perception/event` path, drop hazards with `hazard_certain == false`. Only the LLM path may decide those.
-   - If `require_position` is true and a non-QR event has no position, drop it and keep the task open.
-2. **Classify.** The event becomes `qr`, `hazard` or `survivor` (label `survivor`). Anything else is `object`.
-3. **Match a task.** The first open task of that type whose `label` is empty or equal to the event label. With `report_each_task_once` (default), a task closes after its first answer.
-4. **Pick the scene.** `task_scenes` if set. Otherwise the LLM's `room_type`, then the event's `scene_type`, then the last `/mission/scene_type`.
-5. **Emit.** Publish, append to the files, and POST if `server_url` is set.
+| Mission | `task_type` | Answered by |
+|---|---|---|
+| M01 | `object`, `label: hand_tools` | the first `hand_tools` event |
+| M02 | `hazard`, `label` = the sign found | the first **certain** hazard sign (any of the 5) |
+| M03 | `survivor` | a survivor **with** a QR code beside it (`qr_in_view`, or a QR seen within 1.5 m) |
+| M04 | `qr`, `pos: null`, `message` = exact QR text | the first text on `qr_message_topic` |
+| M05 | `survivor` | a survivor **without** a QR, seen close enough to be sure (it fills >= 25% of the image height) |
 
-### Survivor logic
+**Rules:**
+- Each mission is answered **once**. Later sightings log `no open matching task`.
+- The **same survivor** (within 1 m) can't answer both M03 and M05.
+- With `require_position: true`, a sighting without a map position doesn't use up a mission. It logs `no position ... task kept open` and waits for a sighting that has one.
 
-Survivors have extra rules (`pick_survivor_task()`):
-
-- **De-duplication.** A survivor within `same_survivor_radius_m` of one already reported is skipped.
-- **QR association.** QR positions are remembered. A survivor "has a QR" if the event has `qr_in_view`, or a QR was seen within `qr_near_survivor_m`.
-- **Conditions.** `qr` tasks only take survivors with a QR. `no_qr` tasks only take survivors without one.
-- **Distance check for `no_qr`.** The survivor must fill at least `no_qr_min_bbox_h_frac` of the image height. A distant survivor might have an unseen QR, so it is not reported yet.
-- **Unknown room.** If the task requires a scene and the room is unknown, the survivor is held when `hold_unknown_scene_survivors` is true.
-
-## Outputs
-
-- `/mission/result` topic, one message per task.
-- `<output_dir>/results.jsonl` (default `~/lite3_mission_results`) is append-only. It holds each result, plus a `{"server_reply_for": ...}` line per server POST.
-- `<output_dir>/results.json` is the full list of results, rewritten on each emit.
-- Server POST, if `server_url` is set. It runs in a background thread, so a slow or failed server never blocks the node. A failure is logged and the result stays in the files.
-- `republish_hz > 0` re-sends all results periodically.
-
-## Running
+## Install
 
 ```bash
-ros2 launch lite3_mission_reporter mission_reporter.launch.py
-ros2 launch lite3_mission_reporter mission_reporter.launch.py url:=A use_llm_result:=true
+cd ~/2d/src && unzip lite3_mission_reporter.zip
+cd ~/2d && colcon build --packages-select lite3_mission_reporter && source install/setup.bash
 ```
 
-Launch arguments ([mission_reporter.launch.py](launch/mission_reporter.launch.py)):
+## Configure (`config/mission_reporter.yaml`, rebuild after editing)
 
-| Arg | Default | Effect |
+| Setting | Set to |
+|---|---|
+| `group_id` | your exact group ID + pin |
+| `scene_topic` | the topic your scene package publishes |
+| `qr_message_topic` | the topic your QR package publishes |
+| `position_topic` | the topic your position package publishes (`""` = use perception's position) |
+| `position_msg_type` | `string` (`"[x, y]"`, `"x,y"`, `{"x":..,"y":..}`), `point_stamped`, `pose_stamped`, `pose_cov`, `odometry`, `point`, `pose` |
+| `require_position` | `true` for real runs; `false` to allow `"pos": null` when testing without SLAM |
+| `server_url` | `""` (no sending), `"http://127.0.0.1:8001/task_report"` (practice server), or the organisers' address |
+
+Already set for the fixed missions (don't change):
+```yaml
+task_ids:        ["M01", "M02", "M03", "M04", "M05"]
+task_types:      ["object", "hazard", "survivor", "qr", "survivor"]
+task_labels:     ["hand_tools", "", "", "", ""]
+task_conditions: ["", "", "qr", "", "no_qr"]
+```
+
+Other settings:
+
+| Setting | Default | Meaning |
 |---|---|---|
-| `use_llm_result` | `false` | Listen to `/perception/llm_result` instead of `/perception/event`. |
-| `url` | `""` | `A` / `URLA` posts to `<server>/task_report_A`. `B` / `URLB` posts to `<server>/task_report_B`. A full `http(s)://` URL is used as given. Empty uses `server_url` from the YAML. Anything else raises an error. |
+| `scene_from` | `topic` | `topic` = only the scene package decides the room |
+| `same_survivor_radius_m` | `1.0` | survivors closer than this = the same one |
+| `qr_near_survivor_m` | `1.5` | a QR position this close to a survivor = that survivor has a QR |
+| `no_qr_min_bbox_h_frac` | `0.25` | how close (by size in the image) a survivor must be before calling it "no QR" |
+| `use_llm_result` | `false` | `true` = use LLM-checked results from `llm_event_bridge` |
+| `output_dir` | `~/lite3_mission_results` | where the result files go |
 
-The organiser server address is hard-coded as `SERVER` at the top of the launch file. Update it if the network changes.
+## Run
 
-Set the room as the robot moves:
+```bash
+rm -f ~/lite3_mission_results/results.json      # optional: clear the last run's file
+ros2 launch lite3_mission_reporter mission_reporter.launch.py
+ros2 topic echo /mission/result --full-length --qos-durability transient_local    # watch answers
+```
+The startup log shows:
+- `pos from <position topic> (<type>)`, then `first position from ...` once a position arrives
+- `scene from <scene topic>`
+- `M04 message from <QR topic>`
+- `mission_reporter up: group=... tasks=[...] server=...`
+
+**Between runs:** restart the node. It forgets answered missions on restart.
+
+## Test by hand
 
 ```bash
 ros2 topic pub --once /mission/scene_type std_msgs/String "{data: kitchen}"
-```
-
-Send a manual result:
-
-```bash
+ros2 topic pub --once /perception/qr_text std_msgs/String "{data: 'Please help me.'}"     # -> M04
 ros2 topic pub --once /mission/manual_report std_msgs/String \
-  '{data: "{\"task_id\": \"M01\", \"label\": \"hand_tools\", \"pos\": [1.0, 2.0]}"}'
+  "{data: '{\"task_id\": \"M01\", \"task_type\": \"object\", \"label\": \"hand_tools\", \"pos\": [3.06, 2.04]}'}"
 ```
 
-Watch the results:
+## Practice server
 
+`mock_task_server.py`, kept in `~/2d/scripts`, stands in for the organisers' server. It checks each result's format, and you can view the results in a browser.
 ```bash
-ros2 topic echo /mission/result
+python3 ~/2d/scripts/mock_task_server.py           # then server_url: "http://127.0.0.1:8001/task_report"
 ```
+To view the results, forward port 8001 in VS Code's **Ports** tab, then open `localhost:8001`. **[Clear]** empties the table.
 
-## Configuration
+## Log messages (normal, not errors)
 
-All parameters are in [config/mission_reporter.yaml](config/mission_reporter.yaml).
-
-| Parameter | Default | Meaning |
-|---|---|---|
-| `group_id` | `""` | Your group id, copied exactly from the organisers. Results are rejected if it is empty (the node warns). |
-| `default_scene_type` | `""` | Initial room, until `/mission/scene_type` updates it. |
-| `use_llm_result` | `false` | Use the LLM-verified result stream. |
-| `require_survivor_confirmed` | `true` | (LLM mode) skip survivors the LLM says are not survivors. |
-| `min_confidence` | `0.0` | Minimum event confidence. |
-| `same_survivor_radius_m` | `1.0` | Radius for treating two survivor sightings as the same one. |
-| `hold_unknown_scene_survivors` | `true` | Hold scene-bound survivor tasks while the room is unknown. |
-| `qr_near_survivor_m` | `1.5` | A QR within this distance counts as beside the survivor. |
-| `no_qr_min_bbox_h_frac` | `0.25` | Minimum survivor size before reporting "no QR". |
-| `require_position` | `false` | Don't answer non-QR tasks without a position. The YAML comment suggests turning this on once position sourcing is confirmed. |
-| `report_each_task_once` | `true` | Close a task after its first answer. |
-| `output_dir` | `~/lite3_mission_results` | Where the result files go. |
-| `republish_hz` | `0.0` | Periodically re-send all results (0 = off). |
-| `server_url` | `""` | POST target. Empty means topic and files only. |
-| `server_timeout_s` | `5.0` | HTTP timeout. |
-
-## Gotchas
-
-- Without a position source (no depth and no `map->base` TF), `pos` is `null`. Turn on `require_position` to hold the task open until a located sighting arrives.
-- Uncertain hazards are only reported through the LLM path, so with `use_llm_result:=false` they are silently ignored.
-- There is no unit test for this package yet. The logic is in `process()` and `pick_survivor_task()`.
+| Message | Meaning |
+|---|---|
+| `no open matching task, not reported` | that mission is already answered |
+| `no position ... task kept open` | no map position yet (SLAM / TF) |
+| `same one already reported as M03, skipped` | the same survivor was seen again |
+| `too far to be sure ... not reported as M05 yet` | it needs to get closer to check for a QR |
+| `not sure which sign, not reported` | unclear hazard sign |
+| `qr task already answered, not reported` | another QR text arrived; the first one counts |
+| `server M01: {...}` / `send FAILED` | the server's reply / the server is unreachable (the result is still saved to file) |

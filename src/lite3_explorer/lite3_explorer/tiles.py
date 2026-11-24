@@ -1,8 +1,9 @@
 """1 m x 1 m tile system over the SLAM map (no ROS).
 
 The grid is anchored by the initial tile (chosen with the AI at start-up) and may be
-rotated to line up with the maze walls. Tile (0, 0) is the initial tile; i grows
-along the grid's x axis ("east"), j along its y axis ("north").
+rotated to line up with the maze walls. Tile (0, 0) is the initial tile. The grid is oriented by the
+robot's initial heading: j grows forward (tiles in front of the initial tile are positive) and i grows
+to the right (tiles to its right are positive); behind / to the left are negative.
 
 Tile status
   visited   the robot's centre has been inside the tile (part of the trail)
@@ -164,11 +165,20 @@ def initial_candidates(grid: np.ndarray, info: GridInfo, robot_pose: Sequence[fl
         half = size / 2.0
         return TileGrid(rx - c * half + s * half, ry - s * half - c * half, yaw, size)
 
+    def oriented(yaw):
+        """The same wall-aligned grid turned by a multiple of 90 deg so that +j points along the robot's initial
+        heading (tiles in front are positive) and +i to its right (tiles on the right are positive)."""
+        if heading is None:
+            return yaw
+        want = heading - math.pi / 2.0
+        return want + round(wrap(yaw - want) / (math.pi / 2.0)) * (math.pi / 2.0)
+
     cands = []
     pts = _occupied_points(grid, info, (rx, ry), radius_m, occupied_threshold)
     est = estimate_wall_angle(pts)
     if est is not None:
         yaw, quality = est
+        yaw = oriented(yaw)
         c, s = math.cos(yaw), math.sin(yaw)
         walls = start_tile_walls(pts, (rx, ry), yaw, size)
         back = None
@@ -198,6 +208,7 @@ def initial_candidates(grid: np.ndarray, info: GridInfo, robot_pose: Sequence[fl
             cands.append({'grid': centre, 'kind': 'centred on the robot, turned to match the walls'})
     if est is None or abs(math.degrees(est[0]) % 90) > 3:
         cands.append({'grid': centred(0.0), 'kind': 'centred on the robot, along the map axes'})
+        cands[-1]['grid'] = centred(oriented(0.0))
     for letter, cand in zip('ABCD', cands):
         cand['id'] = letter
         cand['sides'] = tile_sides(grid, info, cand['grid'], (0, 0), occupied_threshold=occupied_threshold)

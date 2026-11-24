@@ -224,6 +224,10 @@ DEFAULTS: Dict[str, Any] = {
             'max_turn_rad_s': 0.6,
             'turn_gain': 1.0,
             'settle_s': 1.0,              # stand still facing it before the AI looks (sharp image)
+            'quickscan': True,            # take 3 pictures (yaw left, centre, right: the scenescan animation) instead of one
+            'animation': 'scenescan',
+            'start_timeout_s': 3.0,       # animation_player did not start it: one picture from where it stands
+            'timeout_s': 30.0,            # give up on (and cancel) the animation after this long
             'llm_attempts': 2,            # AI description tries; after the last the tile is marked explored anyway
         },
         'mppi': {

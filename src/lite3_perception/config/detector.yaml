@@ -38,6 +38,7 @@ object_detector:
     hazard_min_margin: 0.02
 
     # scene (room type) worked out from what is in view; published on /mission/scene_type and added to every event
+    scene_enable: false                           # OFF: your scene package publishes the room instead
     # scene names MUST match the organisers' scene_type names exactly
     scene_rules: '{"workshop": ["tool_bench", "hand_tools"], "kitchen": ["kitchen", "utensils"], "market": ["market_stall", "cart", "food"], "clinic": ["medical_kit"]}'
     # DECIDING objects: if one of these is seen (in >= scene_decisive_hits frames), it sets the scene outright,
@@ -50,6 +51,7 @@ object_detector:
     scene_topic: /mission/scene_type
 
     # M03 = survivor WITH a QR code beside it, M05 = survivor without
+    qr_report: false                              # QR codes are identified (survivor with/without QR) but NOT reported
     qr_assoc_s: 3.0                               # QR in view within this many seconds of the survivor = "has QR"
     qr_text_topic: /perception/qr_text            # every newly decoded QR string, exactly as decoded
 

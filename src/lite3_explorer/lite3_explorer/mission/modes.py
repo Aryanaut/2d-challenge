@@ -1022,6 +1022,41 @@ class MppiMode(Mode):
 
 
 # ----------------------------------------------------------------------------------------- curtain
+class _ViewsCall:
+    """The AI calls of a scene tile's views (left / centre / right) as one call: done when all are, ok when any is.
+    The result is the centre view's with all the descriptions joined; the scene type is the commonest one the views
+    named (traversable only when every view said so)."""
+    ORDER = ('centre', 'left', 'right')
+
+    def __init__(self, calls):
+        self.calls = calls                                  # {view: call}
+
+    @property
+    def done(self):
+        return all(c.done for c in self.calls.values())
+
+    @property
+    def ok(self):
+        return any(c.ok for c in self.calls.values())
+
+    def failure(self):
+        return '; '.join(f'{v}: {c.failure()}' for v, c in self.calls.items() if not c.ok) or 'no views'
+
+    @property
+    def result(self):
+        good = {v: c.result for v, c in self.calls.items() if c.ok}
+        views = [v for v in self.ORDER if v in good]
+        out = dict(good[views[0]])
+        out['scene_description'] = ' | '.join(f'{v.capitalize()}: {good[v].get("scene_description", "")}'
+                                              for v in ('left', 'centre', 'right') if v in good)
+        out['images'] = {v: good[v]['image'] for v in ('left', 'centre', 'right') if good[v].get('image')}
+        types = [good[v].get('scene_type') for v in views if good[v].get('scene_type')]
+        named = [t for t in types if t != 'traversable']
+        if types:
+            out['scene_type'] = max(set(named), key=named.count) if named else 'traversable'
+        return out
+
+
 @register_mode('scene')
 class SceneMode(Mode):
     """A scene tile shares a side with the tile the robot stands on: look at it, never enter it.
@@ -1039,12 +1074,14 @@ class SceneMode(Mode):
         self.label, self.tile, self.yaw, self.call, self.attempt, self.pose0 = None, None, 0.0, None, 0, None
         self.turn_dir = 0                                  # +1 / -1: the direction the turn started in
         self.centre, self.hold_yaw = None, None            # the current tile's centre; heading held driving there
+        self.views = {}                                    # view name -> AI call, while the scenescan animation plays
 
     def targets(self):
         return [self.cfg.get('next_mode', 'exploring')]
 
     def enter(self, reason, tile=None, **kw):
         self.label, self.call, self.attempt, self.turn_dir = tile, None, 0, 0
+        self.views = {}
         self.ctx.set_target(None, None, None)
         pose, tiles = self.ctx.pose(), self.ctx.tiles
         if not tile or pose is None or tiles.grid is None:
@@ -1066,7 +1103,7 @@ class SceneMode(Mode):
 
     def _start_align(self, pose):
         self.ctx.stop()
-        self.yaw = self._facing(pose)                      # from where the robot really is (the centre, or near it)
+        self.yaw = self._facing(self.centre)               # yaw setpoint: along the line from this tile's centre to the scene tile's
         self.turn_dir = 0
         self.set_phase('align')
 
@@ -1140,7 +1177,33 @@ class SceneMode(Mode):
             self.ctx.stop()
             if self.in_phase_s() >= float(c.get('settle_s', 1.0)):
                 self.pose0 = pose
-                self._ask()
+                if self.attempt == 0 and c.get('quickscan', True) and self.ctx.animation_play(c.get('animation', 'scenescan')):
+                    self.ctx.animation_markers()           # drop stale ones
+                    self.set_phase('quickscan')
+                else:
+                    self._ask()
+        elif self.phase == 'quickscan':
+            # a picture (+ AI call) at each marker the animation reaches: left, centre, right
+            for view in self.ctx.animation_markers():
+                if view not in self.views:
+                    self.views[view] = self.ctx.describe_scene(self.label, self.pose0, view=view)
+            state = self.ctx.animation_state()
+            t = self.in_phase_s()
+            if state == 'pending' and t > float(c.get('start_timeout_s', 3.0)):
+                self.ctx.log('warn', 'Scene quickscan: animation_player did not start it (is it running?); one picture.')
+                self.ctx.animation_cancel()
+            elif state != 'done' and t > float(c.get('timeout_s', 30.0)):
+                self.ctx.log('warn', 'Scene quickscan: the animation timed out; cancelling it.')
+                self.ctx.animation_cancel()
+            elif state != 'done':
+                return None
+            if self.views:
+                self.attempt += 1
+                self.call = _ViewsCall(self.views)
+                self.ctx.event('scene_quickscan', tile=self.label, views=sorted(self.views))
+                self.set_phase('describe')
+            else:
+                self._ask()                                # no picture was taken: the single one from here
         elif self.phase == 'describe':
             if not self.call.done:
                 return None
@@ -1156,6 +1219,8 @@ class SceneMode(Mode):
         return None
 
     def exit(self, next_mode, reason):
+        if self.phase == 'quickscan' and self.ctx.animation_state() != 'done':
+            self.ctx.animation_cancel()                    # leave pose mode if another mode takes over mid-animation
         self.ctx.stop()
 
 

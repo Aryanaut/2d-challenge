@@ -70,14 +70,17 @@ Two categories:
 
 | Animation | Category | Sequence |
 |---|---|---|
-| `quickscan` | pose | pose mode → lean forward → pause → look left (still leaning) → look right → pause → level and centred → move mode |
+| `quickscan` | pose | pose mode → (optional lean forward, `quickscan.lean`, default 0) → pause → yaw left → yaw right → pause → centred → move mode |
+| `scenescan` | pose | pose mode → yaw left, hold → centre, hold → yaw right, hold → centred → move mode. Publishes `/animation_marker` (`String`: `left`, `centre`, `right`) at the end of each hold; the scene mode takes a picture (one AI call) at each. Parameters `scenescan.pause_s` (1.0), `scenescan.move_s` (1.0), `scenescan.yaw` (20000). |
 
 Pose commands: lean `0x21010130` (±20000, positive = forward), yaw `0x21010135` (values within ±9553 are a dead zone and ignored, so use more, default 20000; positive = right, so left is negative).
 
 `animation_player` parameters: `quickscan.pause_s` (0.5, the pause at the forward lean and at the right extreme), `quickscan.move_s` (1.0),
-`quickscan.lean` (20000), `quickscan.yaw` (20000), `mode_settle_s` (1.0, wait after pose mode), `mode_repeats` (3, mode commands are sent several times
+`quickscan.lean` (0 = no lean; up to 20000 to lean forward), `quickscan.yaw` (20000), `mode_settle_s` (1.0, wait after pose mode), `mode_repeats` (3, mode commands are sent several times
 in case one is lost), `publish_rate_hz`. Topics: `/play_animation` (`std_msgs/String`: an animation name, or `stop`), `/animation_active` (`Bool`).
-`gait_switcher` sends no gait commands while `/animation_active` is true and restores the terrain gait afterwards.
+`gait_switcher` sends no gait commands while `/animation_active` is true and sends the gait that was in use before the animation again afterwards.
+
+**Scene mode:** with `modes.scene.quickscan: true` (default) the robot, once aligned and settled, plays `scenescan` and takes three pictures (left, centre, right) instead of one; the descriptions are joined in the tile report and the scene type is the commonest one named. If the animation cannot start (no `animation_player`) it falls back to one picture.
 
 ```bash
 ros2 run lite3_explorer animation_player

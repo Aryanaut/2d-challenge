@@ -23,7 +23,9 @@ class AnimationPlayer(Node):
         p = lambda name, default: self.declare_parameter(name, default).value  # noqa: E731
         self.params = {
             'quickscan': dict(pause_s=p('quickscan.pause_s', 0.5), move_s=p('quickscan.move_s', 1.0),
-                              lean=p('quickscan.lean', 20000), yaw=p('quickscan.yaw', 20000)),
+                              lean=p('quickscan.lean', 0), yaw=p('quickscan.yaw', 20000)),
+            'scenescan': dict(pause_s=p('scenescan.pause_s', 1.0), move_s=p('scenescan.move_s', 1.0),
+                              yaw=p('scenescan.yaw', 20000)),
         }
         self.common = dict(mode_settle_s=p('mode_settle_s', 1.0), mode_repeats=p('mode_repeats', 3))
         # Match the domain bridge subscriber (RELIABLE + TRANSIENT_LOCAL), as gait_switcher does.
@@ -31,6 +33,7 @@ class AnimationPlayer(Node):
                              reliability=ReliabilityPolicy.RELIABLE)
         self.cmd_pub = self.create_publisher(MotionSimpleCMD, '/simple_cmd', cmd_qos)
         self.active_pub = self.create_publisher(Bool, '/animation_active', 10)
+        self.marker_pub = self.create_publisher(String, '/animation_marker', 10)   # 'left' / 'centre' / 'right' ...
         self.create_subscription(String, p('animation_topic', '/play_animation'), self._on_play, 10)
         self.anim = None
         self.create_timer(1.0 / p('publish_rate_hz', 20.0), self._tick)
@@ -75,6 +78,8 @@ class AnimationPlayer(Node):
         if self.anim is None:
             return
         self._publish(self.anim.tick(self._now()))
+        for marker in self.anim.pop_markers():
+            self.marker_pub.publish(String(data=marker))
         if self.anim.finished:
             self.get_logger().info(f'animation {self.anim.name} finished')
             self.anim = None

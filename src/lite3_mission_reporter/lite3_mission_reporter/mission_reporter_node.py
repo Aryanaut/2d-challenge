@@ -114,8 +114,22 @@ class MissionReporter(Node):
 
         qos = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.pub = self.create_publisher(String, "/mission/result", qos)
-        self.create_subscription(String, "/mission/scene_type", self.on_scene, 10)
+        self.scene_from = p("scene_from", "topic").value           # "topic" = only the scene topic decides
+        scene_topic = p("scene_topic", "/mission/scene_type").value
+        self.create_subscription(String, scene_topic, self.on_scene, 10)
+        self.get_logger().info(f"scene from {scene_topic} (scene_from={self.scene_from})")
         self.create_subscription(String, "/mission/manual_report", self.on_manual, 10)
+        # pos: taken from your position package's topic (same idea as the scene topic)
+        self.topic_pos = None
+        self.pos_topic = p("position_topic", "").value
+        self.pos_type = p("position_msg_type", "string").value
+        if self.pos_topic:
+            self._subscribe_position(self.pos_topic, self.pos_type)
+        # M04: the QR message text comes from another package's topic (std_msgs/String, plain text or JSON)
+        self.qr_topic = p("qr_message_topic", "/perception/qr_text").value
+        if self.qr_topic:
+            self.create_subscription(String, self.qr_topic, self.on_qr_message, 10)
+            self.get_logger().info(f"M04 message from {self.qr_topic}")
         if self.use_llm:
             self.create_subscription(String, "/perception/llm_result", self.on_llm, 10)
         else:
@@ -129,14 +143,99 @@ class MissionReporter(Node):
 
     # ---- inputs -------------------------------------------------------------------------------
     def on_scene(self, msg):
-        self.scene = msg.data.strip()
-        self.get_logger().info(f"scene_type -> '{self.scene}'")
+        txt = msg.data.strip()
+        if txt.startswith("{"):                                # also accept JSON, e.g. {"scene_type": "kitchen"}
+            try:
+                d = json.loads(txt)
+                txt = str(d.get("scene_type") or d.get("scene") or d.get("room") or "").strip()
+            except json.JSONDecodeError:
+                pass
+        if txt and txt != self.scene:
+            self.scene = txt
+            self.get_logger().info(f"scene_type -> '{self.scene}'")
+
+    def _subscribe_position(self, topic, kind):
+        """kind: string | point_stamped | pose_stamped | pose_cov | odometry | point | pose"""
+        def xy_of(m):
+            if kind == "string":
+                t = m.data.strip()
+                try:
+                    d = json.loads(t)
+                except json.JSONDecodeError:
+                    d = [float(v) for v in t.replace(",", " ").split()[:2]]       # "x y" or "x,y"
+                if isinstance(d, dict):
+                    d = d.get("pos") or [d.get("x"), d.get("y")]
+                return [float(d[0]), float(d[1])]
+            if kind in ("point_stamped",):
+                return [m.point.x, m.point.y]
+            if kind == "point":
+                return [m.x, m.y]
+            if kind == "pose_stamped":
+                return [m.pose.position.x, m.pose.position.y]
+            if kind == "pose":
+                return [m.position.x, m.position.y]
+            if kind in ("pose_cov", "odometry"):
+                return [m.pose.pose.position.x, m.pose.pose.position.y]
+            raise ValueError(kind)
+        if kind == "string":
+            mtype = String
+        elif kind in ("point_stamped", "pose_stamped", "pose_cov", "point", "pose"):
+            from geometry_msgs.msg import PointStamped, PoseStamped, PoseWithCovarianceStamped, Point, Pose
+            mtype = {"point_stamped": PointStamped, "pose_stamped": PoseStamped,
+                     "pose_cov": PoseWithCovarianceStamped, "point": Point, "pose": Pose}[kind]
+        elif kind == "odometry":
+            from nav_msgs.msg import Odometry
+            mtype = Odometry
+        else:
+            self.get_logger().error(f"position_msg_type '{kind}' not supported")
+            return
+
+        def cb(m):
+            try:
+                xy = [round(v, 2) for v in xy_of(m)]
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warn(f"position message not understood: {e}", throttle_duration_sec=5.0)
+                return
+            if self.topic_pos is None:
+                self.get_logger().info(f"first position from {topic}: {xy}")
+            self.topic_pos = xy
+        self.create_subscription(mtype, topic, cb, 10)
+        self.get_logger().info(f"pos from {topic} ({kind})")
+
+    def _pos(self, ev):
+        """Position for a report: your position topic if set, otherwise perception's."""
+        if self.pos_topic:
+            return list(self.topic_pos) if self.topic_pos is not None else None
+        return event_position(ev)
+
+    def on_qr_message(self, msg):
+        """A QR text from the QR package -> answer the qr task (pos null, current scene)."""
+        txt = msg.data
+        if txt.strip().startswith("{"):
+            try:
+                d = json.loads(txt)
+                txt = str(d.get("message") or d.get("text") or d.get("decoded") or d.get("data") or "")
+            except json.JSONDecodeError:
+                pass
+        if not txt.strip():
+            return
+        with self.lock:
+            task = next((t for t in self.tasks if t["type"] == "qr" and not (self.once and t["done"])), None)
+            if task is None:
+                self.get_logger().info(f"QR '{txt}': qr task already answered, not reported",
+                                       throttle_duration_sec=5.0)
+                return
+            task["done"] = True
+            res = build_result(self.group_id, task["id"], "qr", task["scene"] or self.scene, "", None, txt)
+            self._emit(res)
 
     def on_event(self, msg):
         try:
             ev = json.loads(msg.data)
         except json.JSONDecodeError:
             return
+        if ev.get("type") == "qr" and self.qr_topic and self.qr_topic != "/perception/qr_text":
+            return                                     # M04 is answered from the QR package's topic instead
         if ev.get("type") == "hazard" and ev.get("hazard_certain") is False:
             # unsure which sign it is: only the LLM (use_llm_result) may decide those
             self.get_logger().info(f"hazard {ev.get('hazard_top3')}: not sure which sign, not reported",
@@ -179,18 +278,21 @@ class MissionReporter(Node):
         if not confirmed or float(ev.get("confidence", 1.0)) < self.min_conf:
             return
         ttype = event_task_type(ev, label)
-        if ttype != "qr" and self.require_pos and event_position(ev) is None:
+        if ttype != "qr" and self.require_pos and self._pos(ev) is None:
             # don't use up a task on a sighting with no position; wait for one that has it
             self.get_logger().warn(
                 f"event {ttype}/{label}: no position (no depth and no map->base TF?) - task kept open",
                 throttle_duration_sec=5.0)
             return
         with self.lock:
-            scene_now = room or ev.get("scene_type") or self.scene
+            if self.scene_from == "topic":
+                scene_now = self.scene                         # only the scene package decides the room
+            else:
+                scene_now = room or ev.get("scene_type") or self.scene
             if ttype == "qr" and event_position(ev) is not None:
                 self.qr_positions.append(event_position(ev))
             if ttype == "survivor":
-                task = self.pick_survivor_task(event_position(ev), scene_now, ev)
+                task = self.pick_survivor_task(self._pos(ev), scene_now, ev)
                 if task is False:
                     return                               # same survivor again, or waiting for the scene
             else:
@@ -203,9 +305,9 @@ class MissionReporter(Node):
             if ttype == "qr":
                 pos, out_label, message = None, "", ev.get("qr_text", "")
             elif ttype == "survivor":
-                pos, out_label, message = event_position(ev), "", ""
+                pos, out_label, message = self._pos(ev), "", ""
             else:
-                pos, out_label, message = event_position(ev), label, ""
+                pos, out_label, message = self._pos(ev), label, ""
             if ttype == "survivor":
                 self.survivors.append((task["id"], pos))
                 scene_out = task["scene"] or scene_now           # M03: the mission's exact room name; M05: the room it was in

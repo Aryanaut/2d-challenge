@@ -214,6 +214,10 @@ mission_manager:
         max_turn_rad_s: 0.6
         turn_gain: 1.0
         settle_s: 1.0                        # stand still facing it before the AI looks
+        quickscan: true                      # take 3 pictures (body yaws left, centre, right: scenescan animation) instead of one
+        animation: scenescan                 # animations.py, played by animation_player (its scenescan.* parameters)
+        start_timeout_s: 3.0                 # animation_player did not start it: one picture from where it stands
+        timeout_s: 30.0                      # cancel the animation after this long
         llm_attempts: 2                      # AI tries; after the last the tile is marked explored anyway
       mppi:
         type: mppi                           # stuck in the costmap obstacle zone: nudge the robot out with linear x / y velocity

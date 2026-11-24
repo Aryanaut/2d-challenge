@@ -18,7 +18,25 @@ mission_reporter:
 
     # Room the robot is in. Update live with:
     #   ros2 topic pub --once /mission/scene_type std_msgs/String "{data: kitchen}"
+    # Room name comes from your scene package. Set the topic it publishes on (std_msgs/String:
+    # "kitchen", or JSON {"scene_type": "kitchen"}). The last message received is used for every report.
+    scene_topic: /mission/scene_type
+    scene_from: topic                 # topic = only that topic decides; perception = use perception's guess first
     default_scene_type: ""
+
+    # pos: taken from YOUR position package's topic. "" = use perception's position instead.
+    # position_msg_type: string        (std_msgs/String: "[x, y]", "x,y", or JSON {"x":..,"y":..} / {"pos":[x,y]})
+    #                    point_stamped (geometry_msgs/PointStamped)    pose_stamped (geometry_msgs/PoseStamped)
+    #                    pose_cov      (geometry_msgs/PoseWithCovarianceStamped)   odometry (nav_msgs/Odometry)
+    #                    point / pose  (geometry_msgs/Point / Pose)
+    # The LAST position received is used for each report (M04 always reports pos null).
+    position_topic: ""
+    position_msg_type: string
+
+    # M04 (task_type "qr"): its "message" is taken from this topic (std_msgs/String; plain text, or JSON with
+    # message/text/decoded). The first text received answers M04 (pos null, current scene).
+    # Set it to the topic your QR package publishes. /perception/qr_text = perception's own decoder.
+    qr_message_topic: /perception/qr_text
 
     use_llm_result: false             # true = wait for /perception/llm_result and use its verified label
     require_survivor_confirmed: true  # (use_llm_result only) skip survivors the LLM says are not survivors
@@ -27,7 +45,7 @@ mission_reporter:
     hold_unknown_scene_survivors: true
     qr_near_survivor_m: 1.5           # a QR seen within this distance of a survivor = that survivor has a QR
     no_qr_min_bbox_h_frac: 0.25       # M05 only if the survivor fills >= 25% of image height (close enough to see a QR)  # while M03 is open, don't report survivors whose room is unknown
-    require_position: false            # don't answer a task with "pos": null (except qr); wait for a located sighting, change to true once confirm with aryan how to get the position
+    require_position: true            # don't answer a task with "pos": null (except qr); wait for a located sighting
     report_each_task_once: true       # a task is answered by its first matching event, then closed
     output_dir: "~/lite3_mission_results"   # results.jsonl + results.json are written here
     republish_hz: 0.0                 # >0 = re-send all results periodically (late subscribers)
