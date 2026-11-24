@@ -7,7 +7,8 @@ tilt_gate:
     robot_imu_topic: /imu/data      # CHECK with `ros2 topic list | grep -i imu`; '' = ignore the robot IMU
     lidar_imu_topic: /livox/imu     # the Livox's own IMU; '' = ignore it
     reference_s: 3.0                # seconds of readings averaged into the flat reference (start the robot standing still)
-    max_tilt_deg: 6.0               # drop scans when either IMU's gravity is this far from its reference
+    max_tilt_deg: 20.0              # drop scans when either IMU's gravity is this far from its reference (was 6: on flat scene tiles the
+                                    # body sways up to ~28 deg, and at 6 the gate dropped most of the scans there, so SLAM never mapped them)
     hold_s: 1.0                     # keep dropping this long after the tilt is back under the limit
     filter_alpha: 0.2               # low-pass on the gravity vector (gait vibration)
     keepalive_hz: 20.0              # while scans are dropped, republish slam_toolbox's last map->odom at this rate (0 = off) so Nav2 does not

@@ -283,10 +283,13 @@ def points_from_json(data: dict) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------------------------ on the tile grid
-def roller_tiles(grid, points, min_points: int = 4, min_lidar: int = 2, edge_margin_m: float = 0.15) -> Dict[tuple, dict]:
+def roller_tiles(grid, points, min_points: int = 4, min_lidar: int = 2, edge_margin_m: float = 0.15,
+                 depth_only_points: int = 0) -> Dict[tuple, dict]:
     """Tiles holding a roller: at least min_points confirmed roller spots (Nx5 from RollerMap.confirmed()) away from the
     tile's edges (edge_margin_m: the roller lies across the middle of its tile, spots near an edge are spill-over into
-    the neighbour), of which at least min_lidar are confirmed by the lidar (0 = the depth camera alone decides).
+    the neighbour), of which at least min_lidar are confirmed by the lidar (0 = the depth camera alone decides). A tile with
+    depth_only_points or more spots (0 = off) needs no lidar: a long, well-seen ridge is a roller even when the lidar
+    confirmation fails (body tilt on rugged ground shifts the heights it is judged by).
     {tile: {'points', 'lidar', 'normal' (unit way across, either sign), 'line_xy' (mean spot)}}."""
     pts = np.asarray(points, float).reshape(-1, 5)
     if grid is None or len(pts) == 0:
@@ -305,7 +308,7 @@ def roller_tiles(grid, points, min_points: int = 4, min_lidar: int = 2, edge_mar
         e[5] += sign * ny
     out = {}
     for tile, (n, nl, sx, sy, snx, sny) in acc.items():
-        if n >= min_points and nl >= min_lidar:
+        if n >= min_points and (nl >= min_lidar or (depth_only_points > 0 and n >= depth_only_points)):
             u = math.hypot(snx, sny) or 1.0
             out[tile] = {'points': int(n), 'lidar': int(nl), 'normal': (snx / u, sny / u), 'line_xy': (sx / n, sy / n)}
     return out

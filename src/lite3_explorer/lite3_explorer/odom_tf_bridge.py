@@ -6,6 +6,12 @@ usually not synced with the perception host. Then slam_toolbox cannot match scan
 poses ("Message Filter dropping message ... queue is full") and the map frame never
 appears.
 
+AI gait (/ai_mode true): the robot's leg odometry is not trustworthy while it walks in AI mode (it jumps by metres and
+degrees). The bridge then HOLDS the last odom->base_link it published, and when AI mode ends it carries on from the
+held pose (an offset applied to the raw odometry). The mission manager then publishes the pose the robot is expected to
+be at (the centre of the tile beyond the staircase, in the map frame) on /odom_rebase; the bridge converts it with the
+latest map->odom and moves the odom pose there. slam_toolbox only has to scan-match the small remainder.
+
 stamp_mode:
   auto     (default) use the message stamp while it is within max_stamp_offset_s of
            this computer's clock, otherwise stamp with the receive time (and say so)
@@ -16,18 +22,36 @@ If something else already publishes odom->base_link on /tf, this node does not
 broadcast a second one (two parents break the TF tree). It still republishes
 /odom and warns if the existing transform's stamps are off.
 """
+import math
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PoseStamped, Quaternion, TransformStamped
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
 
 def stamp_to_s(stamp):
     return stamp.sec + stamp.nanosec * 1e-9
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def se2_mul(a, b):
+    """a * b for SE(2) poses (x, y, yaw)."""
+    c, s = math.cos(a[2]), math.sin(a[2])
+    return (a[0] + c * b[0] - s * b[1], a[1] + s * b[0] + c * b[1], a[2] + b[2])
+
+
+def se2_inv(a):
+    c, s = math.cos(a[2]), math.sin(a[2])
+    return (-(c * a[0] + s * a[1]), s * a[0] - c * a[1], -a[2])
 
 
 class OdomTfBridge(Node):
@@ -44,6 +68,19 @@ class OdomTfBridge(Node):
         if self.stamp_mode not in ('auto', 'now', 'message'):
             raise ValueError("stamp_mode must be 'auto', 'now' or 'message'")
 
+        self.map_frame = p('map_frame', 'map').value
+        self.hold_in_ai_mode = p('hold_in_ai_mode', True).value
+        # one odom message further than this from the last one is not motion (the leg odometry jumps by metres when AI
+        # mode ends, a moment AFTER /ai_mode goes false): absorbed into the offset so the published pose stays continuous
+        self.max_jump_m = p('max_jump_m', 0.5).value
+        self.max_jump_rad = p('max_jump_rad', 1.0).value
+        self.last_out = None
+        # odom pose published = offset * raw leg odometry; frozen: publish `held` instead of tracking the raw pose
+        self.offset = (0.0, 0.0, 0.0)
+        self.raw = None
+        self.frozen, self.held = False, None
+        self.last_msg = None
+
         self.broadcast_tf = None if self.auto_detect_s > 0 else True
         self.using_receive_time = self.stamp_mode == 'now'
         self.tf_buffer = Buffer()
@@ -52,7 +89,54 @@ class OdomTfBridge(Node):
         self.broadcaster = TransformBroadcaster(self)
         self.odom_pub = self.create_publisher(Odometry, self.republish_topic, 10) if self.republish_topic else None
         self.create_subscription(Odometry, self.odom_topic, self._on_odom, qos_profile_sensor_data)
+        latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Bool, '/ai_mode', self._on_ai_mode, latched)
+        self.create_subscription(PoseStamped, '/odom_rebase', self._on_rebase, 10)
         self.get_logger().info(f'{self.odom_topic} -> {self.odom_frame}->{self.base_frame} (stamp_mode={self.stamp_mode})')
+
+    def _output_pose(self):
+        """The odom pose to publish: the held one while frozen, else offset * raw."""
+        if self.frozen and self.held is not None:
+            return self.held
+        return se2_mul(self.offset, self.raw) if self.raw is not None else None
+
+    def _on_ai_mode(self, msg):
+        on = bool(msg.data) and self.hold_in_ai_mode
+        if on and not self.frozen:
+            self.held = self._output_pose()
+            self.frozen = self.held is not None
+            if self.frozen:
+                self.get_logger().info('AI mode on: holding odom->base_link at the last pose until it ends.')
+        elif not on and self.frozen:
+            # carry on from the held pose: offset * raw_now == held
+            if self.raw is not None:
+                self.offset = se2_mul(self.held, se2_inv(self.raw))
+            self.frozen, self.held = False, None
+            self.get_logger().info('AI mode off: odom->base_link continues from the held pose.')
+
+    def _on_rebase(self, msg: PoseStamped):
+        """Move the robot to the pose in msg (map frame, or odom frame when msg.header.frame_id == odom_frame)."""
+        want = (msg.pose.position.x, msg.pose.position.y, yaw_of(msg.pose.orientation))
+        frame = msg.header.frame_id or self.map_frame
+        if frame != self.odom_frame:
+            try:
+                mo = self.tf_buffer.lookup_transform(self.map_frame, self.odom_frame, Time())
+            except TransformException as e:
+                self.get_logger().error(f'Rebase to {frame} ignored: no {self.map_frame}->{self.odom_frame} ({e}).')
+                return
+            t = mo.transform
+            want = se2_mul(se2_inv((t.translation.x, t.translation.y, yaw_of(t.rotation))), want)
+        if self.frozen:
+            self.held = want                                  # applied when AI mode ends
+        elif self.raw is not None:
+            self.offset = se2_mul(want, se2_inv(self.raw))
+        else:
+            self.get_logger().error('Rebase ignored: no leg odometry yet.')
+            return
+        self.get_logger().info(f'Rebased {self.odom_frame}->{self.base_frame} to ({want[0]:.2f}, {want[1]:.2f}, '
+                               f'{math.degrees(want[2]):.0f} deg).')
+        if self.last_msg is not None and not self.frozen:
+            self._publish(self.last_msg)
 
     def _decide(self):
         self.detect_timer.cancel()
@@ -92,21 +176,45 @@ class OdomTfBridge(Node):
         return now.to_msg() if bad else msg.header.stamp
 
     def _on_odom(self, msg: Odometry):
+        new = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw_of(msg.pose.pose.orientation))
+        if self.raw is not None and not self.frozen and self.last_out is not None:
+            dyaw = math.atan2(math.sin(new[2] - self.raw[2]), math.cos(new[2] - self.raw[2]))
+            step = math.hypot(new[0] - self.raw[0], new[1] - self.raw[1])
+            if step > self.max_jump_m or abs(dyaw) > self.max_jump_rad:
+                self.offset = se2_mul(self.last_out, se2_inv(new))          # output stays where it was
+                self.get_logger().warn(f'{self.odom_topic} jumped {step:.2f} m / {math.degrees(dyaw):.0f} deg in one '
+                                       'message: absorbed (not motion).')
+        self.raw = new
+        self.last_msg = msg
+        self._publish(msg)
+
+    def _publish(self, msg: Odometry):
         stamp = self._stamp_for(msg)
+        x, y, yaw = self._output_pose()
+        self.last_out = (x, y, yaw)
+        q = Quaternion(z=math.sin(0.5 * yaw), w=math.cos(0.5 * yaw))
+        # roll / pitch of the raw odometry are dropped when the pose is corrected or held (SE(2) only)
+        corrected = self.frozen or self.offset != (0.0, 0.0, 0.0)
+        pos = msg.pose.pose.position
         if self.broadcast_tf:
             t = TransformStamped()
             t.header.stamp = stamp
             t.header.frame_id = self.odom_frame
             t.child_frame_id = self.base_frame
-            pos = msg.pose.pose.position
-            t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = pos.x, pos.y, pos.z
-            t.transform.rotation = msg.pose.pose.orientation
+            t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = x, y, pos.z
+            t.transform.rotation = q if corrected else msg.pose.pose.orientation
             self.broadcaster.sendTransform(t)
         if self.odom_pub:
-            msg.header.stamp = stamp
-            msg.header.frame_id = self.odom_frame
-            msg.child_frame_id = self.base_frame
-            self.odom_pub.publish(msg)
+            out = Odometry()
+            out.header.stamp = stamp
+            out.header.frame_id = self.odom_frame
+            out.child_frame_id = self.base_frame
+            out.pose = msg.pose
+            out.twist = msg.twist
+            out.pose.pose.position.x, out.pose.pose.position.y = x, y
+            if corrected:
+                out.pose.pose.orientation = q
+            self.odom_pub.publish(out)
 
 
 def main(args=None):

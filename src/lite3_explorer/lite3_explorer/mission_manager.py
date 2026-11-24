@@ -37,6 +37,7 @@ Interfaces
   pub  /roller_mode             std_msgs/Bool     (latched) true while the roller mode holds the h-step gait (roller_detector pauses)
   pub  /cmd_vel                 geometry_msgs/Twist   direct velocity (curtain, stairs, roller and mppi modes)
   pub  /simple_cmd              transfer_interfaces/MotionSimpleCMD   robot AI mode on / off (stairs mode)
+  pub  /odom_rebase             geometry_msgs/PoseStamped  where the robot is after the AI-mode climb (odom_tf_bridge re-anchors odom)
   pub  /ai_mode                 std_msgs/Bool     (latched) true while AI mode is on: gait_switcher and stair_detector pause
   pub  /stair_climber/enable    std_msgs/Bool     stairs mode with climber: true: hand the climb to stair_climber
   sub  /stair_climber/state     std_msgs/String   ... and watch it (DONE = crossed, ABORT = failed)
@@ -265,6 +266,7 @@ class MissionManager(Node):
         self.tiles.stair_min_points = int(tcfg.get('stair_min_points', 4))
         self.tiles.roller_min_points = int(tcfg.get('roller_min_points', 4))
         self.tiles.roller_min_lidar = int(tcfg.get('roller_min_lidar', 2))
+        self.tiles.roller_depth_only_points = int(tcfg.get('roller_depth_only_points', 0))
         self.tiles.roller_edge_margin_m = float(tcfg.get('roller_edge_margin_m', 0.15))
         self.target = None                     # (label, goal_xy) for the RViz highlight
         self._published_tiles = -1
@@ -361,6 +363,8 @@ class MissionManager(Node):
         self.ai_pub.publish(Bool(data=False))
         # stairs mode with climber: true: the stair_climber package does the alignment + AI crossing
         self.climber_enable_pub = self.create_publisher(Bool, '/stair_climber/enable', 10)
+        self.climber_ai_on_pub = self.create_publisher(Bool, '/stair_climber/ai_on', latched)
+        self.odom_rebase_pub = self.create_publisher(PoseStamped, '/odom_rebase', 10)
         self._climber_state = (None, 0.0)
         self.create_subscription(String, '/stair_climber/state', self._on_climber_state, 10)
         self.simple_cmd_pub, self._simple_cmd_type = None, None
@@ -522,6 +526,19 @@ class MissionManager(Node):
     def ai_flag(self, on):
         """/ai_mode only (gait_switcher / stair_detector pause), no /simple_cmd: stair_climber sends the AI codes."""
         self.ai_pub.publish(Bool(data=bool(on)))
+
+    def stair_climber_ai_on(self, on):
+        """Tell stair_climber the robot is already in AI mode (no Move Mode on enable, no second Enter AI)."""
+        self.climber_ai_on_pub.publish(Bool(data=bool(on)))
+
+    def rebase_odom(self, x, y, yaw):
+        """Tell odom_tf_bridge the robot is at (x, y, yaw) in the global frame (after AI mode threw the leg odometry
+        off): it moves odom->base_link there; slam_toolbox scan-matches the remainder."""
+        ps = PoseStamped()
+        ps.header.frame_id = self.global_frame
+        ps.pose.position.x, ps.pose.position.y = float(x), float(y)
+        ps.pose.orientation.z, ps.pose.orientation.w = math.sin(0.5 * yaw), math.cos(0.5 * yaw)
+        self.odom_rebase_pub.publish(ps)
 
     def stair_climber_enable(self, on):
         """Enable / disable the stair_climber node. Enabling sends false first, so it restarts from IDLE after an
@@ -967,16 +984,19 @@ class MissionManager(Node):
         context = (f"SCENE TILE CONTEXT: tile {label} of the robot's {size:g} m x {size:g} m tile grid is a scene tile "
                    f'(a scanned, mostly non-traversable tile the robot does not enter). The robot stands on the '
                    f'neighbouring tile {here} at ({pose[0]:.2f}, {pose[1]:.2f}) in the map frame and is facing tile {label}. '
-                   f'Describe what is on tile {label}.')
+                   f'Classify what is on tile {label}: one of the eight scene types, or traversable.')
         return self.llm.request('describe_tile', timeout_s=float(self.cfg['llm_report_timeout_s']),
                                 name=f'scene_{label.replace(",", "_")}_q{self.query_count:04d}', tile=label, pose=pose,
-                                context=context, save_dir=self.scene_images_dir)
+                                context=context, save_dir=self.scene_images_dir, prompt='describe_scene')
 
     def record_scene(self, label, pose, call):
         """Write the scene tile's description (or the failure) into the tile report."""
         self.book.reached(label, pose, 'scene tile (looked at, not entered)', {})
         if call.ok:
             result = dict(call.result)
+            if result.get('scene_type') == 'traversable':
+                self.tiles.mark_traversable(tuple(int(v) for v in label.split(',')))   # no scene: an ordinary tile again
+                self.event('scene_traversable', tile=label)
             if result.get('image'):
                 result['image'] = os.path.join(self.scene_images_dir, result['image'])   # the report joins run_dir: absolute wins
             self.book.set_result(label, result)
@@ -1190,7 +1210,10 @@ class MissionManager(Node):
             m.pose.orientation.w = 1.0
             m.scale.z = 0.14
             m.color.r = m.color.g = m.color.b = m.color.a = 1.0
-            m.text = f"free {d['free']:.2f}\nknown {d['known']:.2f}"
+            # the scene test is free/KNOWN < scene_max_free (and known >= scene_min_known); 'free' alone is free/TOTAL, which
+            # reads lower than the tested ratio whenever the tile is not fully scanned (0.79 free of 0.97 known = 0.81)
+            ratio = d['free'] / d['known'] if d['known'] > 0 else 0.0
+            m.text = f"free/known {ratio:.2f}\nknown {d['known']:.2f}\nfree {d['free']:.2f}"
             out.append(m)
         return out
 

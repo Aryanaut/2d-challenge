@@ -28,6 +28,7 @@ mission_manager:
       stair_min_points: 4                    # confirmed stair cells (10 cm, /stairs/points) that make a tile a staircase tile
       roller_min_points: 4                   # confirmed roller spots (10 cm, /roller/points) that make a tile a roller tile ...
       roller_min_lidar: 2                    # ... of which this many the 3D lidar confirms (low returns only, open behind; 0 = depth alone)
+      roller_depth_only_points: 12           # ... or a tile with this many spots needs no lidar (a long, well-seen ridge; 0 = lidar always required)
       roller_edge_margin_m: 0.15             # spots this close to a tile edge do not count (the roller lies across the middle)
 
     # ---------------------------------------------------------------- mission manager
@@ -44,7 +45,7 @@ mission_manager:
       enabled: true
       watch_modes: [exploring, backtracking]
       triggers: [no_motion, costmap]
-      window_s: 60.0                         # no_motion: driving this long (only a long unresponsive spell counts) ...
+      window_s: 20.0                         # no_motion: driving this long (only a long unresponsive spell counts) ...
       min_motion_m: 0.15                     # ... and moving less than this
       costmap_cost: 99                       # costmap: robot centre on a global-costmap cell >= this (99 inscribed, 100 lethal)
       costmap_hold_s: 20.0                   # ... for this long
@@ -152,7 +153,7 @@ mission_manager:
         opening_min_turn_deg: 80            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
         return_tolerance_deg: 3.0            # after the opening sweep, turn back to the starting heading (within this)
         time_allowance_s: 20.0
-        use_crawl: true                      # crawl gait while turning (gait_switcher)
+        use_crawl: false                     # true: crawl gait while turning; false: scan turns (after the opening spin) keep the current gait
         settle_s: 1.0
         check_room: true                     # skip the turn where the body would hit the local costmap
         map_wait_s: 5.0
@@ -241,7 +242,8 @@ mission_manager:
         lateral_gain: 1.0                    # vy that keeps the robot on the line from the tile centre through the edge
         lateral_max_mps: 0.1
         stall_m: 0.05                        # walking through: less progress than this ...
-        stall_s: 3.0                         # ... in this long = blocked (a wall): a failed try
+        stall_s: 2.0                         # ... in this long = blocked: a wall (a curtain gives way)
+        blocked_gives_up: true               # blocked = give up on this curtain at once (it was a wall); false: retry up to max_attempts
         max_attempts: 3                      # tries (back to the centre, square up, walk) before giving up
         speed_mps: 0.25                      # forward speed (vx) through the curtain
         align_tol_deg: 5.0                   # square to the edge within this before walking
@@ -269,13 +271,16 @@ mission_manager:
         lateral_gain: 0.5                    # vy that keeps the robot on the line through the tile centres (0 = off)
         lateral_max_mps: 0.08
         extra_m: 0.0                         # stop this much beyond the centre of the tile beyond the staircase
-        cross_timeout_s: 60.0
+        cross_timeout_s: 10.0
         stall_m: 0.05                        # climbing: less progress than this ...
         stall_s: 10.0                        # ... in this long = stuck on the stairs
         pose_lost_s: 3.0                     # no pose on the stairs: keep walking straight this long, then stop
         # climber: true = after centre + align, hand the climb to the stair_climber package (its own lidar alignment on
         # the real steps, AI on, IMU-based crossing, AI off, RUG gait) and wait for /stair_climber/state DONE / ABORT.
         # The stair_climber node must be running (autostart: false). speed_mps / stall_* / cross_timeout_s are then unused.
+        ai_before_climber: true              # AI mode on after centring + squaring up (flat gait, live pose; leg odom freezes in AI mode),
+                                             # before stair_climber: its lidar alignment and walk run in AI mode, no second Enter AI
+        rebase_odom: true                    # after the climb: odom is re-anchored at the centre of the tile beyond (/odom_rebase)
         climber: true
         climber_search_timeout_s: 15.0       # still searching after this long: the lidar does not see stairs, give up (no climb)
         climber_timeout_s: 180.0             # whole climb, alignment included
@@ -288,12 +293,22 @@ mission_manager:
         center_tol_m: 0.10                   # first drive (turn, then vx / wz) to within this of the centre of the tile in front of the roller
         center_timeout_s: 15.0
         align_tol_deg: 4.0                   # square up to the roller within this before stepping over it
+        approach_angle_deg: -90.0             # approach with the body this far off the roller plane (+ = turned left) while vx / vy walk the straight line through the tile centres ...
+        approach_until_m: 0.0                # ... until the robot reaches the roller tile's edge line (progress past it, in m); then it squares up and crosses
         align_timeout_s: 15.0                # could not square up: give up (never crossed), back to exploring
         speed_mps: 0.20                      # forward speed (vx) over the roller
         heading_gain: 1.0                    # wz that holds the heading while crossing
         lateral_gain: 0.5                    # vy that keeps the robot on the line through the tile centres (0 = off)
         lateral_max_mps: 0.08
         extra_m: 0.0                         # stop this much beyond the centre of the tile beyond the roller
+        recenter: true                       # at the edge after the roller tile: stop, recentre on its midpoint with omni vx / vy / wz, then go on
+        recenter_tol_m: 0.06
+        recenter_speed_mps: 0.08
+        recenter_gain: 0.8
+        recenter_timeout_s: 8.0              # not there by then: cross on from where it is
+        restore_heading: true                # at that midpoint also set the yaw setpoint to the mission's original heading (square to the roller when unknown); it is held to the end
+        restore_max_deg: 100.0               # ... unless that is further than this from the way across (crossing back over a roller)
+        recenter_yaw_tol_deg: 5.0            # recentring ends when the heading is within this of the setpoint too
         cross_timeout_s: 40.0
         stall_m: 0.05                        # crossing: less progress than this ...
         stall_s: 6.0                         # ... in this long = stuck at the roller: back off and try again
@@ -326,8 +341,8 @@ mission_manager:
         candidates: 3                        # nearest centres tried in turn
         min_distance_m: 0.25                 # skip the centre the robot is already on
         adjacent_only: true                  # only the robot's own tile and tiles sharing a side with it (never through another tile)
-        min_clearance_m: 0.25
-        attempt_timeout_s: 45.0
+        min_clearance_m: 0.35
+        attempt_timeout_s: 10.0
         clear_costmaps: true
         clear_settle_s: 1.0
         give_up_after: 3                     # recoveries in a row without a new tile -> give up on the failing tiles

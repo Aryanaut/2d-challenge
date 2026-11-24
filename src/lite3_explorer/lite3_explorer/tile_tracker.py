@@ -32,6 +32,7 @@ class TileTracker:
         self._wall_keys = set()                         # edges that are virtual walls now (hysteresis)
         self.skip_scene = False                        # True: scene tiles are never driven to (the scene mode looks at them)
         self.described: set = set()                    # scene tiles already looked at: explored without being entered
+        self.traversable: set = set()                  # tiles the AI said are no scene (a wall seen from the side): ordinary tiles
         self.max_failures = max_failures     # 0 = never give up on a tile
         self.on_reached = on_reached                   # called (tile, pose, source) for every NEW tile reached
         self.on_enter = on_enter                       # called (tile) whenever the robot enters another tile
@@ -69,6 +70,7 @@ class TileTracker:
         # crossed it in the h-step gait: then it is marked explored (on the trail) and stays out of Nav2 routes.
         self.roller_points = np.zeros((0, 5))
         self.roller_min_points, self.roller_min_lidar, self.roller_edge_margin_m = 4, 2, 0.15
+        self.roller_depth_only_points = 0
         self.rollers: Dict[tuple, dict] = {}           # roller tile -> {'points', 'lidar', 'normal', 'line_xy'}
         self.rollers_crossed: set = set()
         # roller crossings the robot made: {sorted (tile before, tile beyond): roller tile}. Backtracking may cross back
@@ -118,6 +120,7 @@ class TileTracker:
         self.trail, self.trail_log = [], []
         self._wall_keys = set()
         self.described = set()
+        self.traversable = set()
         self.splits = []
         self.curtain_edges = {}
         self.deferred_curtains = {}
@@ -146,6 +149,12 @@ class TileTracker:
                 t['sides'] = T.tile_sides(grid, info, self.grid, tile)
             if t['status'] == 'to_visit' and T.tile_label(tile) in self.unreachable:
                 t['status'] = 'unreachable'
+        for tile in self.traversable:
+            t = self.tiles.get(tile)
+            if t is not None:
+                t['scene'] = False
+                if t['status'] == 'blocked':                   # the AI looked: it can be walked on
+                    t['status'] = 'to_visit'
         for tile in set(self.stairs) | self.stairs_crossed:
             t = self.tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False,
                                              'scene': False})
@@ -315,6 +324,14 @@ class TileTracker:
         self.invalidate()
         self.update()
 
+    def mark_traversable(self, tile):
+        """The AI said the scene tile is none of the scene types (e.g. a dark panel that is only the wall of a traversable
+        tile): it becomes an ordinary tile to explore and is never a scene tile again."""
+        self.traversable.add(tuple(tile))
+        self.described.discard(tuple(tile))
+        self.invalidate()
+        self.update()
+
     def is_scene(self, tile) -> bool:
         tile = tuple(tile)
         return tile in self.described or self._scene_flag(tile)
@@ -381,11 +398,15 @@ class TileTracker:
             return []
         grid, info = self._map
         excl = [tuple(int(v) for v in lab.split(',')) for lab in exclude]
-        out = T.nearest_tile_centres(grid, info, self.grid, self.tiles, robot_xy, statuses=statuses, limit=limit,
+        roller_tiles = set(self.rollers) | set(self.rollers_crossed)
+        out = T.nearest_tile_centres(grid, info, self.grid, self.tiles, robot_xy, statuses=statuses,
+                                     limit=limit + len(roller_tiles),
                                      min_distance_m=min_distance_m, min_clearance_m=min_clearance_m,
                                      exclude=excl,
                                      adjacent_to=self.grid.tile_of(robot_xy[0], robot_xy[1]) if adjacent_only else None)
-        return [t for t in out if self._drivable(t['tile'])]
+        # never recover onto a roller tile (crossed or not): the lidar maps it as a wall, only the roller mode crosses it
+        return [t for t in out if self._drivable(t['tile'])
+                and tuple(int(v) for v in t['tile'].split(',')) not in roller_tiles][:limit]
 
     def tile_of(self, x, y):
         return self.grid.tile_of(x, y) if self.grid is not None else None
@@ -462,7 +483,7 @@ class TileTracker:
         if self.grid is None:
             return False
         found = RC.roller_tiles(self.grid, self.roller_points, self.roller_min_points, self.roller_min_lidar,
-                                self.roller_edge_margin_m)
+                                self.roller_edge_margin_m, self.roller_depth_only_points)
         rollers = dict(self.rollers)
         rollers.update({t: d for t, d in found.items() if t not in self.rollers_crossed})
         changed = set(rollers) != set(self.rollers)

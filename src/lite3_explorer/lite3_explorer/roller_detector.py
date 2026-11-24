@@ -143,7 +143,8 @@ class RollerDetector(Node):
             self.get_logger().info(f'roller seen: {len(self.rollers)} spots, {det.length_m:.2f} m long, top '
                                    f'{det.top_m:.2f} m above the floor, at ({cx:.2f}, {cy:.2f}), across it towards '
                                    f'{math.degrees(math.atan2(det.normal[1], det.normal[0])):+.0f} deg; '
-                                   f'lidar confirms {self._lidar_confirmed()} spot(s)')
+                                   f'lidar confirms {self._lidar_confirmed()} spot(s) (floor z {floor_z:+.2f} m, '
+                                   f'{len(self.lidar._cells)} lidar cells)')
 
     def _on_cloud(self, msg):
         now = self.get_clock().now().nanoseconds * 1e-9

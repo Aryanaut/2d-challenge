@@ -46,6 +46,7 @@ DEFAULTS: Dict[str, Any] = {
         'stair_min_points': 4,            # confirmed stair cells (10 cm, /stairs/points) that make a tile a staircase tile
         'roller_min_points': 4,           # confirmed roller spots (10 cm, /roller/points) that make a tile a roller tile ...
         'roller_min_lidar': 2,            # ... of which this many are confirmed by the 3D lidar (0 = depth camera alone)
+        'roller_depth_only_points': 12,   # ... or a tile with this many spots needs no lidar (0 = lidar always required)
         'roller_edge_margin_m': 0.15,     # spots this close to a tile edge do not count (the roller lies mid-tile)
     },
 
@@ -151,7 +152,7 @@ DEFAULTS: Dict[str, Any] = {
             'opening_min_turn_deg': 160.0,    # the opening spin may stop early (map not sparse) only after turning this far
             'return_tolerance_deg': 3.0,  # after the opening sweep turn back to the starting heading
             'time_allowance_s': 20.0,
-            'use_crawl': True,            # crawl gait while turning (gait_switcher /spin_crawl)
+            'use_crawl': False,           # true: crawl gait while turning (gait_switcher /spin_crawl); false: keep the current gait
             'settle_s': 1.0,
             'check_room': True,           # skip the turn where the body would hit the local costmap
             'map_wait_s': 30.0,           # max wait for the map around the start before placing the tile grid
@@ -278,6 +279,9 @@ DEFAULTS: Dict[str, Any] = {
             'stall_m': 0.05,              # climbing: less progress than this ...
             'stall_s': 10.0,              # ... in this long = stuck on the stairs
             'pose_lost_s': 3.0,           # no pose (SLAM lost on the stairs): keep walking straight this long, then stop
+            'ai_before_climber': False,   # true: centre + square up in the flat gait (live pose), then AI mode on BEFORE the climber
+                                          # (its lidar alignment and walk run in AI mode; it sends no Enter AI / Move Mode)
+            'rebase_odom': True,          # after the climb: tell odom_tf_bridge the robot is at the centre of the tile beyond (AI gait odometry is off)
             'climber': False,             # true: hand the climb to the stair_climber package (/stair_climber/enable, /state)
             'climber_search_timeout_s': 15.0,   # stair_climber still searching: its lidar sees no stairs, give up (no climb)
             'climber_timeout_s': 180.0,   # whole stair_climber run
@@ -296,6 +300,8 @@ DEFAULTS: Dict[str, Any] = {
             'center_heading_gain': 1.5,
             'center_timeout_s': 15.0,     # not there by then: square up from where it is
             'align_tol_deg': 4.0,         # square to the roller within this before stepping over it
+            'approach_angle_deg': 20.0,   # approach with the body this far off the roller plane (+ = left), vx / vy walk the straight line
+            'approach_until_m': 0.0,      # ... until the roller tile's edge line; then square up and cross
             'align_timeout_s': 15.0,      # could not square up: give up (never crossed), back to the mode before
             'min_turn_rad_s': 0.2,
             'max_turn_rad_s': 0.6,
@@ -305,6 +311,14 @@ DEFAULTS: Dict[str, Any] = {
             'lateral_gain': 0.5,          # vy that keeps the robot on the line through the tile centres (0 = off)
             'lateral_max_mps': 0.08,
             'extra_m': 0.0,               # stop this much beyond the centre of the tile beyond the roller
+            'recenter': True,             # at the edge after the roller tile: stop, recentre on its midpoint with omni vx / vy / wz
+            'recenter_tol_m': 0.06,
+            'recenter_speed_mps': 0.08,
+            'recenter_gain': 0.8,
+            'recenter_timeout_s': 8.0,    # not there by then: cross on from where it is
+            'restore_heading': True,      # at the midpoint also set the yaw setpoint to the mission's original heading (held to the end)
+            'restore_max_deg': 100.0,     # ... unless it is further than this from the way across (crossing back over a roller)
+            'recenter_yaw_tol_deg': 5.0,  # recentring ends when the heading is within this of the setpoint too
             'cross_timeout_s': 40.0,
             'stall_m': 0.05,              # crossing: less progress than this ...
             'stall_s': 6.0,               # ... in this long = stuck at the roller: back off and try again

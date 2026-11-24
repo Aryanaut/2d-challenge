@@ -20,6 +20,8 @@ The context object (`ctx`, the ROS node in production, a fake in tests) gives mo
   curtain_points() -> Nx4 (x, y, ux, uy) | None    (only with curtains: true)
   drive(vx, wz, vy=0.0)  stop()  costmap_snapshot() -> (grid, GridInfo) | None      (curtain, stairs and mppi modes)
   ai_mode(on, cmd_code) -> bool   robot AI mode on / off via /simple_cmd; False = no robot listening   (stairs mode)
+  stair_climber_ai_on(on)  stair_climber: AI mode is already on (the mission entered it)                   (stairs mode, climber)
+  rebase_odom(x, y, yaw)   the robot is here (global frame) after the AI-mode climb: odom is re-anchored   (stairs mode)
   (staircase tiles come in through tiles.set_stair_points(); the mission manager feeds it /stairs/points)
   hstep(on)   hold the h-step gait (/step_up) while the roller mode crosses a roller            (roller mode)
   (roller tiles come in through tiles.set_roller_points(); the mission manager feeds it /roller/points)
@@ -124,6 +126,7 @@ class ModeMachine:
         self.scenes_done = set()           # scene tiles already looked at (never twice)
         self.curtains_tried = set()        # tiles behind a curtain that was already walked into (never twice)
         self.stairs_tried = set()          # staircase tiles the stairs mode already went for (never twice)
+        self.scanned_tile = None           # tile the last scan finished on (the end condition waits for a scan on the last tile)
         self.rollers_tried = set()         # roller tiles the roller mode already went for (never twice)
         self.current: Optional[Mode] = None
         self.previous: Optional[str] = None
@@ -222,6 +225,14 @@ class ModeMachine:
             self.ctx.log('error', f'transition to unknown mode {t.mode!r} ({t.reason}); staying in {self.current.name}')
             return
         prev = self.current
+        tiles = self.ctx.tiles
+        if (t.mode == self.complete_mode and str(t.reason).startswith('all_tiles_explored') and prev is not None
+                and prev.type_name != 'scanning' and self.start_mode in self.modes and tiles.ready
+                and tiles.current is not None and self.scanned_tile != tuple(tiles.current)):
+            # the last tile was reached without a scan (recovery / roller / backtracking hand over without one): scan
+            # once here before the end condition counts, in the gait the robot is already in
+            self.ctx.log('info', f'Last tile reached without a scan: scanning once before finishing ({t.reason}).')
+            t = Transition(self.start_mode, 'scanning the last tile before the end condition')
         if prev is not None:
             prev.exit(t.mode, t.reason)
         nxt = self.modes[t.mode]
