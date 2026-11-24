@@ -57,6 +57,10 @@ class LlmEventBridge(Node):
         self.create_subscription(CompressedImage, "/perception/keyframe", self.on_key, 10)
         self.create_subscription(String, "/perception/event", self.on_event, 10)
         self.pub = self.create_publisher(String, "/perception/llm_result", 10)
+        # turn on (and set object_detector publish_observations:=false) once query_llm() works:
+        # then only LLM-checked results go to the mission reporter, with the room type attached
+        self.declare_parameter("publish_observations", False)
+        self.pub_obs = self.create_publisher(String, "/mission_reporter/observation", 10)
         threading.Thread(target=self.worker, daemon=True).start()
 
     def on_key(self, msg):
@@ -136,6 +140,17 @@ class LlmEventBridge(Node):
                 if ev["type"] == "hazard":
                     result["hazard"] = ev["label"]
             self.pub.publish(String(data=json.dumps(result)))
+            if g("publish_observations"):
+                from lite3_perception.object_detector_node import observation_from_event
+                final = result.get("hazard") or result.get("label") or ev["label"]
+                if ev["label"] == "survivor" and answer and not result.get("survivor_confirmed"):
+                    continue                                   # LLM says: real bystander, not a survivor
+                if answer and not result["accepted"]:
+                    continue
+                obs = observation_from_event(ev, label=final,
+                                             scene_type=(answer or {}).get("room_type"))
+                if obs:
+                    self.pub_obs.publish(String(data=json.dumps(obs)))
             self.get_logger().info(f"LLM result for {ev['event_id']}: accepted={result['accepted']} err={err}")
 
 

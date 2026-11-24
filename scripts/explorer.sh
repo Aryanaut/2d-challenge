@@ -7,6 +7,7 @@
 #                        last AI answer | velocity sent to the dog / current gait
 #   window 3 "health"  : /scan rate | /map rate | odom->base_link TF | rviz2 (Ctrl-C it to get a shell)
 #   window 4 "bag"     : only with --bag: rosbag record (Ctrl-C there to stop it)
+#   window "reporter"  : only with --reporter: the mission reporter (lite3_mission_reporter), POSTing to the chosen server URL
 #
 # RViz (scripts/explorer_debug.rviz) shows the tiles like the kitchen explorer: blue = visited (travelled to),
 # green = to_visit (formed), red = blocked, purple = unreachable, orange = the CHOSEN tile (purple while in
@@ -22,6 +23,10 @@
 #   ./explorer.sh --roller           detect roller tiles (depth camera, confirmed by the 3D lidar; low rate): the lidar maps the
 #                                    roller as a wall across half the tile; one beside the current tile is squared up to and
 #                                    crossed in the h-step gait into the tile beyond, the roller tile is marked explored
+#   ./explorer.sh --roller-angle DEG  roller approach angle (default: mission.yaml modes.roller.approach_angle_deg, 20): the body stays
+#                                    this far off the roller plane (+ = left, - = right, 0 = square on) while walking the straight line
+#   ./explorer.sh --reporter URLA    also start the mission reporter, sending results to http://192.168.10.141:8001/task_report_A
+#   ./explorer.sh --reporter URLB    ... to http://192.168.10.141:8001/task_report_B   (A / B and --reporter=URLA work too)
 #   ./explorer.sh --images           with --bag: also record the depth and (compressed) colour camera images, so the slats
 #                                    detection can be replayed offline (large)
 #   ./explorer.sh --bag [bagname]    also record a rosbag to bags/<bagname>_DD_MM_HHMMSS (default bagname: explorer)
@@ -56,7 +61,7 @@ LATCHED="--qos-durability transient_local --qos-reliability reliable"
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
 /exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /stair_climber/state /stair_climber/debug /stair_climber/active /imu/data /leg_odom2 /odom_rebase"
 
 BAG=0
 BAG_NAME=""
@@ -65,6 +70,8 @@ IMAGES=0
 CURTAINS=0
 STAIRS=0
 ROLLER=0
+ROLLER_ANGLE=
+REPORTER=
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -76,12 +83,21 @@ while [[ $# -gt 0 ]]; do
         --curtains) CURTAINS=1 ;;
         --stairs) STAIRS=1 ;;
         --roller|--rollers) ROLLER=1 ;;
+        --roller-angle) ROLLER=1; ROLLER_ANGLE="${2:?--roller-angle needs a number of degrees}"; shift ;;
+        --roller-angle=*) ROLLER=1; ROLLER_ANGLE="${1#--roller-angle=}" ;;
+        --reporter) REPORTER="${2:?--reporter needs URLA or URLB}"; shift ;;
+        --reporter=*) REPORTER="${1#--reporter=}" ;;
         --bag=*) BAG=1; BAG_NAME="${1#--bag=}" ;;
         *) ARGS+=("$1") ;;
     esac
     shift
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+if [[ -n $REPORTER ]]; then
+    REPORTER="${REPORTER^^}"; REPORTER="${REPORTER#URL}"
+    [[ "$REPORTER" == A || "$REPORTER" == B ]] || { echo "--reporter takes URLA or URLB (got '$REPORTER')" >&2; exit 1; }
+fi
 
 command -v tmux >/dev/null || { echo "tmux is not installed: sudo apt install tmux" >&2; exit 1; }
 
@@ -150,6 +166,7 @@ LAUNCH="ros2 launch lite3_explorer exploration.launch.py"
 [[ $CURTAINS == 1 ]] && LAUNCH+=" use_curtains:=true"
 [[ $STAIRS == 1 ]] && LAUNCH+=" use_stairs:=true"
 [[ $ROLLER == 1 ]] && LAUNCH+=" use_rollers:=true"
+[[ -n $ROLLER_ANGLE ]] && LAUNCH+=" roller_angle_deg:=$ROLLER_ANGLE"
 [[ -n "$LAUNCH_ARGS" ]] && LAUNCH+=" $LAUNCH_ARGS"
 
 [[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS /camera/depth/image_raw /camera/color/image_raw/compressed"
@@ -247,6 +264,14 @@ if [[ $BAG == 1 ]]; then
     # shellcheck disable=SC2086
     run "$SESSION:bag.0" "ROSBAG -> bags/$BAG_NAME (Ctrl-C to stop)" \
         "sleep 5; ros2 bag record -o '$BAG_DIR/$BAG_NAME' $(echo $DEBUG_TOPICS $BAG_TOPICS)"
+fi
+
+# ---- window: mission reporter (optional) ----------------------------------
+if [[ -n $REPORTER ]]; then
+    tmux new-window -t "$SESSION:" -n reporter
+    style_window "$SESSION:reporter"
+    run "$SESSION:reporter.0" "MISSION REPORTER (URL$REPORTER)" \
+        "ros2 launch lite3_mission_reporter mission_reporter.launch.py url:=$REPORTER"
 fi
 
 tmux select-window -t "$SESSION:status"

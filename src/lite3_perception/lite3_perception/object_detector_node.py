@@ -66,6 +66,32 @@ def depth_msg_to_m(msg: Image) -> np.ndarray:
     raise ValueError(f"unsupported depth encoding {msg.encoding}")
 
 
+def observation_from_event(event, label=None, scene_type=None):
+    """/perception/event -> lite3_mission_reporter observation dict (None for QR: the reporter's qr_detector does M04)."""
+    if event["type"] == "qr":
+        return None
+    lab = label or event["label"]
+    if lab == "survivor":
+        kind, lab = "survivor", ""
+    elif event["type"] == "hazard":
+        kind = "hazard"
+    else:
+        kind = "object"
+    loc = event.get("location") or {}
+    pose = event.get("robot_pose") or {}
+    if loc.get("xy"):
+        pos = loc["xy"]                                    # where the thing is (depth on)
+    elif "x" in pose:
+        pos = [pose["x"], pose["y"]]                       # fallback: where the robot was (depth off)
+    else:
+        pos = None
+    obs = {"kind": kind, "label": lab, "pos": pos, "confidence": event.get("confidence")}
+    scene_type = scene_type or event.get("scene_type")
+    if scene_type:
+        obs["scene_type"] = scene_type
+    return obs
+
+
 class ObjectDetectorNode(Node):
     def __init__(self):
         super().__init__("object_detector")
@@ -91,6 +117,8 @@ class ObjectDetectorNode(Node):
         p("conf_threshold", 0.35)
         p("class_conf_overrides", "{}")                        # JSON e.g. {"person":0.5,"qr code":0.25}
         p("ignore_classes", ["curtain"])                       # detected (for /perception/detections) but never triggers an event
+        p("report_objects", ["survivor", "hand_tools"])        # ONLY these object labels become events / reports
+                                                               # (hazards and QR codes are always reported)
         # --- hazard warning signs (yellow triangles, template matching, no training)
         p("hazard_enable", True)
         p("hazard_template_dir", "")                           # "" = <pkg share>/hazard_templates (filename = label)
@@ -102,6 +130,22 @@ class ObjectDetectorNode(Node):
         p("survivor_max_height_m", 1.0)                          # taller than this (needs depth) = real human bystander
         p("survivor_new_if_moved_m", 1.5)                        # no-depth de-dup: same survivor if robot moved less than this
         p("survivor_new_if_bearing_deg", 25.0)                   # ... and the bearing differs by less than this
+        # --- scene (room type) from what is in view: scene -> labels that suggest it
+        p("scene_rules", '{"workshop": ["tool_bench", "hand_tools"], "kitchen": ["kitchen", "utensils"], '
+                         '"market": ["market_stall", "cart", "food"], "clinic": ["medical_kit"]}')
+        p("scene_decisive", '{"utensils": "kitchen", "kitchen": "kitchen", "tool_bench": "workshop", '
+                            '"hand_tools": "workshop", "medical_kit": "clinic"}')   # seeing one of these DECIDES the scene
+        p("scene_decisive_hits", 2)                            # ... if seen in at least N frames of the window
+        p("scene_decisive_conf", 0.35)                         # ... with at least this confidence
+        p("scene_window_s", 6.0)                               # look at detections from the last N seconds
+        p("scene_min_score", 1.5)                              # sum of confidences needed to name a scene
+        p("scene_topic", "/mission/scene_type")
+        # --- QR beside a survivor (M03 = survivor WITH a QR, M05 = survivor without)
+        p("qr_assoc_s", 3.0)                                   # QR seen within N s of the survivor = "has QR"
+        p("qr_text_topic", "/perception/qr_text")
+        # --- mission reporter hand-off (lite3_mission_reporter)
+        p("publish_observations", True)                        # set false if llm_event_bridge publishes them instead
+        p("observation_topic", "/mission_reporter/observation")
         # --- trigger logic
         p("detect_hz", 3.0)
         p("confirm_hits", 3)                                   # need >= N hits ...
@@ -119,6 +163,7 @@ class ObjectDetectorNode(Node):
         self.conf_thr = float(g("conf_threshold"))
         self.class_conf = json.loads(g("class_conf_overrides"))
         self.ignore = set(g("ignore_classes"))
+        self.report_objects = set(x for x in g("report_objects") if x)
         self.confirm_hits = int(g("confirm_hits"))
         self.class_confirm = {k: int(v) for k, v in json.loads(g("class_confirm_overrides")).items()}
         self.confirm_window = float(g("confirm_window_s"))
@@ -174,6 +219,17 @@ class ObjectDetectorNode(Node):
         self.survivor_max_h = float(g("survivor_max_height_m"))
         self.survivor_moved = float(g("survivor_new_if_moved_m"))
         self.survivor_bearing = float(g("survivor_new_if_bearing_deg"))
+        self.scene_rules = json.loads(g("scene_rules"))
+        self.scene_window = float(g("scene_window_s"))
+        self.scene_decisive = json.loads(g("scene_decisive"))
+        self.scene_dec_hits = int(g("scene_decisive_hits"))
+        self.scene_dec_conf = float(g("scene_decisive_conf"))
+        self.scene_min = float(g("scene_min_score"))
+        self.scene_hist = []                                   # (t, label, conf)
+        self.scene = ""
+        self.qr_assoc = float(g("qr_assoc_s"))
+        self.last_qr_seen = -1e9                               # any QR in view (decoded or not)
+        self.last_qr_text = ""
         self.hz_min_area = int(g("hazard_min_area"))
         self.hz_min_score = float(g("hazard_min_score"))
         self.hz_min_margin = float(g("hazard_min_margin"))
@@ -200,6 +256,10 @@ class ObjectDetectorNode(Node):
             self.create_subscription(CameraInfo, g("camera_info_topic"), self.on_info, qos_profile_sensor_data)
 
         self.pub_event = self.create_publisher(String, "/perception/event", 10)
+        self.pub_scene = self.create_publisher(String, g("scene_topic"), 10)
+        self.pub_qr_text = self.create_publisher(String, g("qr_text_topic"), 10)
+        self.publish_obs = bool(self.get_parameter("publish_observations").value)
+        self.pub_obs = self.create_publisher(String, self.get_parameter("observation_topic").value, 10)
         self.pub_key = self.create_publisher(CompressedImage, "/perception/keyframe", 10)
         self.pub_dets = self.create_publisher(String, "/perception/detections", 10)
 
@@ -240,12 +300,15 @@ class ObjectDetectorNode(Node):
         self.pub_dets.publish(String(data=json.dumps({"stamp": now, "detections": dets, "hazards": hazards})))
 
         self.check_qr(img, header, dets)
+        self.update_scene(dets, now)
 
         candidates = []
         for d in dets:
             if d["label"] in self.ignore:
                 continue
             mapped = self.label_map.get(d["label"], d["label"])
+            if self.report_objects and mapped not in self.report_objects:
+                continue                                       # still used for the scene, never reported
             if mapped != d["label"]:
                 d = dict(d, label=mapped, detector_label=d["label"])
             candidates.append(("object", mapped, d))
@@ -282,6 +345,10 @@ class ObjectDetectorNode(Node):
             self.reported.append({"label": hkey, "xy": (loc or {}).get("xy"), "t": now,
                                   "pose": pose, "bearing": (loc or {}).get("bearing_deg")})
             extra.update({"confirm_hits": len(lst), "mean_confidence": round(mean_conf, 3)})
+            if key == "survivor":
+                extra["qr_in_view"] = (time.time() - self.last_qr_seen) < self.qr_assoc
+                extra["qr_text_recent"] = self.last_qr_text if extra["qr_in_view"] else ""
+                extra["bbox_h_frac"] = round((d["bbox_xyxy"][3] - d["bbox_xyxy"][1]) / img.shape[0], 3)
             if kind == "hazard":
                 # most common top-1 over the confirming frames, plus the latest top-3 for the LLM
                 votes = {}
@@ -373,6 +440,37 @@ class ObjectDetectorNode(Node):
             out.append({"label": label, "confidence": round(conf, 3), "bbox_xyxy": [round(x1), round(y1), round(x2), round(y2)]})
         return out
 
+    def update_scene(self, dets, now):
+        """Name the room from what has been in view recently (rules in scene_rules)."""
+        self.scene_hist = [h for h in self.scene_hist if now - h[0] < self.scene_window]
+        self.scene_hist += [(now, d.get("detector_label", d["label"]), d["confidence"]) for d in dets]
+        # 1) deciding objects: e.g. a cooking pot (utensils) means kitchen, whatever else is around
+        dec_hits = {}
+        for _, lab, c in self.scene_hist:
+            if lab in self.scene_decisive and c >= self.scene_dec_conf:
+                dec_hits[lab] = dec_hits.get(lab, 0) + 1
+        decided = [(n, self.scene_decisive[lab]) for lab, n in dec_hits.items() if n >= self.scene_dec_hits]
+        if decided:
+            best = max(decided)[1]                             # the deciding object seen most often
+            if best != self.scene:
+                self.scene = best
+                self.pub_scene.publish(String(data=best))
+                self.get_logger().info(f"scene -> {best}  (decided by {dict(dec_hits)})")
+            return
+        # 2) otherwise: vote with everything in view (scene_rules)
+        scores = {}
+        for _, lab, c in self.scene_hist:
+            scenes = [sc for sc, labs in self.scene_rules.items() if lab in labs]
+            for sc in scenes:
+                scores[sc] = scores.get(sc, 0.0) + c / len(scenes)
+        if not scores:
+            return
+        best = max(scores, key=scores.get)
+        if scores[best] >= self.scene_min and best != self.scene:
+            self.scene = best
+            self.pub_scene.publish(String(data=best))
+            self.get_logger().info(f"scene -> {best}  (scores {({k: round(v, 1) for k, v in scores.items()})})")
+
     def detect_hazards(self, img):
         if self.hazard is None:
             return []
@@ -390,10 +488,14 @@ class ObjectDetectorNode(Node):
             return
         if not ok:
             return
+        self.last_qr_seen = time.time()                        # a QR is in view (even if not decodable yet)
         for text, pts in zip(decoded, points):
+            if text:
+                self.last_qr_text = text
             if not text or text in self.reported_qr:
                 continue
             self.reported_qr.add(text)
+            self.pub_qr_text.publish(String(data=text))        # exact decoded string, for other packages
             xs, ys = pts[:, 0], pts[:, 1]
             d = {"label": "qr code", "confidence": 1.0,
                  "bbox_xyxy": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]}
@@ -477,6 +579,7 @@ class ObjectDetectorNode(Node):
             "robot_pose": self.robot_pose(),
             "detector_label": d.get("detector_label", d["label"]),
             "other_labels_in_frame": sorted({x["label"] for x in all_dets if x is not d}),
+            "scene_type": self.scene,
             **extra,
         }
 
@@ -496,6 +599,10 @@ class ObjectDetectorNode(Node):
             km.data = jpg.tobytes()
             self.pub_key.publish(km)   # publish image FIRST so the LLM side already has it when the event lands
         self.pub_event.publish(String(data=json.dumps(event)))
+        if self.publish_obs:
+            obs = observation_from_event(event)
+            if obs:
+                self.pub_obs.publish(String(data=json.dumps(obs)))
         self.get_logger().info(f"EVENT {kind}: {d['label']} {loc}")
 
 

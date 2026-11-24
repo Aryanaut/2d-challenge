@@ -20,8 +20,10 @@ CANON = 96                                    # canonical triangle canvas (px)
 DESC = 32                                     # descriptor size
 _TRI = np.float32([[CANON / 2, 0], [0, CANON - 1], [CANON - 1, CANON - 1]])
 _CENTROID = _TRI.mean(0)
-INNER_SHRINK = 0.66                           # inner region (inside the black border) relative to outer triangle
-SCALES = tuple(np.round(np.arange(1.0, 0.70, -0.03), 2))  # detected triangle = SCALE * template outer triangle
+INNER_SHRINK = 0.80                           # inner region (inside the black border) relative to outer triangle
+SCALES = tuple(np.round(np.arange(1.0, 0.70, -0.03), 2))  # used only for the "is this really a sign" border check
+MATCH_SCALES = (1.04, 1.0, 0.96)              # templates are the real arena signs -> compare at ~the same scale
+MIN_BORDER_FIT = 30.0                         # real signs have a dark border (~70-115); yellow floor/wood ~5
 BORDER_BAND = (0.86, 0.78)                    # where the black border sits in a template (fraction of outer size)
 INSIDE_BAND = (0.73, 0.67)                    # yellow just inside the border
 
@@ -158,14 +160,15 @@ class HazardClassifier:
         g = cv2.cvtColor(canon_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
         return float(g[_INSIDE_RING].mean() - g[_BORDER_RING].mean())
 
+    def is_sign(self, bgr, tri):
+        """Reject yellow triangles that are not warning signs (no dark border anywhere near the edge)."""
+        return max(self._border_fit(_canonical(bgr, tri, sc)) for sc in SCALES) >= MIN_BORDER_FIT
+
     def classify(self, bgr, tri):
         """-> (label, score, margin, top3[(label,score)])  score = correlation in [-1,1]."""
-        canons = [_canonical(bgr, tri, s) for s in SCALES]
-        fits = np.array([self._border_fit(c) for c in canons])
-        i = int(np.argmax(fits))                               # pick the scale where the border fits
         best = np.full(len(self.labels), -1.0)
-        for j in range(max(0, i - 1), min(len(canons), i + 2)):  # +-1 step tolerance
-            best = np.maximum(best, self._class_scores(_descriptor(canons[j])))
+        for sc in MATCH_SCALES:
+            best = np.maximum(best, self._class_scores(_descriptor(_canonical(bgr, tri, sc))))
         order = np.argsort(-best)
         top3 = [(self.labels[i], round(float(best[i]), 3)) for i in order[:3]]
         margin = float(best[order[0]] - best[order[1]]) if len(order) > 1 else 1.0
@@ -174,7 +177,13 @@ class HazardClassifier:
     def detect(self, bgr, min_area=400):
         """All hazard signs in a frame -> list of dicts."""
         res = []
+        H, W = bgr.shape[:2]
         for tri, bbox in find_triangles(bgr, min_area):
+            x1, y1, x2, y2 = bbox
+            if x1 <= 2 or y1 <= 2 or x2 >= W - 3 or y2 >= H - 3:
+                continue                      # sign cut off by the picture edge: wait for a full view
+            if not self.is_sign(bgr, tri):
+                continue
             label, score, margin, top3 = self.classify(bgr, tri)
             res.append({"label": label, "score": round(score, 3), "margin": round(margin, 3),
                         "top3": top3, "bbox_xyxy": bbox})

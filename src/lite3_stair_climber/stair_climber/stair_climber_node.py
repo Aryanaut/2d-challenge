@@ -177,6 +177,12 @@ class StairClimberNode(Node):
         self.create_subscription(Odometry, gp('odom_topic').value, self.on_odom, 10)
         self.create_subscription(Bool, '/stair_climber/enable', self.on_enable, 10)
         self.create_subscription(Bool, '/stair_climber/vlm_result', self.on_vlm, 10)
+        # the mission manager puts the robot in AI mode itself (before enabling this node) and says so here (latched):
+        # no Move Mode on enable (it would leave AI mode) and no second Enter AI
+        self.ai_on_already = False
+        self.create_subscription(Bool, '/stair_climber/ai_on', self.on_ai_on,
+                                 QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                            durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         cmd_topic = '/stair_climber/cmd_vel_preview' if self.dry_run else gp('cmd_vel_topic').value
         # The robot's /cmd_vel subscriber asks for TRANSIENT_LOCAL durability (18 Nov:
@@ -242,6 +248,10 @@ class StairClimberNode(Node):
         self.enabled = msg.data
         if not msg.data:
             self.pending_gait.clear()       # disabled: send no more gait changes
+
+    def on_ai_on(self, msg: Bool):
+        self.ai_on_already = bool(msg.data)
+        self.get_logger().info(f'AI mode already on (set by the mission): {self.ai_on_already}')
 
     def on_vlm(self, msg: Bool):
         self.vlm = msg.data
@@ -329,6 +339,7 @@ class StairClimberNode(Node):
             x=self.x, y=self.y, z=self.z,
             stair=fresh_stair, stair_seq=self.stair_seq, vlm=self.vlm,
             wall_dist=self.wall_dist if (t - self.wall_t) <= self.det_max_age else math.inf,
+            ai_on_already=self.ai_on_already,
         )
         cmd = self.sm.update(obs)
 
@@ -348,7 +359,7 @@ class StairClimberNode(Node):
         entered_search = (cmd.state == State.SEARCH and self.sm.transitions
                           and self.sm.transitions[-1][0] == t
                           and self.sm.transitions[-1][1] == State.IDLE)
-        if entered_search and self.move_mode_on_enable and self.move_mode_code:
+        if entered_search and self.move_mode_on_enable and self.move_mode_code and not self.ai_on_already:
             self.pending_gait.append([self.move_mode_code, self.gait_repeats])
         if cmd.gait_code:
             if self.move_mode_code and not cmd.raw_code:

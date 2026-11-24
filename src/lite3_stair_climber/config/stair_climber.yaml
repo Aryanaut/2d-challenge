@@ -54,6 +54,7 @@ stair_climber:
     ai_exit_code: "0x2101052B"      # Exit AI; then Move Mode + flat_gait_code as usual
     move_mode_after_ai_enter: false # set true if AI mode also needs Move Mode before it walks
     ai_cmd_repeats: 1               # send Enter/Exit AI once, like the manual test that walked
+    ai_pre_enter_wait: 1.5          # stand still this long before Enter AI (23 Nov bag: it was sent with the legs still moving)
     ai_switch_wait: 5.0             # s to wait after Enter / Exit AI
     ai_enter_distance: 0.6          # Enter AI when the first step is 0.6 m ahead (inside the 1 m cell)
     ai_walk_speed: 0.3            # flat gait, from the 1.7 m align point to 0.6 m

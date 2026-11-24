@@ -19,8 +19,10 @@ object_detector:
     device: "cpu"
     imgsz: 640                                    # must match the export size (only used by the OpenCV fallback)
     conf_threshold: 0.35
-    class_conf_overrides: '{"survivor": 0.35, "hand_tools": 0.30, "medical_kit": 0.20}'   # lower = more sensitive
-    ignore_classes: ["cart", "market_stall", "tool_bench"]   # context only, never reported as a label
+    class_conf_overrides: '{"survivor": 0.35, "hand_tools": 0.45}'   # M01 hand_tools: strict on purpose
+    ignore_classes: ["cart", "market_stall", "tool_bench", "cleaning_cart", "kitchen"]   # context only, never reported as a label
+    report_objects: ["survivor", "hand_tools"]   # ONLY these objects are reported (hazards + QR always are);
+                                                  # everything else is still used to work out the scene
 
     # anything detected as these labels is reported as "survivor"
     label_map: '{"person": "survivor", "toy figure": "survivor", "doll": "survivor"}'
@@ -35,10 +37,29 @@ object_detector:
     hazard_min_score: 0.6
     hazard_min_margin: 0.02
 
+    # scene (room type) worked out from what is in view; published on /mission/scene_type and added to every event
+    # scene names MUST match the organisers' scene_type names exactly
+    scene_rules: '{"workshop": ["tool_bench", "hand_tools"], "kitchen": ["kitchen", "utensils"], "market": ["market_stall", "cart", "food"], "clinic": ["medical_kit"]}'
+    # DECIDING objects: if one of these is seen (in >= scene_decisive_hits frames), it sets the scene outright,
+    # e.g. a cooking pot (utensils) -> kitchen even if there is food around. Otherwise scene_rules vote.
+    scene_decisive: '{"utensils": "kitchen", "kitchen": "kitchen", "tool_bench": "workshop", "hand_tools": "workshop", "medical_kit": "clinic"}'
+    scene_decisive_hits: 2
+    scene_decisive_conf: 0.35
+    scene_window_s: 6.0
+    scene_min_score: 1.5
+    scene_topic: /mission/scene_type
+
+    # M03 = survivor WITH a QR code beside it, M05 = survivor without
+    qr_assoc_s: 3.0                               # QR in view within this many seconds of the survivor = "has QR"
+    qr_text_topic: /perception/qr_text            # every newly decoded QR string, exactly as decoded
+
+    publish_observations: true                    # send reports to lite3_mission_reporter
+    observation_topic: /mission_reporter/observation
+
     detect_hz: 3.0
     confirm_hits: 3
     confirm_window_s: 2.0
-    class_confirm_overrides: '{"medical_kit": 2}'  # medical kits confirmed after 2 frames instead of 3
+    class_confirm_overrides: '{"hand_tools": 4}'   # hand tools must be seen in 4 frames
     dedup_radius_m: 1.0
     dedup_cooldown_s: 20.0
     max_range_m: 4.0
@@ -54,4 +75,5 @@ llm_event_bridge:
     retries: 2
     min_accept_confidence: 0.6
     object_labels: ["survivor", "medical_kit", "hand_tools", "food", "water", "utensils"]
+    publish_observations: false                   # true once query_llm() works (then set the detector's to false)
     hazard_list: ["high_voltage", "radioactive", "chemical", "biological", "flammable"]

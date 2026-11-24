@@ -163,6 +163,7 @@ class SMParams:
     ai_enter_code: int = 0x21010528
     ai_exit_code: int = 0x2101052B
     ai_switch_wait: float = 3.0
+    ai_pre_enter_wait: float = 0.0      # stand still this long before Enter AI (it was sent with the legs still moving)
     ai_enter_distance: float = 0.6      # Enter AI this far from the first step (< 1 cell)
     ai_walk_speed: float = 0.06         # flat-gait walk from the align point to ai_enter_distance
     ai_walk_timeout: float = 40.0
@@ -207,6 +208,7 @@ class Observation:
     stair_seq: int = 0             # increments on each new lidar result
     vlm: Optional[bool] = None     # VLM verdict since the last request
     wall_dist: float = math.inf    # lidar: nearest tall obstacle straight ahead (inf = none / unknown)
+    ai_on_already: bool = False    # the mission already put the robot in AI mode (/stair_climber/ai_on): no Enter AI / Move Mode
 
 
 @dataclass
@@ -628,6 +630,13 @@ class StairStateMachine:
         return self._drive(o, p.ai_walk_speed, f'walking to the AI zone, {to_go:.2f} m to go')
 
     def _s_enter_ai(self, o):
+        if o.ai_on_already:                       # the mission sent Enter AI before enabling us
+            self._go(State.CROSS_AI, o, 'AI mode already on')
+            return self._stop('AI mode already on')
+        if self.c.entry_pending:                  # not sent yet: let the walk to the AI zone come to a stop first
+            if self._elapsed(o) < self.p.ai_pre_enter_wait:
+                return self._stop('standing still before Enter AI')
+            self.c.state_t0 = o.t                 # the settle wait counts from the command
         return self._gait_switch(o, self.p.ai_enter_code, State.CROSS_AI, 'AI', raw=True,
                                  wait=self.p.ai_switch_wait)
 
