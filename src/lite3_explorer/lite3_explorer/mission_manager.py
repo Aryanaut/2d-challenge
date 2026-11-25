@@ -49,6 +49,8 @@ import json
 import math
 import os
 import time
+from turtle import st
+from unittest import result
 
 import numpy as np
 import rclpy
@@ -316,6 +318,8 @@ class MissionManager(Node):
         self.intent_pub = self.create_publisher(String, '~/next_target', latched)
         self.complete_pub = self.create_publisher(Bool, '/exploration_complete', latched)
         self.tile_pub = self.create_publisher(String, '/tile_map', latched)
+        self.scene_type_pub = self.create_publisher(String, '/scene/result', latched) ##added by debbie, publisher of scene type
+        self.robot_pos_pub = self.create_publisher(String, '/robot/position', 10) ##added by debbie, publisher of robot position
         self.tile_report_pub = self.create_publisher(String, '/tile_report', QoSProfile(
             depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.tile_marker_pub = self.create_publisher(MarkerArray, '~/tile_markers', latched)
@@ -349,6 +353,7 @@ class MissionManager(Node):
         self.create_timer(0.5, self._track_tiles)
         self.create_timer(1.0, self._refresh_tiles)
         self.create_timer(0.5, self._reevaluate_tiles)
+        self.create_timer(0.5, self._publish_robot_position) #publish robot position every 0.5 seconds
         self.create_timer(1.0, self._publish_virtual_walls)     # re-marked every second: the lidar must not clear them
         self.create_timer(1.0, self._publish_status)
         # curtain mode (use_curtains): the detector's confirmed curtain spots, and direct velocity commands for the walk through it
@@ -428,6 +433,15 @@ class MissionManager(Node):
             return None
         return [round(t.transform.translation.x, 3), round(t.transform.translation.y, 3),
                 round(self._yaw_of(t.transform.rotation), 4)]
+
+    def _publish_robot_position(self):
+        """Publish the tile the robot stands on, "i,j", for the mission reporter."""
+        p = self.pose()
+        if p is None or not self.tiles.ready:
+            return
+        i, j = self.tiles.grid.tile_of(p[0], p[1])
+        k = 1.02                                           # tile position multiplier
+        self.robot_pos_pub.publish(String(data=f'{i * k:.2f},{j * k:.2f}'))
 
     def local_map_ready(self, pose, radius_m=1.5, min_known=0.5):
         if self.tiles.map is None:
@@ -1008,6 +1022,9 @@ class MissionManager(Node):
             if result.get('scene_type') == 'traversable':
                 self.tiles.mark_traversable(tuple(int(v) for v in label.split(',')))   # no scene: an ordinary tile again
                 self.event('scene_traversable', tile=label)
+            st = result.get('scene_type')
+            if st and st != 'traversable':
+                self.scene_type_pub.publish(String(data=st))
             if result.get('image'):
                 result['image'] = os.path.join(self.scene_images_dir, result['image'])   # the report joins run_dir: absolute wins
             if result.get('images'):

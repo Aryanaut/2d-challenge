@@ -28,3 +28,15 @@ curtain_detector:
     lidar_high_min_m: 0.30      # returns from this height are "wall height"
     lidar_min_low: 20           # floor-level returns a cell needs (summed over scans)
     lidar_min_high_behind: 10   # wall-height returns needed beyond the cell, along the robot's view
+    # Front colour camera + depth (curtain_colour.py): a pale, smooth, upright surface 0.12-1.2 m above the floor and at
+    # least 0.8x as bright as the floor in the same image = the fabric curtain. Off by default; tuned on 24 Nov snapshots.
+    use_colour: true
+    colour_topic: /camera/color/image_raw/compressed   # or /camera/color/image_raw (rgb8 / bgr8)
+    colour_info_topic: /camera/color/camera_info
+    colour_max_age_s: 0.5         # ignore colour images older than this
+    colour_min_height_m: 0.12     # above the floor (the wooden ledge under the curtain is ~0.09 m)
+    colour_max_texture: 0.012     # curtain ~0.005, OSB wood 0.016-0.033
+    colour_max_saturation: 0.30   # curtain 0.04-0.22, OSB 0.25-0.37
+    colour_min_rel_brightness: 0.80   # vs the floor; grey wall ~0.6, curtain ~1.0
+    colour_min_area_m2: 0.15      # curtain area needed (far away)...
+    colour_min_fraction: 0.10     # ...or this share of the image (close up)

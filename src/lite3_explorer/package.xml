@@ -27,7 +27,6 @@
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>pointcloud_to_laserscan</exec_depend>
   <exec_depend>lite3_terrain_classifier</exec_depend>
-  <exec_depend>stair_climber</exec_depend>
   <exec_depend>transfer_interfaces</exec_depend>
   <exec_depend>lite3_llm_tools</exec_depend>
   <exec_depend>python3-numpy</exec_depend>

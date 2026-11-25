@@ -275,7 +275,7 @@ mission_manager:
         lateral_gain: 0.5                    # vy that keeps the robot on the line through the tile centres (0 = off)
         lateral_max_mps: 0.08
         extra_m: 0.0                         # stop this much beyond the centre of the tile beyond the staircase
-        cross_timeout_s: 10.0
+        cross_timeout_s: 20.0                # ~1.5 m at speed_mps takes ~8 s; leave room for slow steps
         stall_m: 0.05                        # climbing: less progress than this ...
         stall_s: 10.0                        # ... in this long = stuck on the stairs
         pose_lost_s: 3.0                     # no pose on the stairs: keep walking straight this long, then stop
@@ -285,7 +285,7 @@ mission_manager:
         ai_before_climber: true              # AI mode on after centring + squaring up (flat gait, live pose; leg odom freezes in AI mode),
                                              # before stair_climber: its lidar alignment and walk run in AI mode, no second Enter AI
         rebase_odom: true                    # after the climb: odom is re-anchored at the centre of the tile beyond (/odom_rebase)
-        climber: true
+        climber: true                       # built-in climb (centre, square up, AI on, vx over the stairs, AI off): no stair_climber node needed
         climber_search_timeout_s: 15.0       # still searching after this long: the lidar does not see stairs, give up (no climb)
         climber_timeout_s: 180.0             # whole climb, alignment included
         climber_lost_s: 5.0                  # no /stair_climber/state for this long: the node is not running, give up

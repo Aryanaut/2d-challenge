@@ -189,12 +189,6 @@ def generate_launch_description():
         Node(package=PKG, executable='stair_detector', name='stair_detector', output='screen',
              parameters=[lc('stairs_params'), {'use_sim_time': lc('use_sim_time')}],
              condition=IfCondition(lc('use_stairs'))),
-        # the stairs mode (modes.stairs.climber: true) hands the climb to this node over /stair_climber/enable and waits
-        # for /stair_climber/state; without it the mission gives up after climber_lost_s ("no state from stair_climber")
-        Node(package='stair_climber', executable='stair_climber_node', name='stair_climber', output='screen',
-             parameters=[os.path.join(get_package_share_directory('stair_climber'), 'config', 'stair_climber.yaml'),
-                         {'autostart': False, 'dry_run': False, 'use_sim_time': lc('use_sim_time')}],
-             condition=IfCondition(lc('use_stairs'))),
         Node(package=PKG, executable='roller_detector', name='roller_detector', output='screen',
              parameters=[lc('roller_params'), {'use_sim_time': lc('use_sim_time'), 'cloud_topic': lc('cloud_topic')}],
              condition=IfCondition(lc('use_rollers'))),
