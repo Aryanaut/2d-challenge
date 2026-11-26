@@ -1,0 +1,32 @@
+# Every mission condition in one small course (sim_perception + reporter:=local; scripts/sim_mission_check.sh):
+#   0,2 cleaning_room  survivor WITHOUT a QR                        -> M05 cleaning_room
+#   2,2 workshop       hand_tools                                   -> M01 workshop
+#   4,2 kitchen        survivor WITH a QR, the QR off to the side   -> M03 kitchen (QR read after the survivor) + M04
+#   1,0 clinic         flammable hazard sign                        -> M02 clinic
+#   4,0 'C'            ordinary tile cluttered with boxes + a stray prop sighting: no room, never a named scene
+name: mission_check
+tile_size: 1.02
+layout: |
+  +---+---+---+---+---+---+
+  | 7 | # | 5 | # | 3 | # |
+  +   +---+   +---+   +---+
+  | >                     |
+  +---+   +---+---+   +---+
+  | # | 6 | #   # | C | # |
+  +---+---+---+---+---+---+
+start:
+  yaw_offset_deg: 4.0
+extra:
+  boxes:
+    - [4.30, 0.15, 0.25, 0.25]
+    - [4.70, 0.45, 0.20, 0.30]
+perception:
+  survivors:
+    - {tile: [0, 2], offset_m: [-0.20, 0.10]}
+    - {tile: [4, 2], offset_m: [-0.25, 0.05], qr: "My friend is in the market.", qr_offset_m: [0.35, 0.15]}
+  objects:
+    - {tile: [2, 2], label: hand_tools}
+    - {tile: [1, 0], label: flammable, type: hazard}
+  props: auto
+  clutter_props:
+    - {tile: [4, 0], offset_m: [-0.10, -0.20], label: medical_kit}

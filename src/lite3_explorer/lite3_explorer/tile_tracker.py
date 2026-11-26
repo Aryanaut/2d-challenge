@@ -38,6 +38,9 @@ class TileTracker:
         self.min_known = min_known           # share of a tile the lidar must have scanned before it becomes a tile
         self.scene_min_known, self.scene_max_free = scene_min_known, scene_max_free   # scene tile: scanned >= this, free/scanned < this
         self.scene_margin_m = scene_margin_m           # ... free/scanned measured this far inside the tile edges (walls)
+        # a tile scanned at least scene_min_known but less than this is a scene only with a scene-prop sighting on it
+        # (prop_points): partly scanned tiles beside the start (outside the maze, a wall edge) read cluttered. 0 = off
+        self.scene_lidar_min_known = 0.0
         self.reach_radius_m = reach_radius_m
         # True while SLAM's map->odom has just jumped (mission manager, slam_jump_*): the robot pose may be metres off,
         # so no tile counts as reached from it ('centre reached' / 'goal reached')
@@ -107,6 +110,9 @@ class TileTracker:
         # has left it. Carried over to a new map (same tile numbering).
         self.initial_tile: Optional[tuple] = None
         self.initial_left = False
+        # the robot has left the initial tile only once its pose is this far outside it (the whole body has cleared
+        # it, not just its centre crossed the edge): walling it off earlier would put the robot inside the walls
+        self.initial_clear_m = 0.40
         # tile edges that are no curtain: (tile, side) the curtain mode gave up on (timed out / blocked walking through).
         # Curtain spots on them, or on any edge of the initial tile, are ignored (not_curtain_mask).
         self.not_curtains: List[tuple] = []
@@ -121,6 +127,13 @@ class TileTracker:
         # roller crossings the robot made: {sorted (tile before, tile beyond): roller tile}. Backtracking may cross back
         # over them with the roller mode (known_route links the two tiles, roller_between names the roller tile).
         self.roller_crossings: Dict[tuple, tuple] = {}
+        # scene-prop votes (prop_votes.py): map points of scene props the detector saw. A tile (not on the trail) with at
+        # least prop_min_frames of them summing to prop_min_score confidence stays a scene tile (update) and an AI
+        # 'traversable' answer does not reopen it (mission manager). prop_votes False = points are kept but not used.
+        self.prop_votes = False
+        self.prop_min_frames = 8
+        self.prop_min_score = 4.0
+        self.prop_points: List[tuple] = []             # (x, y, confidence, label, range_m) in the map frame
         self._map = None                              # (grid array, GridInfo)
         self._map_version = 0
         self._classified_version = -1
@@ -132,7 +145,7 @@ class TileTracker:
                'on_aligned', 'skip_scene', 'wall_release_fraction', 'wall_band_m', 'scene_wall_fraction',
                'stair_min_points', 'stair_floor_min_known',
                'stair_floor_min_free', 'stair_shift_max_m', 'roller_min_points', 'roller_min_lidar',
-               'roller_depth_only_points', 'roller_edge_margin_m')
+               'roller_depth_only_points', 'roller_edge_margin_m', 'prop_votes', 'prop_min_frames', 'prop_min_score', 'initial_clear_m')
 
     def reset(self):
         """Forget the grid, the map and everything learned on it (tiles, trail, failures, staircases, rollers, curtains,
@@ -240,6 +253,19 @@ class TileTracker:
                 t['scene'] = False
                 if t['status'] == 'blocked':                   # the AI looked: it can be walked on
                     t['status'] = 'to_visit'
+        if self.scene_lidar_min_known > 0:                     # partly scanned: the lidar alone is not enough
+            props = self.prop_counts()
+            for tile, t in self.tiles.items():
+                if t.get('scene') and t['known'] < self.scene_lidar_min_known and tile not in self.described \
+                        and not props.get(tile, {}).get('frames'):
+                    t['scene'] = False
+                    t['scene_weak'] = True                     # (in /tile_map) would be a scene at scene_min_known
+        if self.prop_votes:                                    # scene props seen on it: a scene tile, whatever the lidar / AI say
+            trail = set(self.trail)
+            for tile in self.prop_tiles():
+                t = self.tiles.get(tile)
+                if t is not None and tile not in trail:
+                    t['scene'], t['prop_scene'] = True, True
         if len(self.stair_points) and self._assign_stairs():   # the map grew: the staircase may only now be found
             self.version += 1
         for tile in set(self.stairs) | self.stairs_crossed:
@@ -368,6 +394,7 @@ class TileTracker:
         """A tile is reached when the robot is within reach_radius_m of its centre. Returns the tile if newly entered."""
         if self.grid is None or pose is None:
             return None
+        self._check_initial_cleared(pose)
         tile = self.grid.tile_of(pose[0], pose[1])
         if within_reach(pose, self.grid.center(tile), self.reach_radius_m):
             return self._visit(tile, pose, 'centre reached')
@@ -437,8 +464,7 @@ class TileTracker:
             self.align_grid(tile, pose)
         new = tile not in set(self.trail)
         self.trail.append(tile)
-        if self.initial_tile is not None and tuple(tile) != self.initial_tile:
-            self.initial_left = True                    # the initial tile is closed from now on (is_closed)
+        self._check_initial_cleared(pose)
         self.trail_log.append({'tile': list(tile), 'time': dt.datetime.now().isoformat(timespec='seconds'),
                                'pose': list(pose) if pose else None, 'source': source})
         self.invalidate()
@@ -496,6 +522,44 @@ class TileTracker:
         return (bool(self.tiles.get(tile, {}).get('scene')) and tile not in set(self.trail)
                 and tile not in self.stairs and tile not in self.stairs_crossed and tile not in self.rollers)
 
+    def prop_counts(self) -> Dict[tuple, dict]:
+        """Per tile: {'frames': n, 'score': summed confidence, 'labels': {label: n}} of the scene-prop points on it
+        (counted on the CURRENT grid, so a grid nudge moves them with the walls)."""
+        out: Dict[tuple, dict] = {}
+        if self.grid is None:
+            return out
+        for x, y, conf, lab, _ in self.prop_points:
+            e = out.setdefault(tuple(self.grid.tile_of(x, y)), {'frames': 0, 'score': 0.0, 'labels': {}})
+            e['frames'] += 1
+            e['score'] = round(e['score'] + conf, 2)
+            e['labels'][lab] = e['labels'].get(lab, 0) + 1
+        return out
+
+    def prop_tiles(self) -> set:
+        """Tiles with enough scene-prop votes (prop_min_frames points, prop_min_score summed confidence)."""
+        return {t for t, e in self.prop_counts().items()
+                if e['frames'] >= self.prop_min_frames and e['score'] >= self.prop_min_score}
+
+    def is_prop_scene(self, tile) -> bool:
+        """prop_votes on and the tile has enough scene-prop votes."""
+        return bool(self.prop_votes) and tuple(tile) in self.prop_tiles()
+
+    def add_prop_points(self, points, max_points: int = 20000) -> List[tuple]:
+        """Add scene-prop map points; returns the tiles that just got enough votes (re-classifies when there are any)."""
+        if not points:
+            return []
+        before = self.prop_tiles()
+        self.prop_points.extend(points)
+        if len(self.prop_points) > max_points:
+            del self.prop_points[:len(self.prop_points) - max_points]
+        new = sorted(self.prop_tiles() - before)
+        weak = self.scene_lidar_min_known > 0 and self.grid is not None and any(
+            self.tiles.get(tuple(self.grid.tile_of(p[0], p[1])), {}).get('scene_weak') for p in points)
+        if (new and self.prop_votes) or weak:               # weak: a partly scanned cluttered tile, now with a prop on it
+            self.invalidate()
+            self.update()
+        return new
+
     def mark_described(self, tile):
         """A scene tile was looked at from a neighbouring tile: it counts as explored (status visited) although the robot
         never entered it. The trail (and so the current tile) is untouched."""
@@ -531,16 +595,72 @@ class TileTracker:
                 return share < self.scene_wall_fraction
         return True
 
+    @staticmethod
+    def _seg_key(seg) -> tuple:
+        """edge_key of a world segment (rounded, sorted end points)."""
+        (x0, y0), (x1, y1) = seg
+        return tuple(sorted(((round(x0, 2), round(y0, 2)), (round(x1, 2), round(y1, 2)))))
+
+    def _virtual_wall_keys(self) -> set:
+        """Edge keys of the virtual walls: map walls (_wall_keys, curtain edges left out), the start wall, the edges of
+        crossed staircases and the closed side (as in virtual_walls)."""
+        keys = set(self._wall_keys) - set(self.curtain_edges)
+        if getattr(self, 'start_wall', None):
+            keys.add(self._seg_key(self.start_wall))
+        if self.grid is not None:
+            segs = [self.grid.edge(tile, side) for tile in self.stairs_crossed for side in T.SIDES]
+            segs += self._closed_wall()
+            if self._initial_closed() and self.current != self.initial_tile:
+                segs += [self.grid.edge(self.initial_tile, side) for side in T.SIDES]
+            keys |= {self._seg_key(s) for s in segs}
+        return keys
+
+    def _virtual_wall_scanned(self, a, b) -> bool:
+        """The side tiles a and b share is a virtual wall AND the lidar has mapped wall on it (T.tile_sides 'wall':
+        >= 0.4 of the edge line within ±1 cell): a real wall, the camera cannot look across it, however little of it the
+        wider wall band (_open_between, scene_wall_fraction) has seen yet. Bag fullrun_26_11_141104: scene 0,-1 looked
+        at from the start tile across the start wall (band share 0.50 < 0.8, edge line 0.45 = 'wall'): the pictures
+        were of the wall."""
+        side = T.side_towards(tuple(a), tuple(b))
+        if side is None or self.grid is None or self._map is None:
+            return False
+        if T.edge_key(self.grid, tuple(a), side) not in self._virtual_wall_keys():
+            return False
+        grid, info = self._map
+        return T.tile_sides(grid, info, self.grid, tuple(a)).get(side) == 'wall'
+
+    def _view_open(self, viewer, scene) -> bool:
+        """The scene tile can be looked at from its neighbour `viewer` across their shared side: _open_between, or,
+        when _open_between calls EVERY side of the scene tile a wall, a side with no straight wall line on it
+        (T.edge_line_share < scene_wall_fraction). The lidar scanned the scene tile, so some side of it is open: all
+        four reading as wall means clutter close to the edges fills the wall band (sim scene clutter sits 0.15 m in,
+        exactly wall_band_m: bag backtracking_20261126_131935, scenes 0,-1 / 2,-1 / 0,-2 'without a viewpoint' while
+        the robot stood beside them, then retrying them forever). Not a scene tile: _open_between."""
+        viewer, scene = tuple(viewer), tuple(scene)
+        if self._virtual_wall_scanned(viewer, scene):
+            return False
+        if self._open_between(viewer, scene):
+            return True
+        if T.side_towards(viewer, scene) is None or self.grid is None or self._map is None or not self.is_scene(scene):
+            return False
+        i, j = scene
+        if any(self._open_between(scene, n) for n in ((i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1))):
+            return False                                # a real open side elsewhere: look from there
+        grid, info = self._map
+        return T.edge_line_share(grid, info, self.grid, viewer, T.side_towards(viewer, scene),
+                                 band_m=self.wall_band_m) < self.scene_wall_fraction
+
     def wall_between(self, a, b) -> bool:
-        """Neighbouring tiles a and b are separated by a wall (see _open_between). Not neighbours: False."""
-        return T.side_towards(tuple(a), tuple(b)) is not None and not self._open_between(a, b)
+        """Neighbouring tiles a and b are separated by a wall (see _open_between; b a scene tile: _view_open).
+        Not neighbours: False."""
+        return T.side_towards(tuple(a), tuple(b)) is not None and not self._view_open(a, b)
 
     def scene_neighbours(self, tile) -> List[tuple]:
         """Scene tiles not looked at yet that share an open side with `tile` (call with the current tile): the only
         ones the scene mode is started for."""
         i, j = tile
         return [n for n in ((i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1))
-                if n not in self.described and self._scene_flag(n) and self._open_between(tile, n)]
+                if n not in self.described and self._scene_flag(n) and self._view_open(tile, n)]
 
     def pending_scenes(self) -> List[tuple]:
         """Scene tiles not looked at yet (and not given up on)."""
@@ -552,7 +672,7 @@ class TileTracker:
         i, j = scene
         return [n for n in ((i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1))
                 if self.tiles.get(n, {}).get('status') in ('visited', 'to_visit') and not self.is_scene(n)
-                and self._open_between(scene, n)]
+                and self._view_open(n, scene)]
 
 
 
@@ -783,6 +903,22 @@ class TileTracker:
         axis, s = fwd
         d = s * (tile[axis] - stair[axis])
         return d < 0 if self.stairs_crossed else d > 0
+
+    def _check_initial_cleared(self, pose) -> bool:
+        """Close the initial tile (initial_left) once the robot's pose is at least initial_clear_m outside it: its body
+        has cleared the tile. Entering the next tile is not enough (the robot still straddles the edge)."""
+        if self.initial_left or self.initial_tile is None or self.grid is None or pose is None:
+            return self.initial_left
+        u, v = self.grid.to_local(pose[0], pose[1])
+        i, j = self.initial_tile
+        s = self.grid.size
+        du = max(i * s - float(u), 0.0, float(u) - (i + 1) * s)
+        dv = max(j * s - float(v), 0.0, float(v) - (j + 1) * s)
+        if math.hypot(du, dv) >= self.initial_clear_m:
+            self.initial_left = True                    # the initial tile is closed from now on (is_closed)
+            self.invalidate()
+            self.version += 1
+        return self.initial_left
 
     def _initial_closed(self) -> bool:
         """The robot has left the initial tile: it is not traversable any more."""

@@ -9,7 +9,10 @@ message the lite3_<gait> shell aliases send with `ros2 topic pub --once`.
 /step_up (Bool, from the mission manager): true while the robot drives to a tile that is higher than the one it stands on
 (terrain classifier elevation option): the step_up_gait (rug_hstep) is used instead of the terrain gait.
 /gait_freeze (Bool, latched, from the mission manager): true while the recovery mode runs; the robot keeps the gait it
-already has (no command is sent for its new targets, a new terrain or /step_up) until it is released.
+already has (no command is sent for its new targets or a new terrain) until it is released. /step_up still switches
+to the step-up gait while frozen (the mission manager only sets it then when recovery's step_up_gait is on).
+/robot_state (Int32MultiArray [basic, gait, policy, motion], robot_state_bridge): while /step_up holds the step-up gait,
+it is sent again every step_up_retry_s until the robot reports it (terrain_gait.GaitConfirm; 0 = no re-sends).
 Switching rules (flat delay, minimum interval) live in terrain_gait.py. The gait only changes when the robot starts
 for a new tile (/mission_manager/next_target names a tile) or when a new terrain is classified (/terrain_type changes);
 a finished spin / animation brings the terrain gait back. While the robot is in AI mode (/ai_mode true: the mission
@@ -18,15 +21,21 @@ Speed per gait: hstep_speed_limit (m/s, default 0.38; 0 = no cap) for rug_hstep,
 e.g. flat_medium:0.4) for any other gait, cap Nav2's linear speed while that gait is in use,
 as a nav2_msgs/SpeedLimit (absolute) on speed_limit_topic (the controller server's, default /speed_limit); any other
 gait lifts the cap (speed_limit 0). Modes that publish /cmd_vel themselves (curtain, roller, stairs) use their own speeds.
+Gait switches only while the robot stands still (switch_hold, terrain_gait.SwitchHold): every gait command is preceded by
+switch_stop_s of zero velocity on /cmd_vel, and zero velocity goes on until the robot reports the new gait (at least
+switch_settle_s; at most switch_stop_s + switch_max_wait_s). /gait_switching (Bool, latched) is true meanwhile: the
+step_pause_gate (Nav2 output) and the mission manager's own /cmd_vel stop forwarding motion while it is.
 """
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import Twist
 from nav2_msgs.msg import SpeedLimit
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32MultiArray, String
 from transfer_interfaces.msg import MotionSimpleCMD
 
-from lite3_explorer.terrain_gait import GAIT_CODES, GaitCommand, TerrainGaitSwitcher
+from lite3_explorer.robot_state import BASIC_STANDING
+from lite3_explorer.terrain_gait import GAIT_CODES, GaitCommand, GaitConfirm, SwitchHold, TerrainGaitSwitcher
 
 
 class GaitSwitcher(Node):
@@ -58,6 +67,12 @@ class GaitSwitcher(Node):
         self.create_subscription(String, p('target_topic', '/mission_manager/next_target'), self._on_target, latched)
         self.step_up_gait = p('step_up_gait', 'rug_hstep')
         self.create_subscription(Bool, p('step_up_topic', '/step_up'), self._on_step_up, latched)
+        # step-up gait: re-send until /robot_state reports it
+        self.confirm = GaitConfirm(retry_s=float(p('step_up_retry_s', 1.5)))
+        self.robot_state_max_age_s = float(p('robot_state_max_age_s', 1.0))
+        self.robot_gait = None                            # (robot_gait_state or None, time) from /robot_state
+        self._last_publish_at = None                      # last /simple_cmd publish (burst repeats included)
+        self.create_subscription(Int32MultiArray, p('robot_state_topic', '/robot_state'), self._on_robot_state, 10)
         self.create_subscription(Bool, '/spin_crawl', self._on_crawl_hold, 10)
         self.create_subscription(Bool, '/spin_flat', self._on_flat_request, 10)
         self.animating = False                            # no gait commands while a robot animation runs
@@ -81,6 +96,15 @@ class GaitSwitcher(Node):
             self.speed_limits.pop('rug_hstep', None)
         self.speed_pub = self.create_publisher(SpeedLimit, p('speed_limit_topic', '/speed_limit'), 10)
         self._limit_sent = None                           # (limit, subscriber count) last published
+        # gait switches only while the robot stands still: zero /cmd_vel before and during each switch
+        self.hold = (SwitchHold(stop_s=float(p('switch_stop_s', 0.4)), settle_s=float(p('switch_settle_s', 1.0)),
+                                max_wait_s=float(p('switch_max_wait_s', 3.0)))
+                     if bool(p('switch_hold', True)) else None)
+        self.vel_pub = self.create_publisher(Twist, p('cmd_vel_topic', '/cmd_vel'), 10)
+        self.switching_pub = self.create_publisher(Bool, p('switching_topic', '/gait_switching'), latched)
+        self.switching_pub.publish(Bool(data=False))
+        self._was_holding = False
+        self.create_timer(0.02, self._hold_tick)
         self.create_timer(0.2, self._tick)
         self.get_logger().info(f'gait switcher: non_rugged -> {self.switcher.flat_gait}, '
                                f'rugged -> {self.switcher.rugged_gait}; Nav2 speed limits {self.speed_limits or "none"}')
@@ -110,10 +134,62 @@ class GaitSwitcher(Node):
         if self.switcher.set_override(self.step_up_gait if msg.data else None):
             self.get_logger().info(f'higher tile ahead: {"h-step gait" if msg.data else "terrain gait again"}')
 
+    def _on_robot_state(self, msg):
+        if len(msg.data) >= 2:
+            gait = int(msg.data[1]) if int(msg.data[0]) == BASIC_STANDING else None
+            self.robot_gait = (gait, self._now())
+
+    def _confirm_step_up(self, now):
+        """While /step_up holds the step-up gait and it was sent, send it again until /robot_state reports it."""
+        sw = self.switcher
+        want = self.step_up_gait if sw.override == self.step_up_gait and sw.gait == self.step_up_gait else None
+        gait = self._robot_gait_now(now)
+        resend = self.confirm.update(now, want, gait, self._last_publish_at)
+        if self.confirm.event:
+            (self.get_logger().warn if resend else self.get_logger().info)(f'step up: {self.confirm.event}')
+        if resend:
+            self._send(GaitCommand(want, GAIT_CODES[want]), now)
+
     def _send(self, cmd, now):
+        """Switch to `cmd`: with switch_hold the robot is stopped first (_hold_tick publishes it), else at once."""
+        if self.hold is None:
+            self._publish_cmd(cmd, now)
+            return
+        if not self.hold.holding:
+            self.get_logger().info(f'gait switch to {cmd.gait}: stopping the robot first')
+        self.hold.request(cmd, now)
+        self._hold_tick()
+
+    def _robot_gait_now(self, now):
+        return (self.robot_gait[0] if self.robot_gait is not None
+                and now - self.robot_gait[1] <= self.robot_state_max_age_s else None)
+
+    def _hold_tick(self):
+        """Send the gait once the robot was stopped; zero /cmd_vel while the switch hold lasts."""
+        if self.hold is None:
+            return
+        now = self._now()
+        if self.hold.cmd is not None and (self.ai_mode or (self.animating and not self.crawl_hold)):
+            # AI mode (a gait would end it) / animation (sends its own gait back after): drop the switch not sent yet
+            self.hold.cancel()
+            self.switcher.armed = True
+        cmd = self.hold.update(now, self._robot_gait_now(now))
+        if cmd is not None:
+            self._publish_cmd(cmd, now)
+        if self.hold.event:
+            self.get_logger().info(f'gait switch: {self.hold.event}')
+        holding = self.hold.holding
+        if holding:
+            self.vel_pub.publish(Twist())
+        if holding != self._was_holding:
+            self._was_holding = holding
+            self.switching_pub.publish(Bool(data=holding))
+
+    def _publish_cmd(self, cmd, now):
         out = MotionSimpleCMD()
         out.cmd_code, out.type = cmd.cmd_code, 0
         self.cmd_pub.publish(out)
+        self._last_publish_at = now
         self._burst = (out, self.repeats - 1, now)
         self.switcher.mark_sent(cmd, now)
         self.get_logger().info(f'gait -> {cmd.gait} (0x{cmd.cmd_code:08X})')
@@ -163,6 +239,9 @@ class GaitSwitcher(Node):
         was, self.ai_mode = self.ai_mode, bool(msg.data)
         if self.ai_mode and not was:
             self._burst = None                            # a gait still being repeated would end AI mode
+            if self.hold is not None and self.hold.holding:
+                self.hold.cancel()                        # nor any gait still waiting to be sent
+                self._hold_tick()
             self._publish_gait('AI mode: stairs')
         elif was and not self.ai_mode:
             self.switcher.restore()                       # AI mode is over: restore the terrain gait
@@ -173,6 +252,7 @@ class GaitSwitcher(Node):
             self._burst = None
         elif now - last >= self.repeat_period_s:
             self.cmd_pub.publish(out)
+            self._last_publish_at = now
             self._burst = (out, left - 1, now)
 
     def _update_speed_limit(self):
@@ -202,9 +282,13 @@ class GaitSwitcher(Node):
         # Don't send (and record) a gait before the robot's subscriber is matched: it would be lost.
         if self.cmd_pub.get_subscription_count() == 0:
             return
+        if self.hold is not None and self.hold.cmd is not None:
+            return                                        # a switch is waiting for the robot to stop
         cmd = self.switcher.pending_command(now)
         if cmd is not None:
             self._send(cmd, now)
+        else:
+            self._confirm_step_up(now)
 
 
 def main(args=None):

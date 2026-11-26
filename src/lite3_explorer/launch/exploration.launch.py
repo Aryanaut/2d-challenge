@@ -9,16 +9,17 @@ Example:
   ros2 launch lite3_explorer exploration.launch.py use_stairs:=true      # climb over staircases in AI mode
   ros2 launch lite3_explorer exploration.launch.py use_rollers:=true     # cross roller tiles in the h-step gait
   ros2 launch lite3_explorer exploration.launch.py hstep_speed:=0.3      # Nav2 speed cap in the h-step gait (m/s)
+  ros2 launch lite3_explorer exploration.launch.py step_pause:=false     # no balance pauses stepping up onto a tile
 """
 import os
 
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, LogInfo, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 from launch_ros.parameter_descriptions import ParameterValue
 
 PKG = 'lite3_explorer'
@@ -34,12 +35,23 @@ def _nav2(context):
         raise RuntimeError(f"controller must be 'rpp' or 'mppi', not {controller!r}")
     params = LaunchConfiguration('nav2_params').perform(context) or os.path.join(
         get_package_share_directory(PKG), 'config', 'nav2_params_mppi.yaml' if controller == 'mppi' else 'nav2_params.yaml')
-    return [LogInfo(msg=f'Nav2 local controller: {controller.upper()} ({params})'),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(os.path.join(
-                    get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')),
-                launch_arguments={'params_file': params, 'use_sim_time': LaunchConfiguration('use_sim_time').perform(context),
-                                  'autostart': 'true'}.items())]
+    nav2 = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(
+            get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')),
+        launch_arguments={'params_file': params, 'use_sim_time': LaunchConfiguration('use_sim_time').perform(context),
+                          'autostart': 'true'}.items())
+    out = [LogInfo(msg=f'Nav2 local controller: {controller.upper()} ({params})')]
+    if LaunchConfiguration('step_pause').perform(context).lower() != 'true':
+        return out + [nav2]
+    # step_pause: the velocity smoother publishes to /cmd_vel_nav_smoothed instead of /cmd_vel (a global remap comes
+    # before the node's own cmd_vel_smoothed -> cmd_vel), and step_pause_gate forwards it, stopping the robot briefly
+    # while it steps up onto a higher tile so it can balance.
+    return out + [
+        GroupAction([SetRemap(src='cmd_vel_smoothed', dst='/cmd_vel_nav_smoothed'), nav2]),
+        Node(package=PKG, executable='step_pause_gate', name='step_pause_gate', output='screen',
+             parameters=[LaunchConfiguration('step_pause_params').perform(context),
+                         {'use_sim_time': LaunchConfiguration('use_sim_time').perform(context).lower() == 'true',
+                          'in_topic': '/cmd_vel_nav_smoothed', 'out_topic': '/cmd_vel'}])]
 
 
 def _llm_client(context):
@@ -129,6 +141,10 @@ def generate_launch_description():
         DeclareLaunchArgument('use_gait', default_value='true'),
         DeclareLaunchArgument('hstep_speed', default_value='0.38',
                               description='Nav2 linear speed cap (m/s) while the h-step gait (rug_hstep) is in use; 0 = no cap'),
+        DeclareLaunchArgument('step_pause', default_value='true',
+                              description='Stop briefly (step_pause.yaml: 2 x 0.2 s) while Nav2 drives up onto a higher tile, '
+                                          'so the robot can balance; false = Nav2 publishes /cmd_vel directly'),
+        DeclareLaunchArgument('step_pause_params', default_value=cfg('step_pause.yaml')),
         DeclareLaunchArgument('use_mission', default_value='true'),
         DeclareLaunchArgument('auto_start', default_value='',
                               description='true/false: leave idle by itself (empty = mission.yaml)'),

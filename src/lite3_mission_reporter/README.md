@@ -73,7 +73,8 @@ Other settings:
 |---|---|---|
 | `scene_from` | `topic` | `topic` = only the scene package decides the room |
 | `same_survivor_radius_m` | `1.0` | survivors closer than this = the same one |
-| `qr_near_survivor_m` | `1.5` | a QR position this close to a survivor = that survivor has a QR |
+| `qr_near_survivor_m` | `1.0` | a QR position (map frame, from `/qr/visible`) this close to the survivor's map position = that survivor has a QR |
+| `no_qr_wait_s` | `10.0` | a survivor with no QR yet waits this long before it can be sent as M05 |
 | `no_qr_min_bbox_h_frac` | `0.25` | how close (by size in the image) a survivor must be before calling it "no QR" |
 | `use_llm_result` | `false` | `true` = use LLM-checked results from `llm_event_bridge` |
 | `output_dir` | `~/lite3_mission_results` | where the result files go |

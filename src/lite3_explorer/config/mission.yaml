@@ -18,7 +18,7 @@ mission_manager:
     use_ai: true                             # AI tile descriptions (lite3_llm_tools llm_client)
     llm_report_timeout_s: 180.0
     llm_report_retries: 5
-    robot_length_m: 0.61                     # turn-room check; match the local costmap footprint
+    robot_length_m: 0.67                     # turn-room check; match the local costmap footprint
     robot_width_m: 0.37
 
     tiles:
@@ -26,12 +26,20 @@ mission_manager:
       reach_radius_m: 0.30                   # a tile is explored once the robot is this close to its centre
       max_failures: 2                        # failed attempts (Nav2 abort, stuck, timeout) before a tile is unreachable
       min_known: 0.6                         # a tile exists once this share of it is scanned (was 0.7: the 1.7 m lidar range left edge tiles unknown)
-      scene_min_known: 0.80                  # scene tile (drawn blue hatched in RViz): scanned at least this much ...
+      scene_min_known: 0.55                  # scene tile (drawn blue hatched in RViz): scanned at least this much ...
+                                             # (26 Nov bags: cluttered tiles at known 0.55-0.61 / free 0.45-0.75 were missed at 0.65)
                                              # (fullrun 25 Nov 21:55: kitchen on -1,0 hides its own back, known stalled
                                              # at 0.81-0.84 with free/known 0.56-0.72 and the tile was entered; 0.80 flags it)
-      scene_max_free: 0.88                   # ... and less than this share of the SCANNED part traversable (free/known)
+      scene_max_free: 0.90                   # ... and less than this share of the SCANNED part traversable (free/known)
+                                             # (26 Nov: cleaning room 0,2 and 2,0 read 0.87, just under 0.88; plain tiles 0.89-1.0,
+                                             # so above 0.90 many ordinary tiles get an AI look)
                                              # (reporter4 25 Nov: sink + bins on 0,-1 read 0.87 and were entered at 0.86;
                                              # ordinary tiles read 0.87-1.0, a false scene only costs one AI look)
+      scene_lidar_min_known: 0.80            # ... but scanned less than this: a scene only with a scene-prop sighting on it
+                                             # (fullrun_26_11_141104: 11 tiles flagged, 1 real; outside-maze tiles beside the
+                                             # start read 0.55-0.70 scanned / free 0.5-0.8). 0 = off. Runtime:
+                                             #   ros2 param set /mission_manager tiles.scene_lidar_min_known 0.0
+      initial_clear_m: 0.40                  # the initial tile is closed (walled off) only once the robot is this far outside it
       align_on_entry: true                   # every tile entry: nudge the grid so that tile's edges lie on the detected walls ...
       align_max_shift_m: 0.15                # ... (an edge further than this from its wall is left alone)
       align_max_rot_deg: 6.0                 # ... (turn at most this much towards the wall angle)
@@ -48,6 +56,23 @@ mission_manager:
       roller_min_lidar: 2                    # ... of which this many the 3D lidar confirms (low returns only, open behind; 0 = depth alone)
       roller_depth_only_points: 12           # ... or a tile with this many spots needs no lidar (a long, well-seen ridge; 0 = lidar always required)
       roller_edge_margin_m: 0.15             # spots this close to a tile edge do not count (the roller lies across the middle)
+      # scene-prop votes: the detector's scene props (food, utensils, cart ...) placed on the lidar map by bearing.
+      # A tile with enough of them stays a scene tile (never entered) even when the lidar test drops it or the AI says
+      # 'traversable' (fullrun 26 Nov: market 2,1 and kitchen 0,-1 had 50-100 sightings each; terrain 3,1 had none).
+      # Needs the detector running (explorer.sh --reporter). Switch at runtime:
+      #   ros2 param set /mission_manager tiles.prop_votes false
+      prop_votes: true
+      prop_min_frames: 5                     # sightings on the tile ...
+      prop_min_score: 2.8                    # ... and their summed confidence (was 8 / 4.0, then 5 / 2.5)
+                                             # (scripts/propvote_replay.py, 26 Nov: the cleaning trolley, seen as 'medical_kit',
+                                             # got 5 / 2.5 in debug_the_scene_not_detecting (missed at 2.8) and 5 / 2.8 in
+                                             # blockedscenetest3 (right at the limit); the robot walked into the room both times.
+                                             # 2.8 keeps terrain 3,1 of an earlier fullrun (5 / 2.7) out: a prop scene cannot be
+                                             # reopened by the AI)
+      # detector labels that count as scene props. The label itself does not matter (the model mixes them up: the market
+      # stall reads as medical_kit, the toy kitchen as food); a sighting only says "a prop is on this tile".
+      # medical_kit included: it fires mostly on scene props (and once on a black post with a red base: fullrun 26 Nov)
+      prop_labels: [tool_bench, hand_tools, kitchen, utensils, market_stall, cart, food, cleaning_cart, medical_kit]
 
     # ---------------------------------------------------------------- mission manager
     mission:
@@ -69,6 +94,11 @@ mission_manager:
       costmap_hold_s: 20.0                   # ... for this long
       cooldown_s: 5.0                        # grace period after entering a watched mode
       costmap_mode: mppi                     # stuck in the costmap obstacle zone -> this mode moves the robot out with x / y velocity ('' = recovery)
+      per_mode:                              # overrides of costmap_hold_s / cooldown_s while that mode runs
+        backtracking:
+          # blockedscenetest3_26_11_092119: in the costmap for the whole backtrack, but every attempt (5 s cooldown,
+          # 15 s align timeout, 5 s no_motion) ended in a failing recovery before the 20 s hold: the mppi nudge never ran
+          costmap_hold_s: 4.0
 
     # ---------------------------------------------------------------- end condition
     # combine: any = finish when one condition is met; all = when every one is.
@@ -195,11 +225,11 @@ mission_manager:
         turn_deg: 80.0
         opening_setpoints_deg: [0, 80, -80]   # opening spin: yaw setpoints relative to the starting heading (flat gait), swept through the front only, then back to 0
         opening_retries: 2                  # the opening scan must finish: retry the sweep (alternating sides) this often
-        opening_min_turn_deg: 80            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
+        opening_min_turn_deg: 45            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
         return_tolerance_deg: 3.0            # after the opening sweep, turn back to the starting heading (within this)
         time_allowance_s: 7.0
         use_crawl: false                     # true: crawl gait while turning; false: scan turns (after the opening spin) keep the current gait
-        settle_s: 1.0
+        settle_s: 2.0
         check_room: true                     # skip the turn where the body would hit the local costmap
         map_wait_s: 5.0
         next_mode: exploring
@@ -268,16 +298,21 @@ mission_manager:
         center_tol_m: 0.10                   # then drive (vx / vy, heading held) to within this of the current tile's centre ...
         center_timeout_s: 15.0               # (not there by then: face it from where it is) ...
         commit_deg: 150.0                    # ... and only then turn to face the scene tile; target further round than this: keep the turn's direction
-        align_tol_deg: 2.0
+        face: back_wall                      # back_wall: square up to the scene tile's back wall (lidar map) so the 3 views spread
+                                             # evenly over it; no straight wall found (or face: centre): face the tile's centre
+        back_wall_max_deg: 20.0              # back wall turned at most this far from the tile grid ...
+        back_wall_beyond_m: 0.4              # ... in the scene tile's far half or up to this past its far edge ...
+        back_wall_min_coverage: 0.8          # ... and continuous over at least this share of the tile's middle 0.8 m
+        align_tol_deg: 0.5
         align_timeout_s: 15.0
-        min_turn_rad_s: 0.2
-        max_turn_rad_s: 0.6
-        turn_gain: 1.0
+        min_turn_rad_s: 0.02
+        max_turn_rad_s: 0.3
+        turn_gain: 0.5
         settle_s: 1.0                        # stand still facing it before the AI looks
         quickscan: true                      # take 3 pictures (body yaws left, centre, right: scenescan animation) instead of one
         animation: scenescan                 # animations.py, played by animation_player (its scenescan.* parameters)
         start_timeout_s: 3.0                 # animation_player did not start it: one picture from where it stands
-        timeout_s: 30.0                      # cancel the animation after this long
+        timeout_s: 8.0                      # cancel the animation after this long
         llm_attempts: 2                      # AI tries; after the last the tile is marked explored anyway (not in the background: one try)
         background: true                     # once the pictures are taken, go on exploring; the AI's answer is recorded when it comes
       mppi:
@@ -427,7 +462,9 @@ mission_manager:
         traversal: recovery_mppi             # Nav2 with the holonomic RecoveryMPPI controller (strafes with vx / vy)
         fallback_traversal: omni             # that failed: straight linear x / y velocity to the same tile centre ('' = none)
         keep_gait: true                      # keep the gait the robot already has (gait_switcher /gait_freeze): no switch for
-                                             # the recovery targets, a new terrain or a step up until recovery ends
+                                             # the recovery targets or a new terrain until recovery ends
+        step_up_gait: true                   # ... but a recovery target higher than the robot's tile still switches to the
+                                             # h-step gait (the top-level step_up_gait rule; false = frozen for step ups too)
         candidates: 3                        # nearest centres tried in turn
         min_distance_m: 0.25                 # skip the centre the robot is already on
         adjacent_only: true                  # prefer the robot's own tile / tiles sharing a side with it; none explored -> nearest explored tile anywhere

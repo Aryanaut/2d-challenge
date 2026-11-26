@@ -16,6 +16,14 @@ or other items. The SCENE TILE CONTEXT, LIDAR lines at the end of this message
 give the tile name and the lidar distances. Decide, based on the image, which
 kind of scene the tile ahead is.
 
+ONLY THE TILE DIRECTLY AHEAD COUNTS: the floor from about 0.5 m to 1.5 m in
+front of the camera, up to the first wall panel. The maze has several scenes
+next to each other, so props of ANOTHER scene are often visible further away,
+behind or over a wall panel, or through a gap. Those belong to a different
+tile: do not name them. If the matching props stand behind a wall panel, or
+clearly further than about 1.5 m away while the tile ahead is empty floor or
+holds something else, answer for the tile ahead only (often "traversable").
+
 The scene types are exactly these eight:
 - clothes_shop: clothes, garments, hangers, clothing racks, mannequins
 - fitness_centre: gym equipment, weights, dumbbells, mats, exercise machines
@@ -34,6 +42,8 @@ answer "traversable". This is the right answer when, for example:
 - you see only an empty floor, terrain sections (blocks, ramps, beams, stairs)
   or the open lab room;
 - the view is too dark, empty or blocked to recognise any of the eight scenes.
+- the matching props are behind a wall panel or further away than the tile
+  ahead: they are on another tile.
 Do not guess a scene type from a single weak cue: with no clear visible objects
 that belong to one of the eight types, answer "traversable".
 

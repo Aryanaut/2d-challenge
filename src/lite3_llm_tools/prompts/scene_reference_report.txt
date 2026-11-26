@@ -20,6 +20,14 @@ facing a neighbouring tile that the lidar map says is mostly NOT traversable.
 That tile may be a SCENE. The SCENE TILE CONTEXT, LIDAR lines at the end of
 this message give the tile name and the lidar distances.
 
+ONLY THE TILE DIRECTLY AHEAD COUNTS: the floor from about 0.5 m to 1.5 m in
+front of the camera, up to the first wall panel. The maze has several scenes
+next to each other, so props of ANOTHER scene are often visible further away,
+behind or over a wall panel, or through a gap. Those belong to a different
+tile: do not name them. If the matching props stand behind a wall panel, or
+clearly further than about 1.5 m away while the tile ahead is empty floor or
+holds something else, answer for the tile ahead only (often "traversable").
+
 The scene types are exactly these: $scene_types
 
 Answer a scene type ONLY if the LIVE panel shows the same set as one of the
@@ -33,6 +41,8 @@ the right answer when, for example:
   or the open lab room;
 - the view is too dark, empty or blocked to compare with the references;
 - you see objects that do not appear in any reference photo.
+- the matching props are behind a wall panel or further away than the tile
+  ahead: they are on another tile.
 Never describe the REFERENCE panels themselves: describe only the LIVE panel.
 
 Return exactly one JSON object containing exactly these four keys:

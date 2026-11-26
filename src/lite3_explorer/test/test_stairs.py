@@ -817,6 +817,19 @@ def test_the_initial_tile_is_closed_once_the_robot_leaves_it():
     assert tiles.known_route(tiles.current, start) is None
 
 
+def test_the_initial_tile_stays_open_until_the_robot_has_cleared_it():
+    tiles = _room((0.5, 1.5), 0.0, (2.5, 1.5), (1.0, 0.0))
+    start = tuple(tiles.start_tile)
+    tiles.relocate(start, [1.2, 1.5, 0.0])                                    # in the next tile, body still over the edge
+    assert tiles.current != start
+    tiles.update(force=True)
+    assert not tiles.is_closed(start) and tiles.tiles[start]['status'] != 'closed'
+    assert tiles.grid.edge(start, 'E') not in tiles.virtual_walls(start_wall=False)   # the edge the robot stands on
+    tiles.track([1.0 + tiles.initial_clear_m + 0.01, 1.5, 0.0])               # now clear of it
+    tiles.update(force=True)
+    assert tiles.is_closed(start) and tiles.tiles[start]['status'] == 'closed'
+
+
 def test_nothing_is_closed_before_a_staircase_is_found():
     tiles = _room((0.5, 1.5), 0.0, (2.5, 1.5), (1.0, 0.0))
     tiles.stairs = {}

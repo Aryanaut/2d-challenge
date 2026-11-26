@@ -97,6 +97,7 @@ Visualization Manager:
   Tools:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/SetInitialPose
+      Topic: {Value: /initialpose}
     - Class: rviz_default_plugins/SetGoal
   Value: true
   Views:

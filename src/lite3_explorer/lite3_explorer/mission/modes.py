@@ -467,6 +467,7 @@ class ExploringMode(Mode):
         edge = self._curtain_on_edge(pose) if self.index == 0 else None
         if self.index == 0:
             self._note_discovered_splits()
+            self._note_late_curtains()
             # scenes first: the scene mode keeps the robot on this tile, but a stairs crossing is one way (the staircase
             # is walled off behind it), so a scene beside this tile could never be looked at afterwards.
             # Both before the end condition: the lidar cannot see past a staircase's riser, so the tiles behind it are
@@ -760,6 +761,43 @@ class ExploringMode(Mode):
             self.ctx.log('info', f'Tile {s["tile"]} is a split again: new tile(s) {", ".join(s["new"])} beside it '
                                  f'({len(s["options"])} to travel to: {", ".join(s["options"])}).')
             self.ctx.event('split', tile=s['tile'], options=s['options'], discovered=s['new'])
+
+    def _note_late_curtains(self):
+        """curtains: true. A curtain confirmed only after the robot left its tile (the camera saw it while driving on: sim
+        bag run_20261126_133942, curtain on the N edge of 3,-2 confirmed on the way to 4,-2) is on an edge of a visited
+        tile, not the current one, so _curtain_on_edge never sees it and the robot idled with the tile behind it
+        unexplored. Such a curtain is left for later from that tile (tiles.defer_curtain) and the tile becomes a split
+        with the tile behind as an option: backtracking comes back and walks through it once nothing else is left."""
+        tiles = self.ctx.tiles
+        if (not self.cfg.get('curtains', False) or not self.cfg.get('backtracking', False)
+                or not hasattr(self.ctx, 'curtain_points') or tiles.grid is None or not tiles.ready):
+            return
+        pts = self.ctx.curtain_points()
+        if pts is None or len(pts) == 0:
+            return
+        pts = np.asarray(pts, float)
+        pts = pts[tiles.not_curtain_mask(pts)]
+        if len(pts) == 0:
+            return
+        here = tuple(tiles.current) if tiles.current is not None else None
+        for tile in dict.fromkeys(reversed([tuple(t) for t in tiles.trail])):     # most recently visited first
+            if tile == here or tiles.is_closed(tile):
+                continue
+            edge = self._edge_curtain(tile, pts)
+            if edge is None:
+                continue
+            behind = tuple(edge['neighbour'])
+            if behind in tiles.deferred_curtains or tiles.is_closed(behind):
+                continue
+            label = T.tile_label(behind)
+            old = next((s for s in tiles.splits if s['tile'] == tile), None)
+            tiles.defer_curtain(tile, behind, edge['side'])
+            options = sorted(set(tiles.split_remaining(old, include_unreachable=True) if old else []) | {label})
+            tiles.mark_split(tile, options)
+            self.ctx.log('info', f'Curtain along the {edge["side"]} edge of tile {T.tile_label(tile)} (tile {label} '
+                                 f'behind it), seen after leaving that tile: backtracking walks through it later.')
+            self.ctx.event('curtain_deferred', tile=T.tile_label(tile), side=edge['side'], neighbour=label, late=True)
+            self.ctx.event('split', tile=T.tile_label(tile), options=options)
 
     def _backtrack(self, why):
         """No exploration target left but tiles are still unexplored -> backtracking mode, back to the last split tile
@@ -1080,7 +1118,12 @@ class ExploringMode(Mode):
         pts = pts[tiles.not_curtain_mask(pts)]         # no spots on a rejected edge nor on the initial tile's edges
         if len(pts) == 0:
             return None
-        edge = CC.edge_curtain(tiles.grid, tuple(tiles.current), pts, visited=tiles.trail,
+        return self._edge_curtain(tuple(tiles.current), pts)
+
+    def _edge_curtain(self, tile, pts):
+        """CC.edge_curtain for `tile` with this mode's thresholds (curtain points already masked)."""
+        tiles = self.ctx.tiles
+        edge = CC.edge_curtain(tiles.grid, tuple(tile), pts, visited=tiles.trail,
                                skip=self.machine.curtains_tried,
                                tol_m=float(self.cfg.get('curtain_edge_tol_m', 0.30)),
                                min_span_m=float(self.cfg.get('curtain_min_span_m', 0.40)),
@@ -1296,6 +1339,9 @@ class _ViewsCall:
         votes = [(good[v]['scene_type'], self._confidence(good[v])) for v in views if good[v].get('scene_type')]
         if votes:
             out['scene_type'] = self.vote(votes)
+            # agreement x confidence of the winning answer: two tiles named the same scene -> the reporter keeps the higher
+            win = [c for t, c in votes if t == out['scene_type']]
+            out['scene_confidence'] = round(sum(win) / len(votes), 3)
             out['scene_votes'] = {v: good[v]['scene_type'] for v in views if good[v].get('scene_type')}
         return out
 
@@ -1329,7 +1375,9 @@ class SceneMode(Mode):
 
     Phases: rest (stand still: a spin just before, e.g. the scan, is still coasting) -> center (drive with vx / vy, the
     heading held, to the centre of the tile the robot stands on, within center_tol_m; not there after center_timeout_s:
-    go on from where it is) -> align (only now: turn in place to face the scene tile's centre by the shorter way, and
+    go on from where it is) -> align (only now: turn in place to face the scene tile by the shorter way: face: back_wall
+    squares up to the straight wall behind the scene tile in the lidar map, so the left / centre / right views spread
+    evenly over it; no such wall, or face: centre, faces the scene tile's centre. Either way the shorter way, and
     keep that direction while it is almost behind the robot: right at 180 deg the shorter way flips with every bit of
     coasting) -> settle (stand still) -> describe (the AI is asked
     what is on the tile; retried llm_attempts times) -> next_mode (exploring), with the scene tile marked explored
@@ -1352,6 +1400,7 @@ class SceneMode(Mode):
 
     def enter(self, reason, tile=None, **kw):
         self.label, self.call, self.attempt, self.turn_dir = tile, None, 0, 0
+        self.looking_sent = False                          # told the reporter we face the scene tile (settle .. leaving)
         self.views = {}
         self.ctx.set_target(None, None, None)
         pose, tiles = self.ctx.pose(), self.ctx.tiles
@@ -1379,9 +1428,30 @@ class SceneMode(Mode):
         cx, cy = self.ctx.tiles.grid.center(self.tile)
         return math.atan2(cy - xy[1], cx - xy[0])
 
+    def _back_wall(self):
+        """face: back_wall. The scene tile's back wall in the lidar map (T.back_wall_heading) -> its dict, or None (no
+        map / no straight wall behind the scene)."""
+        c, tiles = self.cfg, self.ctx.tiles
+        if str(c.get('face', 'back_wall')) != 'back_wall' or tiles.map is None or tiles.grid is None:
+            return None
+        here = tiles.current if tiles.current is not None else tiles.grid.tile_of(*self.centre)
+        grid, info = tiles.map
+        return T.back_wall_heading(grid, info, tiles.grid, tuple(here), tuple(self.tile),
+                                   max_deg=float(c.get('back_wall_max_deg', 20.0)),
+                                   beyond_m=float(c.get('back_wall_beyond_m', 0.4)),
+                                   min_coverage=float(c.get('back_wall_min_coverage', 0.8)))
+
     def _start_align(self, pose):
         self.ctx.stop()
         self.yaw = self._facing(self.centre)               # yaw setpoint: along the line from this tile's centre to the scene tile's
+        wall = self._back_wall()
+        if wall is not None:                               # square to the scene's back wall: the views spread evenly over it
+            self.yaw = wall['yaw']
+            self.ctx.log('info', f'Scene tile {self.label}: facing its back wall ({wall["offset_deg"]:+.1f} deg off the '
+                                 f'grid, {wall["distance_m"]:.2f} m past its centre, {wall["coverage"]:.0%} covered).')
+            self.ctx.event('scene_back_wall', tile=self.label, **wall)
+        elif str(self.cfg.get('face', 'back_wall')) == 'back_wall':
+            self.ctx.log('info', f'Scene tile {self.label}: no straight back wall; facing its centre.')
         self.turn_dir = 0
         self.set_phase('align')
 
@@ -1463,6 +1533,10 @@ class SceneMode(Mode):
                                                               float(c.get('turn_gain', 1.0)) * abs(err)))
             self.ctx.drive(0.0, math.copysign(w, err))
         elif self.phase == 'settle':
+            if not self.looking_sent:
+                # facing the scene tile from here on: what perception reports now is on THAT tile (its room / position)
+                self.looking_sent = True
+                getattr(self.ctx, 'scene_looking', lambda _l: None)(self.label)
             self.ctx.stop()
             if self.in_phase_s() >= float(c.get('settle_s', 1.0)):
                 self.pose0 = pose
@@ -1512,6 +1586,9 @@ class SceneMode(Mode):
     def exit(self, next_mode, reason):
         if self.phase == 'quickscan' and self.ctx.animation_state() != 'done':
             self.ctx.animation_cancel()                    # leave pose mode if another mode takes over mid-animation
+        if getattr(self, 'looking_sent', False):
+            self.looking_sent = False
+            getattr(self.ctx, 'scene_looking', lambda _l: None)(None)
         self.ctx.stop()
 
 
@@ -2758,6 +2835,8 @@ class BacktrackingMode(Mode):
     def _drive_hop(self):
         hop = self.hops.pop(0)
         x, y, yaw = hop[-1]
+        if hasattr(self.ctx, 'set_step_tile'):     # step up (h-step gait) per hop: this hop's tile, not only the target
+            self.ctx.set_step_tile(T.tile_label(self.ctx.tiles.grid.tile_of(x, y)))
         if not self.traversal.start([x, y], yaw, hop):
             return self._abort(f'could not start driving to tile {self.target["tile"]}')
         self.set_phase(self.drive_phase)

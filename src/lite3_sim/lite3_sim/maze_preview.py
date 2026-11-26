@@ -12,10 +12,15 @@ import argparse
 import math
 import sys
 
-from lite3_sim.maze import CURTAIN, SLIT, STAIRS, WALL, MazeError, load_maze
+from lite3_sim.maze import CURTAIN, SCENE_TYPES, SLIT, STAIRS, WALL, MazeError, load_maze
 
 H = {WALL: '---', CURTAIN: '~~~', SLIT: '===', None: '   '}
 V = {WALL: '|', CURTAIN: '~', SLIT: '!', None: ' '}
+
+
+def _scene_digit(maze, tile) -> str:
+    name = maze.scene_types.get(tile)
+    return str(SCENE_TYPES.index(name) + 1) if name else '0'
 
 
 def render(maze) -> str:
@@ -27,7 +32,7 @@ def render(maze) -> str:
         top = '    +' + ''.join(H[maze.edge((i, j), 'N')] + '+' for i in range(maze.cols))
         row = f'{j:3d} ' + V[maze.edge((0, j), 'W')]
         for i in range(maze.cols):
-            cell = ('#' if (i, j) in maze.solid else '0' if (i, j) in maze.scenes else 'M' if (i, j) in maze.stairs
+            cell = ('#' if (i, j) in maze.solid else _scene_digit(maze, (i, j)) if (i, j) in maze.scenes else 'M' if (i, j) in maze.stairs
                     else arrow if (i, j) == start
                     else maze.labels.get((i, j), ''))
             row += f'{cell:^3s}' + V[maze.edge((i, j), 'E')]
@@ -52,7 +57,7 @@ def save_png(maze, path):
     for t in maze.scenes:
         ax.add_patch(plt.Rectangle((t[0] * maze.tile_size + 0.15, t[1] * maze.tile_size + 0.15),
                                    maze.tile_size - 0.3, maze.tile_size - 0.3, color='orange', alpha=0.5))
-        ax.text(*maze.tile_centre(t), 'scene', ha='center', va='center', fontsize=8)
+        ax.text(*maze.tile_centre(t), maze.scene_types.get(t, 'scene'), ha='center', va='center', fontsize=7)
     for t, sides in maze.stairs.items():
         ax.add_patch(plt.Rectangle((t[0] * maze.tile_size, t[1] * maze.tile_size), maze.tile_size, maze.tile_size,
                                    color='gold', alpha=0.35))

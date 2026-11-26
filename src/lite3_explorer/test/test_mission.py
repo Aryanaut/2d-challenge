@@ -836,6 +836,25 @@ def test_clutter_against_the_edge_of_a_scene_tile_is_no_wall():
     assert not ctx.tiles.wall_between((1, 0), (2, 0))
 
 
+def test_scene_clutter_filling_the_wall_band_on_every_side_still_leaves_its_open_side():
+    """Sim bag backtracking_20261126_131935: clutter speckled over the scene tile a little in from its edges reads as
+    wall within wall_band_m on all four sides, so the robot stood beside the scene, called it 'without a viewpoint',
+    never looked at it and retried it forever. The open side has no straight wall line: it is looked at from there."""
+    grid, info = corridor(3.0)
+    rng = np.random.default_rng(0)
+    r0, c0 = info.world_to_cell(2.10, 0.10)
+    r1, c1 = info.world_to_cell(2.90, 0.90)
+    grid[r0:r1, c0:c1] = np.where(rng.random((r1 - r0, c1 - c0)) < 0.6, 100, 0)
+    ctx, m = make(world=(grid, info))
+    ctx.nav_up = False
+    run(ctx, m, steps=30, until_complete=False)
+    tiles = ctx.tiles
+    assert tiles.is_scene((2, 0))
+    assert not tiles._open_between((1, 0), (2, 0))                            # the old test: a wall on the open side
+    assert not tiles.wall_between((1, 0), (2, 0))
+    assert tiles.scene_neighbours((1, 0)) == [(2, 0)] and tiles.scene_viewpoints((2, 0)) == [(1, 0)]
+
+
 # ------------------------------------------------------------------------------------------------ backtracking
 def tee_world():
     """Corridor tiles 0,0 .. 2,0 with a branch going north from tile 1,0 (tiles 1,1 and 1,2): tile 1,0 is a split."""
@@ -1114,6 +1133,59 @@ def test_scene_mode_reaches_the_tile_centre_before_turning_to_the_scene():
     assert turning and all(vx == 0 and vy == 0 for vx, vy, _ in turning)      # ... then only turned in place
     looked = ctx.asked[0][1]
     assert abs(math.atan2(math.sin(looked[2]), math.cos(looked[2]))) <= math.radians(6) + 1e-6   # facing east, at it
+
+
+def tilted_back_wall_world(deg):
+    """scene_world, but the end wall behind scene tile 2,0 is turned by deg about (3.0, 0.5)."""
+    grid, info = scene_world()
+    r0, c0 = info.world_to_cell(3.0, -0.2)
+    r1, c1 = info.world_to_cell(3.6, 1.2)
+    grid[r0:r1, c0:c1] = 0                                   # the straight end wall gone (free floor behind it)
+    a = math.radians(deg)
+    for r in range(grid.shape[0]):                           # nothing behind the turned wall (the block stays in front)
+        for c in range(grid.shape[1]):
+            x, y = info.origin_x + (c + 0.5) * RES, info.origin_y + (r + 0.5) * RES
+            if x > 2.5 and (x - 3.0) * math.cos(a) + (y - 0.5) * math.sin(a) > 0.0 and grid[r, c] >= 65:
+                grid[r, c] = 0
+    for t in np.arange(-0.55, 0.55, RES / 2):
+        x, y = 3.0 + t * -math.sin(a), 0.5 + t * math.cos(a)
+        r, c = info.world_to_cell(x, y)
+        grid[r, c] = 100
+    return grid, info
+
+
+def test_back_wall_heading_squares_up_to_a_turned_wall():
+    tg = T.TileGrid(0.0, 0.0, 0.0)
+    for deg in (0.0, 8.0, -12.0):
+        grid, info = tilted_back_wall_world(deg)
+        wall = T.back_wall_heading(grid, info, tg, (1, 0), (2, 0))
+        assert wall is not None and abs(math.degrees(wall['yaw']) - deg) <= 1.5, (deg, wall)
+        assert abs(wall['distance_m'] - 0.5) <= 0.06
+
+
+def test_back_wall_heading_none_without_a_wall_behind_the_scene():
+    grid, info = tilted_back_wall_world(0.0)
+    r0, c0 = info.world_to_cell(2.9, -0.2)
+    r1, c1 = info.world_to_cell(3.6, 1.2)
+    grid[r0:r1, c0:c1] = 0                                   # open behind the scene tile
+    tg = T.TileGrid(0.0, 0.0, 0.0)
+    assert T.back_wall_heading(grid, info, tg, (1, 0), (2, 0)) is None
+    assert T.back_wall_heading(grid, info, tg, (0, 0), (2, 0)) is None     # not a neighbour
+
+
+def test_scene_mode_faces_the_back_wall_not_the_tile_centre():
+    ctx, m = make(world=tilted_back_wall_world(10.0))
+    run(ctx, m, 300)
+    assert ctx.asked and ctx.asked[0][0] == '2,0'
+    assert any(k == 'scene_back_wall' for k, _ in ctx.events)
+    looked = ctx.asked[0][1][2]
+    assert abs(math.degrees(math.atan2(math.sin(looked), math.cos(looked))) - 10.0) <= 6.0 + 1.5
+
+
+def test_scene_mode_faces_the_tile_centre_when_asked():
+    ctx, m = make({'modes.scene.face': 'centre'}, world=tilted_back_wall_world(10.0))
+    run(ctx, m, 300)
+    assert ctx.asked and not any(k == 'scene_back_wall' for k, _ in ctx.events)
 
 
 def test_scene_found_while_driving_recovers_to_the_previous_tile_then_looks_at_it():
@@ -1574,3 +1646,13 @@ def test_ending_tile_needs_the_ending_mode():
                                                                  'complete']}))
     with pytest.raises(ValueError, match='ending'):
         ModeMachine(FakeCtx(cfg), cfg)
+
+
+def test_stuck_per_mode_costmap_hold():
+    from lite3_explorer.mission.stuck import StuckDetector
+    d = StuckDetector(['costmap'], costmap_hold_s=20.0)
+    assert d.update(0.0, None, False, 99) is None
+    assert d.update(5.0, None, False, 99) is None                       # default patience: 20 s
+    assert d.update(5.0, None, False, 99, costmap_hold_s=4.0) and d.trigger == 'costmap'   # backtracking: 4 s
+    ctx, m = make({'stuck.per_mode.backtracking.costmap_hold_s': 4.0})
+    assert m.stuck_per_mode == {'backtracking': {'costmap_hold_s': 4.0}}

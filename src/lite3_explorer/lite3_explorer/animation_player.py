@@ -25,7 +25,8 @@ class AnimationPlayer(Node):
             'quickscan': dict(pause_s=p('quickscan.pause_s', 0.5), move_s=p('quickscan.move_s', 1.0),
                               lean=p('quickscan.lean', 0), yaw=p('quickscan.yaw', 20000)),
             'scenescan': dict(pause_s=p('scenescan.pause_s', 1.0), move_s=p('scenescan.move_s', 1.0),
-                              yaw=p('scenescan.yaw', 20000)),
+                              yaw=p('scenescan.yaw', 20000),
+                              side_pause_s=p('scenescan.side_pause_s', 0.4)),   # hold at left / right
         }
         self.common = dict(mode_settle_s=p('mode_settle_s', 1.0), mode_repeats=p('mode_repeats', 3))
         # Match the domain bridge subscriber (RELIABLE + TRANSIENT_LOCAL), as gait_switcher does.

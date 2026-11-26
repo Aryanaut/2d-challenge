@@ -112,6 +112,7 @@ class ModeMachine:
         st = cfg['stuck']
         self.stuck_watch = set(n for n in st.get('watch_modes', []) if n)
         self.stuck_cooldown_s = float(st.get('cooldown_s', 5.0))
+        self.stuck_per_mode = {n: dict(v) for n, v in (st.get('per_mode') or {}).items() if isinstance(v, dict)}
         self.stuck = StuckDetector(st['triggers'], st['window_s'], st['min_motion_m'], int(st['costmap_cost']),
                                    st['costmap_hold_s']) if st.get('enabled', True) and st.get('triggers') else None
         needed = {self.initial_mode, self.start_mode, self.complete_mode}
@@ -220,8 +221,11 @@ class ModeMachine:
             if reason:
                 return self._finish(reason)
         if self.stuck is not None and mode.name in self.stuck_watch:
-            if now - mode.entered_at >= self.stuck_cooldown_s:
-                why = self.stuck.update(now, self.ctx.pose(), mode.is_driving, self.ctx.costmap_cost_at_robot())
+            own = self.stuck_per_mode.get(mode.name, {})
+            if now - mode.entered_at >= float(own.get('cooldown_s', self.stuck_cooldown_s)):
+                hold = own.get('costmap_hold_s')
+                why = self.stuck.update(now, self.ctx.pose(), mode.is_driving, self.ctx.costmap_cost_at_robot(),
+                                        costmap_hold_s=None if hold is None else float(hold))
                 if why:
                     return self._on_stuck(mode, why)
         t = mode.tick()

@@ -32,14 +32,16 @@ class StuckDetector:
         self.trigger = None             # which trigger fired last: 'costmap' | 'no_motion'
 
     def update(self, now: float, pose: Optional[Sequence[float]], driving: bool,
-               cost: Optional[int] = None) -> Optional[str]:
-        """Feed one sample; returns a reason string when stuck, else None."""
+               cost: Optional[int] = None, costmap_hold_s: Optional[float] = None) -> Optional[str]:
+        """Feed one sample; returns a reason string when stuck, else None. costmap_hold_s overrides the configured hold
+        for this sample (per-mode patience, e.g. shorter while backtracking)."""
         reason = None
+        hold = self.costmap_hold_s if costmap_hold_s is None else costmap_hold_s
         if 'costmap' in self.triggers:
             if cost is not None and cost >= self.costmap_cost:
                 if self.in_cost_since is None:
                     self.in_cost_since = now
-                elif now - self.in_cost_since >= self.costmap_hold_s:
+                elif now - self.in_cost_since >= hold:
                     reason = f'in the global costmap obstacle zone (cost {cost}) for {now - self.in_cost_since:.0f} s'
                     self.trigger = 'costmap'
             else:

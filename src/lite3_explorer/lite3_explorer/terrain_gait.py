@@ -14,10 +14,12 @@ Rules:
     ended and the terrain gait must come back) or when the terrain label changes (a new terrain was classified).
     Between those events the gait is left alone, whatever the label says.
   * OVERRIDE (set_override): a gait that wins over the terrain, e.g. rug_hstep while the robot drives onto a higher tile.
-    Setting or clearing it arms a switch; cleared, the terrain decides again.
+    Setting or clearing it arms a switch; cleared, the terrain decides again. It also wins over a FREEZE (recovery).
 """
 from dataclasses import dataclass
 from typing import Optional
+
+from lite3_explorer.robot_state import GAIT_STATE_BY_CODE
 
 GAIT_CODES = {
     'flat_slow': 0x21010300,
@@ -74,8 +76,9 @@ class TerrainGaitSwitcher:
 
     def freeze(self, on: bool) -> bool:
         """Keep the gait the robot already has (on) / let the terrain, target and override rules switch again (off).
-        Terrain / override changes while frozen are still recorded, but nothing is armed by them: after the freeze the gait
-        changes only at the next new tile or new terrain, never the moment the freeze ends. True when it changed."""
+        Terrain changes while frozen are still recorded, but nothing is armed by them: after the freeze the gait changes
+        only at the next new tile or new terrain, never the moment the freeze ends. The override (step up onto a higher
+        tile) still switches while frozen; cleared while frozen, the robot keeps the gait it has. True when it changed."""
         if bool(on) == self.frozen:
             return False
         self.frozen, self.armed = bool(on), False
@@ -113,7 +116,7 @@ class TerrainGaitSwitcher:
 
     def pending_command(self, now: float) -> Optional[GaitCommand]:
         """The command to send now, or None. Call mark_sent() after publishing it."""
-        if self.frozen:
+        if self.frozen and self.override is None:
             self.armed = False                   # whatever armed it meanwhile is dropped (see freeze)
             return None
         if not self.armed:
@@ -132,3 +135,111 @@ class TerrainGaitSwitcher:
 
     def mark_sent(self, command: GaitCommand, now: float):
         self.gait, self.last_sent_at, self.armed = command.gait, now, False
+
+
+class GaitConfirm:
+    """Re-send a gait until /robot_state reports it (no ROS).
+
+    A gait command can be lost or refused; the burst of command_repeats only covers the first ~0.6 s. While a gait must
+    be confirmed (the step-up gait while /step_up is on), update() says when to send it again: every retry_s after the
+    last publish, until the robot's robot_gait_state matches (robot_state.GAIT_STATE_BY_CODE). Once it matched, nothing
+    more is sent for that gait (a state glitch on the step edge must not re-command the robot); a new gait to confirm, or
+    None in between, starts afresh. steptest_26_11_133619: rug_hstep was accepted ~2.3 s after the first publish.
+    """
+
+    def __init__(self, retry_s: float = 1.5):
+        self.retry_s = float(retry_s)
+        self.gait: Optional[str] = None
+        self.confirmed = False
+        self.retries = 0
+        self.event: Optional[str] = None         # set on the tick something changes (for logging), else None
+
+    def update(self, now: float, gait: Optional[str], robot_gait: Optional[int], last_publish_at: Optional[float]) -> bool:
+        """gait: the gait that must be confirmed now (None = nothing). robot_gait: robot_gait_state while standing /
+        stepping, None = unknown / stale. last_publish_at: time of the last /simple_cmd publish of any gait.
+        True = send `gait` again now."""
+        self.event = None
+        if gait != self.gait:
+            self.gait, self.confirmed, self.retries = gait, False, 0
+        if gait is None or self.confirmed or self.retry_s <= 0:
+            return False
+        want = GAIT_STATE_BY_CODE.get(GAIT_CODES.get(gait))
+        if want is None:                          # no robot state for this gait (crawl): cannot confirm
+            return False
+        if robot_gait == want:
+            self.confirmed = True
+            self.event = f'robot reports {gait} (gait state {want})' + (f' after {self.retries} re-send(s)'
+                                                                        if self.retries else '')
+            return False
+        if last_publish_at is None or now - last_publish_at >= self.retry_s:
+            self.retries += 1
+            self.event = (f'robot still not in {gait} (gait state {robot_gait}, want {want}): '
+                          f're-sending, attempt {self.retries}')
+            return True
+        return False
+
+
+class SwitchHold:
+    """Gait switches only while the robot stands still (no ROS).
+
+    request(cmd) starts a hold: the robot is sent zero velocity for stop_s first, then the command is sent (update()
+    returns it once), and the hold lasts until the robot reports the new gait (robot_state.GAIT_STATE_BY_CODE), but at
+    least settle_s after the send (the burst of repeats) and, when the gait cannot be confirmed (no /robot_state, crawl),
+    exactly settle_s. The whole hold never lasts more than stop_s + max_wait_s (gait refused / lost: drive on, so stuck
+    detection can still act). A request while a hold runs replaces the command; if the robot is already held past stop_s
+    it is sent at once (the robot is still), and the hold time limit is not extended.
+    """
+
+    def __init__(self, stop_s: float = 0.4, settle_s: float = 1.0, max_wait_s: float = 3.0):
+        self.stop_s = max(0.0, float(stop_s))
+        self.settle_s = max(0.0, float(settle_s))
+        self.max_wait_s = max(self.settle_s, float(max_wait_s))
+        self.cancel()
+
+    def cancel(self):
+        self.started_at: Optional[float] = None   # hold start (None = robot free)
+        self.cmd: Optional[GaitCommand] = None    # waiting for the robot to stop
+        self.sent: Optional[GaitCommand] = None
+        self.sent_at: Optional[float] = None
+        self.event: Optional[str] = None          # set on the tick the hold ends (for logging), else None
+
+    @property
+    def holding(self) -> bool:
+        return self.started_at is not None
+
+    def request(self, cmd: GaitCommand, now: float):
+        if self.started_at is None:
+            self.started_at = now
+        self.cmd = cmd
+
+    def update(self, now: float, robot_gait: Optional[int]) -> Optional[GaitCommand]:
+        """robot_gait: robot_gait_state while standing / stepping, None = unknown / stale. Returns the command to send
+        now (once per request), else None; afterwards `holding` says whether to keep the robot still."""
+        self.event = None
+        if self.started_at is None:
+            return None
+        if self.cmd is not None:
+            if now - self.started_at >= self.stop_s:
+                self.sent, self.sent_at, self.cmd = self.cmd, now, None
+                return self.sent
+            return None
+        want = GAIT_STATE_BY_CODE.get(self.sent.cmd_code)
+        waited = now - self.sent_at
+        if now - self.started_at >= self.stop_s + self.max_wait_s:
+            self.event = (f'robot still not in {self.sent.gait} (gait state {robot_gait}) after '
+                          f'{now - self.started_at:.1f} s: driving on anyway')
+        elif waited < self.settle_s:
+            return None
+        elif want is not None and robot_gait is not None and robot_gait != want:
+            return None
+        else:
+            self.event = (f'{self.sent.gait} ' + ('confirmed' if want is not None and robot_gait == want
+                                                  else 'not confirmable, settle time over')
+                          + f' after {now - self.started_at:.1f} s still: driving on')
+        self.cancel_keep_event()
+        return None
+
+    def cancel_keep_event(self):
+        event = self.event
+        self.cancel()
+        self.event = event

@@ -74,7 +74,8 @@ from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import ComputePathToPose, Spin
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import Imu, LaserScan, PointCloud2
+from rcl_interfaces.msg import SetParametersResult
+from sensor_msgs.msg import CameraInfo, Imu, LaserScan, PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, Empty, Int32MultiArray, String
 from std_srvs.srv import SetBool, Trigger
@@ -83,6 +84,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from lite3_explorer import curtain_core as CC
 from lite3_explorer import map_grid as G
+from lite3_explorer import prop_votes as PV
 from lite3_explorer import roller_core as RC
 from lite3_explorer import tiles as T
 from lite3_explorer import turn_check as TC
@@ -273,6 +275,7 @@ class MissionManager(Node):
                                  scene_max_free=float(tcfg.get('scene_max_free', 0.80)),
                                  scene_margin_m=float(tcfg.get('scene_margin_m', 0.10)))
         self.tiles.align_on_entry = bool(tcfg.get('align_on_entry', True))
+        self.tiles.initial_clear_m = float(tcfg.get('initial_clear_m', 0.40))
         self.tiles.align_max_shift_m = float(tcfg.get('align_max_shift_m', 0.15))
         self.tiles.align_max_rot_deg = float(tcfg.get('align_max_rot_deg', 6.0))
         self.tiles.align_radius_m = float(tcfg.get('align_radius_m', 2.0))
@@ -290,6 +293,10 @@ class MissionManager(Node):
         self.tiles.roller_min_lidar = int(tcfg.get('roller_min_lidar', 2))
         self.tiles.roller_depth_only_points = int(tcfg.get('roller_depth_only_points', 0))
         self.tiles.roller_edge_margin_m = float(tcfg.get('roller_edge_margin_m', 0.15))
+        self.tiles.prop_votes = bool(tcfg.get('prop_votes', False))
+        self.tiles.scene_lidar_min_known = float(tcfg.get('scene_lidar_min_known', 0.0))
+        self.tiles.prop_min_frames = int(tcfg.get('prop_min_frames', 8))
+        self.tiles.prop_min_score = float(tcfg.get('prop_min_score', 4.0))
         self.target = None                     # (label, goal_xy) for the RViz highlight
         self._published_tiles = -1
 
@@ -338,7 +345,9 @@ class MissionManager(Node):
         self.intent_pub = self.create_publisher(String, '~/next_target', latched)
         self.complete_pub = self.create_publisher(Bool, '/exploration_complete', latched)
         self.tile_pub = self.create_publisher(String, '/tile_map', latched)
-        self.scene_type_pub = self.create_publisher(String, '/scene/result', latched) ##added by debbie, publisher of scene type
+        self.scene_type_pub = self.create_publisher(String, '/scene/result', QoSProfile(depth=20, durability=DurabilityPolicy.TRANSIENT_LOCAL)) ##added by debbie, publisher of scene type
+        # {"tile": "i,j", "pos": [x, y]} while scene mode faces that scene tile, {} once it stops (mission reporter)
+        self.scene_looking_pub = self.create_publisher(String, '/scene/looking', latched)
         self.robot_pos_pub = self.create_publisher(String, '/robot/position', 10) ##added by debbie, publisher of robot position
         self.tile_report_pub = self.create_publisher(String, '/tile_report', QoSProfile(
             depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -360,6 +369,9 @@ class MissionManager(Node):
         # recovery mode (modes.recovery.keep_gait): the robot keeps the gait it already has (gait_switcher /gait_freeze)
         self.gait_freeze_pub = self.create_publisher(Bool, '/gait_freeze', latched)
         self._gait_frozen = False
+        self._frozen_step_up = True                    # recovery step_up_gait: the elevation rule still switches while frozen
+        self._step_tile = None                         # tile the robot is driving into now when it is not the target
+                                                       # (backtracking: the next tile of the route, hop by hop)
         self.gait_freeze_pub.publish(Bool(data=False))
         self._hstep_hold = False                                                 # roller mode: h-step gait while crossing
         self.roller_mode_pub = self.create_publisher(Bool, '/roller_mode', latched)
@@ -402,10 +414,23 @@ class MissionManager(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._cmd = None                                  # (vx, wz, expires): republished at 20 Hz until it expires
         self.create_timer(0.05, self._publish_cmd)
+        # gait_switcher: a gait switch is running, the robot must stand still (direct /cmd_vel is zeroed meanwhile)
+        self._gait_switching = False
+        self.create_subscription(Bool, '/gait_switching', self._on_gait_switching, latched)
         # stairs mode (use_stairs): the stair detector's confirmed stair cells, and the robot's AI mode on / off
         self.create_subscription(String, '/stairs/points', self._on_stair_points, latched)
         # roller mode (use_rollers): the roller detector's confirmed roller spots
         self.create_subscription(String, '/roller/points', self._on_roller_points, latched)
+        # scene-prop votes (tiles.prop_votes): the detector's scene props placed on the map keep a tile a scene tile.
+        # Always subscribed (the points are collected even while off), so switching it on mid-run uses what was seen.
+        self._prop_cam = (float(tcfg.get('prop_fx', 462.6)), float(tcfg.get('prop_cx', 320.1)))
+        self._prop_last_pose = None                       # (monotonic t, yaw) of the previous detection message
+        self._prop_logged = set()
+        self.create_subscription(String, tcfg.get('prop_detections_topic', '/perception/detections'), self._on_detections, 10)
+        if tcfg.get('prop_camera_info_topic'):
+            self.create_subscription(CameraInfo, tcfg['prop_camera_info_topic'], self._on_prop_camera_info,
+                                     qos_profile_sensor_data)
+        self.add_on_set_parameters_callback(self._on_set_params)
         self.ai_pub = self.create_publisher(Bool, '/ai_mode', latched)
         self.ai_pub.publish(Bool(data=False))
         # stair detector on / off: always on when an exploring mode climbs staircases (use_stairs), else only while a
@@ -700,6 +725,66 @@ class MissionManager(Node):
         ps.pose.orientation.z, ps.pose.orientation.w = math.sin(0.5 * yaw), math.cos(0.5 * yaw)
         self.odom_rebase_pub.publish(ps)
 
+    def _on_prop_camera_info(self, msg):
+        if msg.k[0] > 0:
+            self._prop_cam = (float(msg.k[0]), float(msg.k[2]))
+
+    def _on_set_params(self, params):
+        """Runtime switches: tiles.prop_votes / prop_min_frames / prop_min_score (ros2 param set /mission_manager ...)."""
+        for p in params:
+            if p.name == 'tiles.prop_votes':
+                self.tiles.prop_votes = bool(p.value)
+                self.log('info', f'Scene-prop votes {"ON" if p.value else "OFF"}.')
+            elif p.name == 'tiles.prop_min_frames':
+                self.tiles.prop_min_frames = int(p.value)
+            elif p.name == 'tiles.prop_min_score':
+                self.tiles.prop_min_score = float(p.value)
+            elif p.name == 'tiles.scene_lidar_min_known':
+                self.tiles.scene_lidar_min_known = float(p.value)
+            else:
+                continue
+            self.tiles.invalidate()
+            self.tiles.update()
+        return SetParametersResult(successful=True)
+
+    def _on_detections(self, msg):
+        """/perception/detections: place the scene props on the map (prop_votes.place) and count them per tile."""
+        if not self.tiles.ready or self.tiles.map is None:
+            return
+        try:
+            dets = json.loads(msg.data).get('detections') or []
+        except (ValueError, AttributeError):
+            return
+        tcfg = self.cfg['tiles']
+        labels = [l for l in tcfg.get('prop_labels', PV.DEFAULT_PROPS) if l]
+        if not any(d.get('label') in labels for d in dets):
+            return
+        pose = self.pose()
+        if pose is None:
+            return
+        now = time.monotonic()
+        last, self._prop_last_pose = self._prop_last_pose, (now, pose[2])
+        if last is not None and now - last[0] < 2.0:      # turning fast: the frame was taken at another heading
+            rate = abs(math.degrees(math.atan2(math.sin(pose[2] - last[1]), math.cos(pose[2] - last[1])))) / max(now - last[0], 1e-3)
+            if rate > float(tcfg.get('prop_max_turn_dps', 30.0)):
+                return
+        grid, info = self.tiles.map
+        pts = PV.place(dets, pose, grid, info, fx=self._prop_cam[0], cx=self._prop_cam[1],
+                       cam_x=float(tcfg.get('prop_camera_x_m', 0.252)), props=labels,
+                       min_conf=float(tcfg.get('prop_min_conf', 0.35)), max_range_m=float(tcfg.get('prop_max_range_m', 3.0)))
+        here = tuple(self.tiles.grid.tile_of(pose[0], pose[1]))
+        pts = [p for p in pts if tuple(self.tiles.grid.tile_of(p[0], p[1])) != here]   # the tile the robot stands on is no scene
+        for tile in self.tiles.add_prop_points(pts):
+            label = T.tile_label(tile)
+            if label in self._prop_logged:
+                continue
+            self._prop_logged.add(label)
+            e = self.tiles.prop_counts().get(tile, {})
+            state = 'kept a scene tile' if self.tiles.prop_votes else 'not used (tiles.prop_votes off)'
+            self.log('info', f'Tile {label}: scene props seen ({e.get("frames")} sightings, {e.get("labels")}): {state}.')
+            self.event('prop_scene', tile=label, frames=e.get('frames'), score=e.get('score'), labels=e.get('labels'),
+                       used=bool(self.tiles.prop_votes))
+
     def _on_imu(self, msg):
         q, w = msg.orientation, msg.angular_velocity
         pitch = math.asin(max(-1.0, min(1.0, 2.0 * (q.w * q.y - q.z * q.x))))
@@ -780,6 +865,9 @@ class MissionManager(Node):
             self._cmd = None
             self.cmd_pub.publish(Twist())
 
+    def _on_gait_switching(self, msg):
+        self._gait_switching = bool(msg.data)
+
     def _publish_cmd(self):
         if self._cmd is None:
             return
@@ -788,7 +876,8 @@ class MissionManager(Node):
             self.stop()
             return
         msg = Twist()
-        msg.linear.x, msg.linear.y, msg.angular.z = vx, vy, wz
+        if not self._gait_switching:                     # a gait switch runs: hold still (gait_switcher sends zero too)
+            msg.linear.x, msg.linear.y, msg.angular.z = vx, vy, wz
         self.cmd_pub.publish(msg)
 
     def costmap_snapshot(self):
@@ -831,11 +920,20 @@ class MissionManager(Node):
         if new == self.target:
             return
         self.target = new
+        self._step_tile = None
         self.intent_pub.publish(String(data=f'tile {label} at ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) '
                                              f'[{self.machine.current.name}]' if label else '(none)'))
         self._update_step_up()
         if self.tiles.ready:
             self._publish_tile_markers()
+
+    def set_step_tile(self, label):
+        """The tile the robot is driving into now, for the step-up check (backtracking: the next tile of the route, hop
+        by hop; None = the target tile). Its rise is measured from the tile the robot is on when it changes."""
+        if label == self._step_tile:
+            return
+        self._step_tile = label
+        self._update_step_up()
 
     def _update_step_up(self):
         """/step_up is true while the robot drives to a target tile that is higher than the tile it started from. Both elevations
@@ -843,16 +941,22 @@ class MissionManager(Node):
         with no measurement counts as the start floor, 0 m). The start elevation is taken once, when the target is set, and the
         largest elevation measured for the target is kept, so neither the robot moving over the step edge nor a later low reading
         of the raised tile switches the h-step gait off. It stays on until the target changes (the tile is reached, or given up)."""
-        if self._gait_frozen:
+        if self._gait_frozen and not self._frozen_step_up:
             return                                # recovery keeps the gait: /step_up stays as it was
         on = False
-        if self.cfg.get('step_up_gait', True) and self.target and self.tiles.ready:
-            if self._rise_target != self.target[0]:
-                self._rise_target, self._rise_max = self.target[0], None
+        step_tile = (self._step_tile or self.target[0]) if self.target else None
+        if self.cfg.get('step_up_gait', True) and step_tile and self.tiles.ready:
+            if self._rise_target != step_tile:
+                self._rise_target, self._rise_max = step_tile, None
                 pose = self.pose()
                 here = self.tiles.elevation(T.tile_label(self.tiles.grid.tile_of(pose[0], pose[1]))) if pose is not None else None
+                max_slope = float(self.cfg.get('step_up_from_max_slope_deg', 15.0))
+                if here and max_slope > 0 and float(here.get('slope_deg') or 0.0) > max_slope:
+                    self.log('info', f'Current tile elevation {here["elevation_m"]:+.2f} m at slope {here["slope_deg"]} deg '
+                                     f'is not a floor: step up measured from the start floor.')
+                    here = None
                 self._rise_from = here['elevation_m'] if here else 0.0
-            goal = self.tiles.elevation(self.target[0])
+            goal = self.tiles.elevation(step_tile)
             if goal:
                 rise = goal['elevation_m'] - self._rise_from
                 self._rise_max = rise if self._rise_max is None else max(self._rise_max, rise)
@@ -865,9 +969,9 @@ class MissionManager(Node):
             self._step_up = on
             self.step_up_pub.publish(Bool(data=on))
             self.log('info', 'Crossing a roller / curtain: h-step gait.' if on and not rise else
-                     f'Target tile {self.target[0] if self.target else "-"}: '
+                     f'Target tile {step_tile or "-"}: '
                      + (f'{self._rise_max:+.2f} m above the start tile: h-step gait.' if on else 'no step up: terrain gait.'))
-            self.event('step_up', on=on, tile=self.target[0] if self.target else None)
+            self.event('step_up', on=on, tile=step_tile)
 
     def publish_goal(self, pose_stamped, profile):
         self.goal_pub.publish(pose_stamped)
@@ -890,8 +994,11 @@ class MissionManager(Node):
         freeze = m is not None and m.type_name == 'recovery' and bool(m.cfg.get('keep_gait', True))
         if freeze != self._gait_frozen:
             self._gait_frozen = freeze
+            if freeze:
+                self._frozen_step_up = bool(m.cfg.get('step_up_gait', True))
             self.gait_freeze_pub.publish(Bool(data=freeze))
-            self.log('info', 'Recovery: keeping the current gait.' if freeze else 'Gait follows terrain / targets again.')
+            self.log('info', ('Recovery: keeping the current gait' + (' (step ups still switch to h-step).'
+                              if self._frozen_step_up else '.')) if freeze else 'Gait follows terrain / targets again.')
             if not freeze:
                 self._update_step_up()            # the target may have changed meanwhile
 
@@ -1124,6 +1231,7 @@ class MissionManager(Node):
 
     TERRAIN_DEBUG_COLOURS = {'flat': [0.1, 0.8, 0.2, 0.25]}
     UNEVEN_MARKER = {'style': 'hatch', 'color': [1.0, 0.75, 0.0, 1.0], 'label': 'UNEVEN'}
+    ELEV_FIELDS = ('elevation_m', 'elevation_class', 'slope_deg', 'elevation_spread_m', 'elevation_points')
 
     def _on_terrain_details(self, msg):
         """The classifier's rugged / non_rugged answer for the tile being looked at; used when no kind was named."""
@@ -1154,14 +1262,19 @@ class MissionManager(Node):
         if label is None or result.get('kind') in (None, 'unknown') or self.now() < self._terrain_after:
             return
         self._terrain_seen.add(label)
+        before = self.tiles.elevation(label)
         if result['kind'] == 'flat' and self.tiles.terrain.get(label, {}).get('kind') not in (None, 'flat'):
             kept = self.tiles.terrain[label]['kind']
             self.get_logger().info(f'Tile {label}: the classifier now says flat (spread {result.get("spread_median_m")} m, '
                                    f'rough {result.get("rough_fraction")}), but this look already found it {kept.upper()}: keeping that.')
             self.event('terrain_kept', tile=label, kept=kept, ignored='flat')
-            return
-        before = self.tiles.elevation(label)
-        if self.tiles.set_terrain(label, result):
+            # The kind is kept, but the elevation is still news: steptest_26_11_133619 tile 1,0 was UNEVEN (/terrain_type)
+            # before any elevation came in, every later answer (flat, 0.51 m higher) was dropped here, /step_up stayed
+            # off and the robot hit the step in the flat gait.
+            elev = {k: result[k] for k in self.ELEV_FIELDS if k in result}
+            if elev:
+                self.tiles.set_terrain(label, dict(self.tiles.terrain[label], **elev))
+        elif self.tiles.set_terrain(label, result):
             self.get_logger().info(f'Tile {label}: terrain {result["kind"].upper()} '
                                    f'(spread {result.get("spread_median_m")} m, cells {result.get("n_cells")}).')
             self.event('terrain', tile=label, terrain=result['kind'], info={k: v for k, v in result.items()
@@ -1224,17 +1337,36 @@ class MissionManager(Node):
                                 name=f'scene_{label.replace(",", "_")}_q{self.query_count:04d}' + (f'_{view}' if view else ''), tile=label, pose=pose,
                                 context=context, save_dir=self.scene_images_dir, prompt='describe_scene')
 
+    def scene_looking(self, label):
+        """Scene mode faces scene tile `label` now (None: no longer). The mission reporter gives what perception sees
+        meanwhile that tile's room and position (tile x 1.02) once the AI has named it."""
+        msg = {}
+        if label:
+            i, j = (int(v) for v in label.split(','))
+            msg = {'tile': label, 'pos': [round(i * 1.02, 2), round(j * 1.02, 2)]}
+        self.scene_looking_pub.publish(String(data=json.dumps(msg)))
+
     def record_scene(self, label, pose, call):
         """Write the scene tile's description (or the failure) into the tile report."""
         self.book.reached(label, pose, 'scene tile (looked at, not entered)', {})
+        # every scene tile's answer goes to the mission reporter, traversable / failed ones too (scene_type ""):
+        # it releases what perception saw while facing the tile. pos = the SCENE tile x 1.02 (as /robot/position)
+        i, j = (int(v) for v in label.split(','))
+        scene_msg = {'tile': label, 'scene_type': '', 'pos': [round(i * 1.02, 2), round(j * 1.02, 2)], 'confidence': None}
         if call.ok:
             result = dict(call.result)
             if result.get('scene_type') == 'traversable':
-                self.tiles.mark_traversable(tuple(int(v) for v in label.split(',')))   # no scene: an ordinary tile again
-                self.event('scene_traversable', tile=label)
-            st = result.get('scene_type')
-            if st and st != 'traversable':
-                self.scene_type_pub.publish(String(data=st))
+                tile = tuple(int(v) for v in label.split(','))
+                if self.tiles.is_prop_scene(tile):                 # scene props were seen on it: a bad picture, not a free tile
+                    e = self.tiles.prop_counts().get(tile, {})
+                    self.log('warn', f'Scene tile {label}: the AI said traversable, but scene props were seen on it '
+                                     f'({e.get("frames")} sightings, {e.get("labels")}): it stays a scene tile.')
+                    self.event('scene_traversable_vetoed', tile=label, frames=e.get('frames'), labels=e.get('labels'))
+                else:
+                    self.tiles.mark_traversable(tile)              # no scene: an ordinary tile again
+                    self.event('scene_traversable', tile=label)
+            scene_msg['scene_type'] = result.get('scene_type') or ''
+            scene_msg['confidence'] = result.get('scene_confidence', result.get('confidence'))
             if result.get('image'):
                 result['image'] = os.path.join(self.scene_images_dir, result['image'])   # the report joins run_dir: absolute wins
             if result.get('images'):
@@ -1245,6 +1377,7 @@ class MissionManager(Node):
             self.book.set_no_ai(label, 'AI disabled (use_ai:=false)')
         else:
             self.book.set_error(label, call.failure())
+        self.scene_type_pub.publish(String(data=json.dumps(scene_msg)))
         self._write_book(finished=self.machine.finished_reason is not None)   # a background answer may come after the end
         self._publish_tile_report(label)
 

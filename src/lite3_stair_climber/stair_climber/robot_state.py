@@ -52,7 +52,7 @@ STATE_NAMES = {
     (6, 6, 0): 'standing, RUG grip', (6, 6, 1): 'stepping, RUG grip', (6, 12, 1): 'moonwalk',
     (6, 13, 0): 'standing, RUG H-step', (6, 13, 1): 'stepping, RUG H-step',
     (7, 0, 0): 'sitting', (8, 0, 0): 'lose-control protection', (9, 0, 0): 'posture adjustment',
-    (11, 0, 0): 'flipping over', (16, 0, 1): 'AI basic gait', (16, 16, 1): 'AI jump gait',
+    (11, 0, 0): 'flipping over', (16, 0, 14): 'AI basic gait', (16, 16, 1): 'AI jump gait',
     (16, 18, 1): 'AI stand gait', (16, 20, 1): 'AI fast gait', (17, 0, 0): 'reset to zero',
     (18, 0, 0): 'backflip', (20, 0, 0): 'hello',
 }

@@ -20,6 +20,7 @@ the reply is logged and appended to results.jsonl.
 import json
 import os
 import threading
+import time
 import urllib.request
 
 import rclpy
@@ -30,8 +31,10 @@ from std_msgs.msg import String
 TASK_TYPES = ("object", "hazard", "survivor", "qr")
 
 
-def build_result(group_id, task_id, task_type, scene_type, label, pos, message):
-    """The exact organiser format (key order preserved)."""
+def build_result(group_id, task_id, task_type, scene_type, label, pos, message, swap_xy=False):
+    """The exact organiser format (key order preserved). swap_xy: report [y, x] instead of [x, y]."""
+    if pos and swap_xy:
+        pos = [pos[1], pos[0]]
     return {
         "group_id": group_id,
         "task_id": task_id,
@@ -97,15 +100,40 @@ class MissionReporter(Node):
         hz = float(p("republish_hz", 0.0).value)
         self.server_url = p("server_url", "").value
         self.require_pos = p("require_position", True).value
+        self.swap_xy = p("swap_xy", True).value   # reported "pos" is [y, x] (map x/y flipped); internal maths stays [x, y]
         self.same_survivor_r = float(p("same_survivor_radius_m", 1.0).value)
         self.hold_unknown = p("hold_unknown_scene_survivors", True).value
         self.require_scene = p("require_scene", True).value
         self.pending_max = int(p("pending_max", 50).value)
+        # "scene:task_id:label": answer that task as soon as the room is identified as `scene`
+        self.scene_tasks = [r.split(":") for r in p("scene_tasks", [""]).value if r.count(":") == 2]
+        # a scene_tasks answer waits this long: another tile named the same scene meanwhile -> the higher confidence wins
+        # (the AI sometimes names a scene it sees BEYOND a wall, from the tile in front of it)
+        self.scene_task_hold_s = float(p("scene_task_hold_s", 45.0).value)
+        # sightings while the robot faces a scene tile (and this long after) are on THAT tile: its room and position
+        self.scene_look_grace_s = float(p("scene_look_grace_s", 3.0).value)
+        self.scene_held_timeout_s = float(p("scene_held_timeout_s", 90.0).value)   # no answer for the tile by then: release
+        self.looking = None                      # {"tile": "i,j", "pos": [x, y]} while facing a scene tile
+        self.looking_ended = (None, 0.0)         # (that look, monotonic time it ended)
+        self.held = {}                           # scene tile -> [(monotonic time, (ev, label, confirmed, room))]
+        self.scene_task_cands = {}               # task_id -> best scene_tasks answer so far, sent at its deadline
         self.pending = []                        # sightings / QR texts waiting for the room to become known
         self.survivors = []                      # (task_id, [x, y]) already reported
-        self.qr_positions = []                   # where QR codes were seen ([x, y])
+        self.qr_positions = []                   # where QR codes were seen ([x, y], map frame)
         self.qr_near_r = float(p("qr_near_survivor_m", 1.5).value)
         self.no_qr_min_h = float(p("no_qr_min_bbox_h_frac", 0.25).value)
+        # "survivor WITH a QR" (M03) also when the front camera had a QR in view within qr_window_s (either side) of the
+        # survivor sighting, read straight from the qr_scanner (/qr/visible) - not only perception's qr_in_view, which
+        # missed a QR read 0.7 s before (plusscenevote 26 Nov: sent as M05). A survivor without one waits until
+        # qr_window_s after its sighting before it can go out as "no QR" (M05), while a "qr" task is still open.
+        self.qr_window_s = float(p("qr_window_s", 3.0).value)
+        # how long a survivor with no QR yet waits before it can go out as "no QR" (M05). Longer than qr_window_s: the QR
+        # beside a survivor is often only read once the robot has turned to it (fullrun_26_11_141104: survivor at
+        # 14:12:47, its QR read 7.4 s later 0.18 m from it - sent as M05). A QR read meanwhile near it makes it M03.
+        self.no_qr_wait_s = max(self.qr_window_s, float(p("no_qr_wait_s", 10.0).value))
+        self.qr_camera = p("qr_camera", "front").value
+        self.qr_seen_times = []                  # unix times a QR was in view (qr_camera), last 15 min
+        self.survivor_wait = []                  # (due unix time, (ev, label, confirmed, room)) waiting for a late QR
         self.server_timeout = float(p("server_timeout_s", 5.0).value)
 
         if not self.group_id:
@@ -120,8 +148,14 @@ class MissionReporter(Node):
         self.scene_from = p("scene_from", "topic").value           # "topic" = only the scene topic decides
         scene_topic = p("scene_topic", "/mission/scene_type").value
         # latched like the publisher (mission_manager /scene/result), so a room published before we started is still received
-        scene_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        scene_qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, scene_topic, self.on_scene, scene_qos)
+        look_topic = p("scene_looking_topic", "/scene/looking").value
+        if look_topic:
+            look_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                  durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.create_subscription(String, look_topic, self.on_looking, look_qos)
+        self.create_timer(1.0, self._tick_scene)
         self.get_logger().info(f"scene from {scene_topic} (scene_from={self.scene_from})")
         self.create_subscription(String, "/mission/manual_report", self.on_manual, 10)
         # pos: taken from your position package's topic (same idea as the scene topic)
@@ -135,6 +169,9 @@ class MissionReporter(Node):
         if self.qr_topic:
             self.create_subscription(String, self.qr_topic, self.on_qr_message, 10)
             self.get_logger().info(f"M04 message from {self.qr_topic}")
+        qr_vis = p("qr_visible_topic", "/qr/visible").value
+        if qr_vis:
+            self.create_subscription(String, qr_vis, self.on_qr_visible, 10)
         if self.use_llm:
             self.create_subscription(String, "/perception/llm_result", self.on_llm, 10)
         else:
@@ -148,17 +185,115 @@ class MissionReporter(Node):
 
     # ---- inputs -------------------------------------------------------------------------------
     def on_scene(self, msg):
+        """/scene/result: {"tile", "scene_type", "pos", "confidence"} for every scene tile looked at (plain text and
+        {"scene_type": ...} work too). "" / traversable = no room: the current room stays."""
         txt = msg.data.strip()
-        if txt.startswith("{"):                                # also accept JSON, e.g. {"scene_type": "kitchen"}
+        scene_pos, tile, conf = None, None, None
+        if txt.startswith("{"):
             try:
                 d = json.loads(txt)
                 txt = str(d.get("scene_type") or d.get("scene") or d.get("room") or "").strip()
+                scene_pos, tile, conf = d.get("pos"), d.get("tile"), d.get("confidence")
             except json.JSONDecodeError:
                 pass
-        if txt and txt != self.scene:
-            self.scene = txt
-            self.get_logger().info(f"scene_type -> '{self.scene}'")
-        self._flush_pending()
+        named = txt if txt and self._norm(txt) != "traversable" else ""
+        if named and named != self.scene:
+            self.scene = named
+            self.get_logger().info(f"scene_type -> '{self.scene}'" + (f" (tile {tile})" if tile else ""))
+        if tile is not None:
+            self._release_held(str(tile), named)   # seen while facing this tile: its room (or, if none, the usual way)
+        self._flush_pending()          # a real detection waiting in the queue wins over a scene rule
+        if named:
+            self._apply_scene_tasks(named, scene_pos, conf, tile)
+
+    def on_looking(self, msg):
+        """/scene/looking: {"tile", "pos"} while scene mode faces a scene tile, {} when it stops."""
+        try:
+            d = json.loads(msg.data or "{}")
+        except json.JSONDecodeError:
+            d = {}
+        with self.lock:
+            if d.get("tile"):
+                self.looking = {"tile": str(d["tile"]), "pos": d.get("pos")}
+                self.get_logger().info(f"facing scene tile {d['tile']}: sightings wait for its room")
+            elif self.looking is not None:
+                self.looking_ended = (self.looking, time.monotonic())
+                self.looking = None
+
+    def _current_look(self):
+        """Called with self.lock held: the scene tile the camera faces now (or did, scene_look_grace_s ago)."""
+        if self.looking is not None:
+            return self.looking
+        last, t = self.looking_ended
+        if last is not None and time.monotonic() - t <= self.scene_look_grace_s:
+            return last
+        return None
+
+    def _release_held(self, tile, room):
+        """The AI answered for scene tile `tile`: what was seen while facing it is reported now, with `room` when it
+        named one (else the usual way: the current room, or the queue until one is known)."""
+        with self.lock:
+            items = self.held.pop(tile, [])
+        if items:
+            self.get_logger().info(f"scene tile {tile} -> '{room or 'no scene'}': {len(items)} held sighting(s) released")
+        for _, (ev, label, confirmed, rm) in items:
+            if room:
+                ev["_scene_room"] = room
+            self.process(ev, label, confirmed, rm)
+
+    def _apply_scene_tasks(self, scene, scene_pos, conf=None, tile=None):
+        """scene_tasks rules: the identified room alone answers the task (pos = the scene tile x 1.02). Held for
+        scene_task_hold_s: if another tile is named the same scene meanwhile, the higher confidence wins."""
+        for room, task_id, label in self.scene_tasks:
+            if self._norm(room) != self._norm(scene):
+                continue
+            with self.lock:
+                task = next((t for t in self.tasks if t["id"] == task_id and not t["done"]), None)
+                if task is None:
+                    continue
+                if self.require_pos and scene_pos is None:
+                    self.get_logger().warn(f"scene '{scene}': no position - task {task_id} kept open")
+                    continue
+                c = float(conf) if conf is not None else 0.0
+                cand = self.scene_task_cands.get(task_id)
+                if cand is None:
+                    self.scene_task_cands[task_id] = {"deadline": time.monotonic() + self.scene_task_hold_s,
+                                                      "scene": scene, "pos": scene_pos, "conf": c, "label": label,
+                                                      "tile": tile}
+                    self.get_logger().info(f"scene '{scene}' on tile {tile} (confidence {c:.2f}): {task_id} sent in "
+                                           f"{self.scene_task_hold_s:.0f} s unless another tile is named '{scene}'")
+                elif c > cand["conf"]:
+                    self.get_logger().info(f"scene '{scene}' also on tile {tile} ({c:.2f} > {cand['conf']:.2f} on "
+                                           f"tile {cand['tile']}): {task_id} will use tile {tile}")
+                    cand.update(scene=scene, pos=scene_pos, conf=c, tile=tile)
+                else:
+                    self.get_logger().info(f"scene '{scene}' also on tile {tile} ({c:.2f} <= {cand['conf']:.2f}): "
+                                           f"{task_id} keeps tile {cand['tile']}")
+        if self.scene_task_hold_s <= 0:
+            self._tick_scene()
+
+    def _tick_scene(self):
+        """1 Hz: send scene_tasks answers whose hold is over; release sightings held for a tile that never got an answer."""
+        now = time.monotonic()
+        with self.lock:
+            for tid, c in [(k, v) for k, v in self.scene_task_cands.items() if now >= v["deadline"]]:
+                del self.scene_task_cands[tid]
+                task = next((t for t in self.tasks if t["id"] == tid and not t["done"]), None)
+                if task is None:
+                    continue                    # a real detection answered it meanwhile
+                task["done"] = True
+                self._emit(build_result(self.group_id, tid, task["type"], c["scene"], c["label"], c["pos"], "", swap_xy=self.swap_xy))
+            stale = [tile for tile, items in self.held.items()
+                     if items and now - items[0][0] > self.scene_held_timeout_s]
+            due = [w for w in self.survivor_wait if time.time() >= w[0]]
+            self.survivor_wait = [w for w in self.survivor_wait if w not in due]
+        for _, args in due:
+            args[0]["_qr_wait_done"] = True
+            self.process(*args)                      # QR window over: decided now (a late QR makes it M03)
+        for tile in stale:
+            self.get_logger().warn(f"scene tile {tile}: no answer after {self.scene_held_timeout_s:.0f} s - "
+                                   f"releasing what was seen while facing it")
+            self._release_held(tile, "")
 
     def _queue(self, item):
         """Called with self.lock held: keep a sighting until the room is known (oldest dropped past pending_max)."""
@@ -176,6 +311,7 @@ class MissionReporter(Node):
             items, self.pending = self.pending, []
         if items:
             self.get_logger().info(f"room known ('{self.scene}'): replaying {len(items)} queued sighting(s)")
+        items.sort(key=lambda it: it[0] != "qr")       # QR texts first, then the sightings (stable: oldest first)
         for kind, a in items:
             if kind == "qr":
                 self._answer_qr(a)
@@ -249,7 +385,39 @@ class MissionReporter(Node):
                 pass
         if not txt.strip():
             return
+        self._note_qr_seen(time.time())
         self._answer_qr(txt)
+
+    def on_qr_visible(self, msg):
+        """/qr/visible (qr_scanner, every scan): note when qr_camera had a code in view (read or not)."""
+        try:
+            d = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        codes = (d.get("codes") or []) if isinstance(d, dict) else []
+        mine = [c for c in codes if isinstance(c, dict) and c.get("camera", self.qr_camera) == self.qr_camera]
+        if mine:
+            self._note_qr_seen(float(d.get("t") or time.time()))
+        with self.lock:
+            for c in mine:                       # where it is (map frame): a survivor seen near it has a QR (M03)
+                mp = c.get("map_point")
+                if isinstance(mp, (list, tuple)) and len(mp) >= 2 and None not in mp[:2]:
+                    self.qr_positions.append([float(mp[0]), float(mp[1])])
+            del self.qr_positions[:-500]
+
+    def _note_qr_seen(self, t):
+        with self.lock:
+            self.qr_seen_times.append(t)
+            self.qr_seen_times = [x for x in self.qr_seen_times if x > t - 900.0]
+
+    @staticmethod
+    def _seen_unix(ev):
+        """When the sighting happened (unix): perception's stamp, else when it reached us."""
+        if ev.get("_seen_unix") is None:
+            st = ev.get("stamp") or {}
+            ev["_seen_unix"] = (st["sec"] + st.get("nanosec", 0) * 1e-9) if isinstance(st, dict) and st.get("sec") \
+                else time.time()
+        return ev["_seen_unix"]
 
     def _answer_qr(self, txt):
         with self.lock:
@@ -305,7 +473,7 @@ class MissionReporter(Node):
             task = next((t for t in self.tasks if t["id"] == d.get("task_id")), None)
             ttype = d.get("task_type") or (task or {}).get("type", "object")
             res = build_result(self.group_id, d.get("task_id", ""), ttype, d.get("scene_type", self.scene),
-                               d.get("label", ""), d.get("pos"), d.get("message", ""))
+                               d.get("label", ""), d.get("pos"), d.get("message", ""), swap_xy=self.swap_xy)
             if task:
                 task["done"] = True
             self._emit(res)
@@ -314,7 +482,20 @@ class MissionReporter(Node):
     def process(self, ev, label, confirmed, room=None):
         if not confirmed or float(ev.get("confidence", 1.0)) < self.min_conf:
             return
+        self._seen_unix(ev)
         ttype = event_task_type(ev, label)
+        if ttype != "qr" and "_scene_tile" not in ev:
+            with self.lock:
+                look = self._current_look()
+                if look is not None:
+                    # facing a scene tile: it is on THAT tile. Wait for the AI's answer for it (its room), pos = the tile
+                    ev_h = dict(ev)
+                    ev_h["_scene_tile"] = look["tile"]
+                    ev_h["_pos_at_sighting"] = list(look["pos"]) if look.get("pos") is not None else self._pos(ev)
+                    self.held.setdefault(look["tile"], []).append((time.monotonic(), (ev_h, label, confirmed, room)))
+                    self.get_logger().info(f"event {ttype}/{label}: seen while facing scene tile {look['tile']} - "
+                                           f"held for that tile's room")
+                    return
         if ttype != "qr" and self.require_pos and self._pos(ev) is None:
             # don't use up a task on a sighting with no position; wait for one that has it
             self.get_logger().warn(
@@ -322,7 +503,9 @@ class MissionReporter(Node):
                 throttle_duration_sec=5.0)
             return
         with self.lock:
-            if self.scene_from == "topic":
+            if ev.get("_scene_room"):
+                scene_now = ev["_scene_room"]                  # seen while facing that scene tile: its room
+            elif self.scene_from == "topic":
                 scene_now = self.scene                         # only the scene package decides the room
             else:
                 scene_now = room or ev.get("scene_type") or self.scene
@@ -330,6 +513,13 @@ class MissionReporter(Node):
                 self.qr_positions.append(event_position(ev))
             if ttype == "survivor":
                 task = self.pick_survivor_task(self._pos(ev), scene_now, ev)
+                if task == "wait_qr":
+                    ev_w = dict(ev)
+                    ev_w["_pos_at_sighting"] = self._pos(ev)       # where the robot was, not where it is in 3 s
+                    self.survivor_wait.append((ev_w["_seen_unix"] + self.no_qr_wait_s, (ev_w, label, confirmed, room)))
+                    self.get_logger().info(f"survivor at {ev_w['_pos_at_sighting']}: no QR yet - waiting "
+                                           f"{self.no_qr_wait_s:.0f} s for one before calling it 'no QR'")
+                    return
                 if task is False:
                     return                               # same survivor again, or waiting for the scene
             else:
@@ -355,7 +545,7 @@ class MissionReporter(Node):
                 scene_out = task["scene"] or scene_now           # M03: the mission's exact room name; M05: the room it was in
             else:
                 scene_out = task["scene"] or scene_now
-            res = build_result(self.group_id, task["id"], ttype, scene_out, out_label, pos, message)
+            res = build_result(self.group_id, task["id"], ttype, scene_out, out_label, pos, message, swap_xy=self.swap_xy)
             self._emit(res)
 
     @staticmethod
@@ -366,16 +556,20 @@ class MissionReporter(Node):
         """True if a QR code was seen beside this survivor (same moment, or a QR seen near this spot)."""
         if ev.get("qr_in_view"):
             return True
-        if pos is not None:
+        t = self._seen_unix(ev)
+        if any(abs(q - t) <= self.qr_window_s for q in self.qr_seen_times):
+            return True                              # the scanner had a QR in view around the sighting
+        here = event_position(ev)                    # map frame, like qr_positions (pos may be the course frame)
+        if here is not None:
             for q in self.qr_positions:
-                if ((pos[0] - q[0]) ** 2 + (pos[1] - q[1]) ** 2) ** 0.5 < self.qr_near_r:
-                    return True
+                if ((here[0] - q[0]) ** 2 + (here[1] - q[1]) ** 2) ** 0.5 < self.qr_near_r:
+                    return True                      # a QR seen beside where the survivor is (before or since)
         return False
 
     def pick_survivor_task(self, pos, scene_now, ev=None):
         """Survivor -> task.  task_conditions: "qr" = survivor WITH a QR beside it (M03),
         "no_qr" = survivor WITHOUT one (M05), "" = any.  task_scenes (optional) = room it must be in.
-        Returns task, None (no open task) or False (skip for now)."""
+        Returns task, None (no open task), False (skip for now) or "wait_qr" (no QR yet: decide after qr_window_s)."""
         ev = ev or {}
         if pos is not None:
             for tid, p in self.survivors:
@@ -400,6 +594,10 @@ class MissionReporter(Node):
         if not cands:
             return None
         task = cands[0]
+        if task["cond"] == "no_qr" and not ev.get("_qr_wait_done") \
+                and time.time() < self._seen_unix(ev) + self.no_qr_wait_s \
+                and any(t["cond"] == "qr" for t in open_):
+            return "wait_qr"                         # a QR may still come into view: decide after the window
         if task["cond"] == "no_qr":
             # only call it "no QR" if we were close enough that a QR beside it would have been seen
             h = float(ev.get("bbox_h_frac", 1.0))

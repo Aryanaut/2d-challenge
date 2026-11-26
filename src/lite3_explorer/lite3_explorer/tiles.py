@@ -134,6 +134,62 @@ def find_wall(along: np.ndarray, across: np.ndarray, *, d_min: float, d_max: flo
     return None if found is None else float(np.median(along[np.abs(along - found[0]) <= band_m]))
 
 
+def back_wall_heading(grid: np.ndarray, info: GridInfo, tg: TileGrid, here: Tile, scene: Tile, *,
+                      max_deg: float = 20.0, step_deg: float = 0.5, beyond_m: float = 0.4, span: float = 0.4,
+                      band_m: float = 0.03, slot_m: float = 0.05, min_coverage: float = 0.8,
+                      occupied_threshold: int = 65) -> Optional[dict]:
+    """The back wall of a scene tile seen from `here` (a tile sharing a side with it): the straight wall in the scene
+    tile's far half or up to beyond_m past its far edge, turned at most max_deg from the grid. The lidar does not see
+    past the back wall, so per slot_m slot across |across| <= span * size only the FARTHEST occupied cell counts
+    (along = distance from the scene tile's centre away from `here`): clutter in front of the wall (a table against
+    it, a solid block) never does. At each angle the line `along = d` through the most of those cells (within band_m)
+    is found; a wall needs them in at least min_coverage of the slots (continuous). Best = highest coverage, then the
+    tightest; a straight-line fit to its cells then gives the angle finer than step_deg (map cells are coarse).
+    Returns {'yaw': heading square to that wall, facing it from `here`, 'offset_deg': its turn from the grid,
+    'distance_m': d, 'coverage'} or None (not a neighbour / no such wall)."""
+    di, dj = int(scene[0]) - int(here[0]), int(scene[1]) - int(here[1])
+    if abs(di) + abs(dj) != 1:
+        return None
+    base = tg.yaw + math.atan2(dj, di)
+    half, half_span = tg.size / 2.0, span * tg.size
+    sc = tg.center(tuple(scene))
+    pts = _occupied_points(grid, info, sc, math.hypot(half + beyond_m, half_span) + band_m, occupied_threshold)
+    if len(pts) < 5:
+        return None
+    dx, dy = pts[:, 0] - sc[0], pts[:, 1] - sc[1]
+    n_slots = max(1, int(round(2 * half_span / slot_m)))
+    best = None
+    for deg in np.arange(-max_deg, max_deg + 1e-9, step_deg):
+        a = base + math.radians(float(deg))
+        c, s = math.cos(a), math.sin(a)
+        along, across = c * dx + s * dy, -s * dx + c * dy
+        keep = (np.abs(across) <= half_span) & (along >= 0.0) & (along <= half + beyond_m)
+        if not keep.any():
+            continue
+        al, ac = along[keep], across[keep]
+        slot = np.clip(((ac + half_span) / slot_m).astype(int), 0, n_slots - 1)
+        order = np.lexsort((al, slot))                         # per slot, the farthest cell last
+        last = np.r_[slot[order][1:] != slot[order][:-1], True]
+        far_al, far_ac = al[order][last], ac[order][last]
+        for d in far_al:                                       # the candidate lines: through each farthest cell
+            on = np.abs(far_al - d) <= band_m
+            cover = int(on.sum()) / n_slots
+            key = (round(cover, 3), -float(np.std(far_al[on])), -abs(float(deg)))
+            if best is None or key > best[0]:
+                best = (key, float(deg), far_ac[on], far_al[on])
+    if best is None or best[0][0] < min_coverage:
+        return None
+    _, deg, ac, al = best
+    dist = float(np.mean(al))
+    if len(ac) >= 3:                                           # fit along = k * across + d: the wall is turned by -atan(k)
+        k = float(np.polyfit(ac, al, 1)[0])
+        ref = deg - math.degrees(math.atan(k))
+        if abs(ref) <= max_deg:
+            deg = ref
+    return {'yaw': wrap(base + math.radians(deg)), 'offset_deg': round(deg, 2),
+            'distance_m': round(dist, 3), 'coverage': best[0][0]}
+
+
 def align_to_walls(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, robot_xy: Sequence[float], *,
                    radius_m: float = 2.0, max_shift_m: float = 0.15, max_rot_deg: float = 6.0,
                    min_quality: float = 1.5, occupied_threshold: int = 65) -> Optional[dict]:
@@ -351,6 +407,33 @@ def edge_coverage(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, occu
             hit[inside] = dil[r[inside], c[inside]]
             out.append((key, ((x0, y0), (x1, y1)), float(hit.any(axis=1).sum()) / samples))
     return out
+
+
+def edge_line_share(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, side: str, *, band_m: float = 0.15,
+                    thick_cells: int = 4, occupied_threshold: int = 65, samples: int = 20) -> float:
+    """Share of a tile edge covered by ONE straight line of mapped wall parallel to it: the best stripe thick_cells
+    wide anywhere within band_m across the edge (either side), counting the samples along the edge with an occupied
+    cell in that stripe. A maze wall is such a line; scene clutter near the edge is not: it is spread over the whole
+    band, so edge_coverage (any wall cell within the band per sample) reads it as a wall and this does not
+    (sim bag backtracking_20261126_131935, clutter 0.15 m in from the edge: 0.80-1.00 there, 0.00-0.10 here).
+    Coarser walls of the real lidar map lose some share here (blockedscenetest_26_11_084131: 1.00 -> 0.60), so this
+    only decides when edge_coverage calls every side of a scene tile a wall (TileTracker._view_open)."""
+    occ = grid >= occupied_threshold
+    h, w = occ.shape
+    (x0, y0), (x1, y1) = tg.edge(tile, side)
+    length = math.hypot(x1 - x0, y1 - y0) or 1.0
+    nx, ny = -(y1 - y0) / length, (x1 - x0) / length
+    f = (np.arange(samples) + 0.5) / samples
+    offsets = np.arange(-band_m, band_m + 1e-9, info.resolution)
+    px = x0 + f[:, None] * (x1 - x0) + offsets[None, :] * nx
+    py = y0 + f[:, None] * (y1 - y0) + offsets[None, :] * ny
+    r = np.floor((py - info.origin_y) / info.resolution).astype(np.int64)
+    c = np.floor((px - info.origin_x) / info.resolution).astype(np.int64)
+    inside = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+    hit = np.zeros(r.shape, bool)
+    hit[inside] = occ[r[inside], c[inside]]
+    k = max(1, min(int(thick_cells), hit.shape[1]))
+    return max(float(hit[:, s:s + k].any(axis=1).mean()) for s in range(hit.shape[1] - k + 1))
 
 
 def wall_edges(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, min_fraction: float = 0.5,

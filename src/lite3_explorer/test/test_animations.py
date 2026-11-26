@@ -59,7 +59,7 @@ def test_cancel_goes_to_move_mode():
 
 def test_scenescan_markers_left_centre_right_once_each():
     from lite3_explorer.animations import SceneScan
-    a = SceneScan(pause_s=1.0, move_s=1.0, yaw=20000, mode_settle_s=0.0)
+    a = SceneScan(pause_s=1.0, move_s=1.0, yaw=20000, side_pause_s=None, mode_settle_s=0.0)
     assert 'scenescan' in ANIMATIONS and a.pose_at(1.0)[YAW] == -20000 and a.pose_at(5.0)[YAW] == 20000
     assert a.pose_at(a.duration)[YAW] == 0
     a.start(0.0)
@@ -69,3 +69,13 @@ def test_scenescan_markers_left_centre_right_once_each():
         seen += a.pop_markers()
         t += 0.1
     assert seen == ['left', 'centre', 'right']
+
+
+def test_scenescan_holds_shorter_at_the_sides():
+    from lite3_explorer.animations import SceneScan
+    a = SceneScan(pause_s=1.0, move_s=1.0, yaw=20000, side_pause_s=0.4, mode_settle_s=0.0)
+    assert [n for _, n in a.markers()] == ['left', 'centre', 'right']
+    assert [round(t, 3) for t, _ in a.markers()] == [1.4, 3.4, 4.8]
+    assert a.pose_at(1.2)[YAW] == -20000 and a.pose_at(1.6)[YAW] != -20000       # left: held 0.4 s, then back
+    assert abs(a.duration - (4 * 1.0 + 1.0 + 2 * 0.4)) < 1e-9
+    assert SceneScan(pause_s=1.0, side_pause_s=None).side_pause_s == 1.0

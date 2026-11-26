@@ -192,6 +192,33 @@ def test_virtual_wall_survives_a_thinned_map_but_not_a_cleared_one():
     assert not walls(thin)                                     # and 45% alone does not bring it back
 
 
+def test_no_scene_look_across_a_virtual_wall_the_lidar_has_mapped():
+    """Bag fullrun_26_11_141104: scene 0,-1 was looked at from the start tile across the start wall. Half of that wall
+    was mapped at the time (band share 0.50 < scene_wall_fraction, 0.45 on the edge line: 'wall'), so the camera
+    photographed the wall. A virtual wall with mapped wall on it blocks the view; the same half wall alone does not."""
+    from lite3_explorer.tile_tracker import TileTracker
+    info = fc.GridInfo(20, 40, 0.05, 0.0, -1.0)                 # tile 0,0 (y 0..1) above tile 0,-1 (y -1..0)
+    grid = np.zeros((40, 20), dtype=np.int16)
+    grid[19:21, 0:9] = 100                                     # half of the shared edge y=0 mapped as wall (0.50)
+    grid[4:16, 4:16] = 100                                     # a prop in the middle of 0,-1: a scene tile
+    t = TileTracker()
+    t.grid = T.TileGrid(0.0, 0.0, 0.0)
+    t.trail = [(0, 0)]
+    t.start_wall = None
+    t.set_map(grid, info)
+    t.update(force=True)
+    t.virtual_walls()
+    assert t.is_scene((0, -1))
+    assert t.scene_neighbours((0, 0)) == [(0, -1)]              # no virtual wall there: half a wall is not enough
+    t.start_wall = t.grid.edge((0, 0), 'S')                    # the virtual wall behind the start pose
+    assert t.scene_neighbours((0, 0)) == []
+    assert t.wall_between((0, 0), (0, -1))
+    grid[19:21, 0:9] = 0                                       # no wall mapped on it: the virtual wall alone does not block
+    t.set_map(grid, info)
+    t.update(force=True)
+    assert t.scene_neighbours((0, 0)) == [(0, -1)]
+
+
 def _start_room(robot_xy=(0.0, 0.0), back_wall=True, clutter=True, size=1.02):
     """Start tile centred on the origin (walls N and S, a back wall W, open E) and, two tiles east, a tile full of
     scattered clutter (a scene tile) that outnumbers the wall cells."""

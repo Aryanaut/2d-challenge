@@ -191,31 +191,34 @@ class QuickScan(PoseAnimation):
 
 
 class SceneScan(PoseAnimation):
-    """Yaw to the left, back to the centre, then to the right, stopping at each for pause_s (level, no lean).
+    """Yaw to the left, back to the centre, then to the right (level, no lean), holding side_pause_s at the left and
+    the right and pause_s at the centre (side_pause_s None: pause_s at all three).
 
-    The markers 'left', 'centre' and 'right' are reached at the end of each pause: the scene mode takes a picture
+    The markers 'left', 'centre' and 'right' are reached at the end of each hold: the scene mode takes a picture
     at each. Ends level and centred.
     """
     name = 'scenescan'
 
-    def __init__(self, pause_s: float = 1.0, move_s: float = 1.0, yaw: int = 20000, **kw):
+    def __init__(self, pause_s: float = 1.0, move_s: float = 1.0, yaw: int = 20000,
+                 side_pause_s: Optional[float] = 0.4, **kw):
         if not YAW_DEAD_ZONE < abs(yaw) <= YAW_MAX:
             raise ValueError(f'yaw must be beyond the dead zone ({YAW_DEAD_ZONE}) up to {YAW_MAX}')
         self.pause_s, self.move_s, self.yaw = pause_s, move_s, yaw
+        self.side_pause_s = pause_s if side_pause_s is None else side_pause_s
         super().__init__(**kw)
 
     def keyframes(self):
-        p, m, yaw = self.pause_s, self.move_s, self.yaw
+        p, s, m, yaw = self.pause_s, self.side_pause_s, self.move_s, self.yaw
         return [
-            (m, {YAW: -yaw}), (p, {}),          # look left, hold
+            (m, {YAW: -yaw}), (s, {}),          # look left, hold
             (m, {YAW: 0}), (p, {}),             # back to the centre, hold
-            (m, {YAW: yaw}), (p, {}),           # look right, hold
+            (m, {YAW: yaw}), (s, {}),           # look right, hold
             (m, {YAW: 0}),                      # centred again
         ]
 
     def markers(self):
-        p, m = self.pause_s, self.move_s
-        return [(m + p, 'left'), (2 * (m + p), 'centre'), (3 * (m + p), 'right')]
+        p, s, m = self.pause_s, self.side_pause_s, self.move_s
+        return [(m + s, 'left'), (2 * m + s + p, 'centre'), (3 * m + 2 * s + p, 'right')]
 
 
 ANIMATIONS = {cls.name: cls for cls in (QuickScan, SceneScan)}

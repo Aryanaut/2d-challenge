@@ -36,7 +36,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 
-from geometry_msgs.msg import PoseStamped, Quaternion, TransformStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion, TransformStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
@@ -103,6 +103,9 @@ class OdomTfBridge(Node):
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Bool, '/ai_mode', self._on_ai_mode, latched)
         self.create_subscription(PoseStamped, '/odom_rebase', self._on_rebase, 10)
+        # RViz "2D Pose Estimate" (/initialpose): put the robot where the operator clicked, e.g. after a fall threw the
+        # leg odometry off. Same as an /odom_rebase; slam_toolbox scan-matches the remainder.
+        self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self._on_initialpose, 10)
         self.get_logger().info(f'{self.odom_topic} -> {self.odom_frame}->{self.base_frame} (stamp_mode={self.stamp_mode})')
 
     def _output_pose(self):
@@ -144,6 +147,10 @@ class OdomTfBridge(Node):
         if self.release_at is not None and self.frozen and self._now_s() >= self.release_at:
             self.get_logger().warn('No /odom_rebase after AI mode: releasing the held pose anyway.')
             self._release('Hold timed out')
+
+    def _on_initialpose(self, msg: PoseWithCovarianceStamped):
+        self.get_logger().warn('2D Pose Estimate from RViz: moving the robot to the clicked pose.')
+        self._on_rebase(PoseStamped(header=msg.header, pose=msg.pose.pose))
 
     def _on_rebase(self, msg: PoseStamped):
         """Move the robot to the pose in msg (map frame, or odom frame when msg.header.frame_id == odom_frame)."""

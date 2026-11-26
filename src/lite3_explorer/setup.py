@@ -39,6 +39,7 @@ setup(
             'scan_fill = lite3_explorer.scan_fill:main',
             'controller_monitor = lite3_explorer.controller_monitor:main',
             'robot_state_bridge = lite3_explorer.robot_state_bridge:main',
+            'step_pause_gate = lite3_explorer.step_pause_gate:main',
         ],
     },
 )

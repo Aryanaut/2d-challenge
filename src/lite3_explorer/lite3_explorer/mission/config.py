@@ -36,6 +36,9 @@ DEFAULTS: Dict[str, Any] = {
     'prefer_flat_tiles': True,        # classifier elevation option on: go to the reachable tile with the least elevation change (up or down) from the current one
     'flat_tile_tolerance_m': 0.03,    # ... elevation changes within this of the best count as equal (the strategy's ranking decides)
     'step_up_min_rise_m': 0.04,       # ... when it is at least this much higher
+    'step_up_from_max_slope_deg': 15.0,  # ... the current tile's elevation is ignored (start floor, 0 m, used instead) when
+                                      # its plane is steeper than this: a wall panel read as floor (fullrun_26_11_120359: the
+                                      # current tile read 0.55 m at 22.6 deg, so the higher target looked lower)
     'llm_report_timeout_s': 180.0,
     'llm_report_retries': 5,
     'robot_length_m': 0.61,               # turn-room check (match the local costmap footprint)
@@ -49,6 +52,8 @@ DEFAULTS: Dict[str, Any] = {
         'min_known': 0.5,                 # share of a tile that must be scanned before it becomes a tile
         'scene_min_known': 0.85,          # scene tile: scanned at least this much ...
         'scene_max_free': 0.80,           # ... and less than this share of the SCANNED part traversable (drawn blue hatched in RViz)
+        'scene_lidar_min_known': 0.0,     # a scene from the lidar alone needs this much scanned; less: only with a scene-prop sighting
+        'initial_clear_m': 0.40,          # the initial tile is closed once the robot is this far outside it (body cleared)
         'align_on_entry': True,           # on every tile entry: nudge the grid so that tile's edges lie on the walls around it
         'align_max_shift_m': 0.15,        # ... an edge further than this from its wall is not that wall's: left alone
         'align_max_rot_deg': 6.0,         # ... turn at most this much towards the wall angle
@@ -63,6 +68,20 @@ DEFAULTS: Dict[str, Any] = {
         'roller_min_lidar': 2,            # ... of which this many are confirmed by the 3D lidar (0 = depth camera alone)
         'roller_depth_only_points': 12,   # ... or a tile with this many spots needs no lidar (0 = lidar always required)
         'roller_edge_margin_m': 0.15,     # spots this close to a tile edge do not count (the roller lies mid-tile)
+        # scene-prop votes (prop_votes.py): the detector's scene props placed on the lidar map keep a tile a scene tile
+        'prop_votes': False,              # on / off (also at runtime: ros2 param set /mission_manager tiles.prop_votes true)
+        'prop_min_frames': 8,             # prop sightings on a tile needed ...
+        'prop_min_score': 4.0,            # ... and their summed confidence
+        'prop_detections_topic': '/perception/detections',
+        'prop_camera_info_topic': '/camera/color/camera_info',
+        'prop_fx': 462.6,                 # colour camera intrinsics until camera_info arrives (Orbbec 640x480)
+        'prop_cx': 320.1,
+        'prop_camera_x_m': 0.252,         # camera ahead of base_link
+        'prop_min_conf': 0.35,
+        'prop_max_range_m': 3.0,
+        'prop_max_turn_dps': 30.0,        # ignore detections while the robot turns faster than this (pose / frame mismatch)
+        'prop_labels': ['tool_bench', 'hand_tools', 'kitchen', 'utensils', 'market_stall', 'cart', 'food',
+                        'cleaning_cart', 'medical_kit'],   # any of them = "a prop is here"; the label is not trusted
     },
 
     'mission': {
@@ -86,6 +105,7 @@ DEFAULTS: Dict[str, Any] = {
         'costmap_hold_s': 20.0,           # ... for this long = stuck in the global costmap
         'cooldown_s': 5.0,                # ignore triggers this long after (re-)entering a watched mode
         'costmap_mode': 'mppi',           # stuck in the costmap obstacle zone -> this mode moves the robot out ('' = recovery)
+        'per_mode': {},                   # <mode>: {costmap_hold_s, cooldown_s} overriding the above while that mode runs
     },
 
     'end_condition': {
@@ -256,7 +276,11 @@ DEFAULTS: Dict[str, Any] = {
             'center_gain': 1.0,
             'heading_gain': 1.0,          # wz that holds the heading while centring
             'center_timeout_s': 15.0,     # not there by then: turn to face the scene tile from where it is
-            'align_tol_deg': 6.0,         # only then turn in place until facing the scene tile's centre within this
+            'face': 'back_wall',          # back_wall: square up to the scene tile's back wall (lidar map); none found / centre: face its centre
+            'back_wall_max_deg': 20.0,    # the back wall may be turned this far from the tile grid
+            'back_wall_beyond_m': 0.4,    # ... and lie in the scene tile's far half or up to this past its far edge
+            'back_wall_min_coverage': 0.8,   # ... a continuous line over at least this share of the tile's middle 0.8
+            'align_tol_deg': 6.0,         # only then turn in place until facing it within this
             'commit_deg': 150.0,          # target further round than this: keep the direction the turn started in (no flip at 180 deg)
             'align_timeout_s': 15.0,
             'min_turn_rad_s': 0.2,
@@ -422,6 +446,7 @@ DEFAULTS: Dict[str, Any] = {
             'traversal': 'recovery_mppi',     # Nav2 + holonomic RecoveryMPPI controller (strafes with vx / vy)
             'fallback_traversal': 'omni',     # that failed: straight x / y velocity to the same centre ('' = none)
             'keep_gait': True,            # keep the gait the robot already has while recovering (/gait_freeze)
+            'step_up_gait': True,         # ... except a step up: a higher recovery target still switches to h-step (/step_up)
             'candidates': 3,
             'min_distance_m': 0.25,       # skip centres the robot is already on
             'adjacent_only': True,        # only the robot's own tile / tiles sharing a side with it (never through another tile)

@@ -4,8 +4,8 @@ object_detector:
     # (and set use_depth: false - the Pi has no depth, you will get bearing only).
     image_topic: /camera/color/image_raw/compressed
     depth_topic: /camera/depth/image_raw          # needs depth ALIGNED to colour (enable align in the Orbbec driver)
-    camera_info_topic: /camera_info
-    use_depth: false                              # true once depth alignment is checked
+    camera_info_topic: /camera/color/camera_info
+    use_depth: true                               # true once depth alignment is checked
 
     backend: onnx                                 # onnx = no PyTorch on the robot (needs onnxruntime OR OpenCV >= 4.8)
     model_path: detector.onnx                     # put the file in src/lite3_perception/models/ then rebuild
@@ -66,7 +66,7 @@ object_detector:
     detect_hz: 3.0
     confirm_hits: 3
     confirm_window_s: 2.0
-    class_confirm_overrides: '{"hand_tools": 4}'   # hand tools must be seen in 4 frames
+    class_confirm_overrides: '{"hand_tools": 4, "high_voltage": 2, "radioactive": 2, "chemical": 2, "biological": 2, "flammable": 2}'   # hand tools: 4 frames; a CERTAIN hazard sign: 2 (blockedscenetest 26 Nov: high_voltage seen in 2 frames during a scene look, never confirmed)
     dedup_radius_m: 1.0
     dedup_cooldown_s: 20.0
     max_range_m: 4.0

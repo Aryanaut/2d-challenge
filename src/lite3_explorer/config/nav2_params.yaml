@@ -154,7 +154,7 @@ local_costmap:
       resolution: 0.05
       # Body size (0.61 m x 0.37 m) with no padding, so the spin's collision check
       # does not treat walls a few centimetres away as contact.
-      footprint: "[[0.305, 0.185], [0.305, -0.185], [-0.305, -0.185], [-0.305, 0.185]]"
+      footprint: "[[0.335, 0.185], [0.335, -0.185], [-0.335, -0.185], [-0.335, 0.185]]"
       footprint_padding: 0.0
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:

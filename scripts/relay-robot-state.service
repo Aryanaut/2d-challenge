@@ -1,0 +1,28 @@
+# systemd unit for scripts/relay_robot_state.py on the robot computer (192.168.1.50).
+#
+#   sudo install -m 755 relay_robot_state.py /usr/local/bin/relay_robot_state.py
+#   sudo install -m 644 relay-robot-state.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now relay-robot-state
+#   journalctl -u relay-robot-state -f          # status lines every 30 s
+#
+# Change the destination / rate in ExecStart, then: sudo systemctl daemon-reload && sudo systemctl restart relay-robot-state
+
+[Unit]
+Description=Relay Lite3 0x0901 robot state reports to the explorer computer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/bin/relay_robot_state.py --iface eth0 --to 192.168.1.71:43897 --max-rate 10 --every 30
+# eth0 may not be up yet at boot: the script exits and systemd starts it again
+Restart=always
+RestartSec=3
+# no root needed: an unprivileged throwaway user with only the raw-socket capability
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -26,9 +26,16 @@ For RViz / debugging
   pub /sim/status      std_msgs/String JSON (1 Hz): sim time, pose, maze tile, Nav2 task, ground-truth coverage
   srv ~/reset_curtains std_srvs/Trigger   forget the detected curtain spots
 
+Scene AI stand-in (parameter scene_ai: true; the launch file turns it on for mazes with '1'..'8' scene tiles)
+  It plays lite3_llm_tools' llm_client: pub /llm/status (latched, 1 Hz, ready), sub /llm/request, pub /llm/response.
+  The scene mode's describe_tile (prompt describe_scene) is answered with the ground truth: the scene type of the maze
+  scene tile the robot faced when the picture was taken ('1'..'8'), no scene type for a '0' tile, 'traversable' when it
+  faces no scene tile. Every other describe_tile (tile reports) gets a placeholder description; other tasks fail.
+
 Staircases ('M'): the risers block the lidar, and the robot unless it is in AI mode; the stair camera runs
 lite3_explorer's stairs_core on simulated tread / floor points. The climb itself is not simulated (no pitch, no
-height). Not simulated: terrain, gaits, scene / pose animations, the AI. Parameters: config/sim.yaml.
+height). Not simulated: terrain, gaits, scene / pose animations, the AI (only the scene answers above).
+Parameters: config/sim.yaml.
 """
 from __future__ import annotations
 
@@ -94,6 +101,7 @@ class Lite3Sim(Node):
         flat = {k: p.value for k, p in self.get_parameters_by_prefix('').items() if k != 'use_sim_time'}
         cfg = unflatten(flat)
         maze_path = cfg.pop('maze', '')
+        scene_ai = bool(cfg.pop('scene_ai', False))
         if not maze_path:
             raise RuntimeError('parameter "maze" (path to a maze YAML) is required')
         self.maze = load_maze(maze_path)
@@ -161,6 +169,18 @@ class Lite3Sim(Node):
             self.create_service(ClearEntireCostmap, name, self._on_clear, callback_group=self.action_group)
         self.create_service(Trigger, '~/reset_curtains', self._on_reset_curtains, callback_group=self.action_group)
 
+        # scene AI stand-in (llm_client's topics): scene tiles answered with the maze's scene types
+        self.scene_ai = scene_ai
+        if scene_ai:
+            self.llm_status_pub = self.create_publisher(String, '/llm/status', LATCHED)
+            self.llm_response_pub = self.create_publisher(String, '/llm/response', QoSProfile(depth=50))
+            self.create_subscription(String, '/llm/request', self._on_llm_request, QoSProfile(depth=50),
+                                     callback_group=self.action_group)
+            self.create_timer(1.0, self._publish_llm_status, callback_group=self.action_group)
+            self._publish_llm_status()
+            named = ', '.join(f'{i},{j} {n}' for (i, j), n in sorted(self.maze.scene_types.items())) or 'none'
+            self.get_logger().info(f'Scene AI stand-in on (/llm/*): maze scene tiles {named}')
+
         # state for publishing
         self._last = {'scan': None, 'map': -1, 'global': -1, 'local': None, 'curtain': -1, 'stairs': -1}
         self._task_path_id = None
@@ -176,6 +196,58 @@ class Lite3Sim(Node):
         self.create_timer(0.1, self._publish_robot, callback_group=self.timer_group)
         self.create_timer(1.0, self._publish_status, callback_group=self.timer_group)
         self.create_timer(2.0, self._publish_maze, callback_group=self.timer_group)   # late RViz subscribers
+
+    # =========================================================================================== scene AI
+    def _publish_llm_status(self):
+        self.llm_status_pub.publish(String(data=json.dumps(
+            {'ready': True, 'server': 'lite3_sim scene AI stand-in', 'group_set': True, 'simulated': True})))
+
+    def _faced_scene_tile(self, pose_map):
+        """The maze scene tile in front of a robot at pose_map (map frame): the first scene tile on the line from the
+        robot along its heading, up to 1.5 tiles out (the camera looks at the neighbouring tile). None: no scene tile."""
+        mx, my, myaw = W.compose(W.invert(self.world.map_T_maze), tuple(pose_map))
+        s = self.maze.tile_size
+        for k in range(1, 16):
+            d = 0.1 * k * s
+            tile = (int(math.floor((mx + d * math.cos(myaw)) / s)), int(math.floor((my + d * math.sin(myaw)) / s)))
+            if tile in self.maze.scenes:
+                return tile
+            if tile in self.maze.solid:
+                return None
+        return None
+
+    def _on_llm_request(self, msg):
+        try:
+            req = json.loads(msg.data)
+        except ValueError:
+            return
+        reply = {'id': req.get('id'), 'ok': True}
+        if req.get('task') != 'describe_tile':
+            reply = {'id': req.get('id'), 'ok': False,
+                     'error': f'lite3_sim scene AI stand-in: task {req.get("task")!r} is not simulated'}
+        elif req.get('prompt') == 'describe_scene':
+            pose = req.get('pose')
+            with self.lock:
+                if not (isinstance(pose, (list, tuple)) and len(pose) >= 3):
+                    pose = list(self.world.pose)
+                tile = self._faced_scene_tile(pose)
+            name = self.maze.scene_types.get(tile) if tile is not None else None
+            if tile is None:
+                result = {'scene_type': 'traversable', 'confidence': 1.0, 'relevant_to_mission': False,
+                          'scene_description': 'traversable (lite3_sim: no scene tile in front of the robot)'}
+            elif name is None:
+                result = {'confidence': 0.0, 'relevant_to_mission': False,
+                          'scene_description': f"unnamed scene (lite3_sim: maze tile {tile[0]},{tile[1]} is a '0')"}
+            else:
+                result = {'scene_type': name, 'confidence': 1.0, 'relevant_to_mission': True,
+                          'scene_description': f'{name} (lite3_sim: maze tile {tile[0]},{tile[1]})'}
+            result['maze_tile'] = list(tile) if tile is not None else None
+            reply['result'] = result
+            self.get_logger().info(f'Scene AI stand-in: mission tile {req.get("tile")} -> maze tile {tile} -> '
+                                   f'{result.get("scene_type") or "no scene type"}')
+        else:
+            reply['result'] = {'scene_description': 'lite3_sim: tile reached (no AI description in the simulator)'}
+        self.llm_response_pub.publish(String(data=json.dumps(reply)))
 
     # =========================================================================================== loop
     def _step(self):

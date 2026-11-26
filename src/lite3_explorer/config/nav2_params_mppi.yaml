@@ -58,7 +58,7 @@ controller_server:
       temperature: 0.3
       gamma: 0.015
       prune_distance: 1.7                # path length ahead that is optimised
-      transform_tolerance: 0.1
+      transform_tolerance: 1.0           # map->odom can trail the robot pose by up to ~1 s (lidar lag, see slam_toolbox.yaml)
       regenerate_noises: true
       visualize: true                    # /trajectories (MarkerArray) in RViz: the sampled and the chosen path
       TrajectoryVisualizer:
@@ -133,7 +133,7 @@ controller_server:
       temperature: 0.3
       gamma: 0.015
       prune_distance: 1.7                # path length ahead that is optimised
-      transform_tolerance: 0.1
+      transform_tolerance: 1.0           # map->odom can trail the robot pose by up to ~1 s (lidar lag, see slam_toolbox.yaml)
       regenerate_noises: true
       visualize: true                    # /trajectories (MarkerArray) in RViz: the sampled and the chosen path
       TrajectoryVisualizer:

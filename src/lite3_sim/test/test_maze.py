@@ -75,6 +75,16 @@ def test_zero_marks_a_scene_tile():
     assert (1, 0) not in m.reachable_tiles()                                   # never entered
 
 
+def test_digits_1_to_8_name_the_scene():
+    m = load_maze_dict({'layout': '+---+---+---+---+\n| 1 | > | 0 | 8 |\n+---+---+---+---+\n|   | 3 | 5 |   |\n'
+                                  '+---+---+---+---+\n'})
+    assert m.scenes == {(0, 1), (2, 1), (3, 1), (1, 0), (2, 0)}
+    assert m.scene_types == {(0, 1): 'clothes_shop', (3, 1): 'furniture_shop', (1, 0): 'kitchen', (2, 0): 'workshop'}
+    assert not m.labels
+    drawn = render(m).splitlines()[1:]                                         # the preview redraws the digits
+    assert ' 1 | > | 0 | 8 ' in drawn[1] and ' 3 | 5 ' in drawn[3]
+
+
 def test_the_start_cannot_be_a_scene_tile():
     with pytest.raises(MazeError):
         load_maze_dict({'layout': '+---+\n| 0 |\n+---+\n', 'start': {'tile': [0, 0]}})

@@ -41,7 +41,9 @@
 #   ROS_SETUP, ATTACH (0 = detached), RVIZ_CONFIG (default scripts/explorer_debug.rviz),
 #   BAG_TOPICS  extra topics to record, space separated
 #   CLOUD_TOPIC lidar pointcloud recorded in every bag (default /livox/points)
-#   STATE_PORT  UDP port the motion host sends its 0x0901 robot state to (default 43897)
+#   STATE_PORT  UDP port the 0x0901 robot state arrives on (default 43897)
+#   STATE_IP    local address robot_state_bridge listens on (default 192.168.1.71, where relay_robot_state.py on
+#               192.168.1.50 sends the reports; 0.0.0.0 = all interfaces)
 set -euo pipefail
 
 SESSION="${SESSION:-explorer}"
@@ -65,7 +67,7 @@ LATCHED="--qos-durability transient_local --qos-reliability reliable"
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
 /exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /stairs/enable /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /robot_state /robot_state/text /imu/data /leg_odom2 /odom_rebase"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /stairs/enable /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /robot_state /robot_state/text /imu/data /leg_odom2 /odom_rebase /scene/looking"
 
 BAG=0
 BAG_NAME=""
@@ -178,7 +180,7 @@ LAUNCH="ros2 launch lite3_explorer exploration.launch.py"
 
 [[ $CURTAINS == 1 ]] && IMAGES=1     # the curtain detector (depth + colour) can only be replayed with the images
 # with --reporter the bag also records what the reporter and perception do (small topics, no images)
-[[ -n $REPORTER ]] && BAG_TOPICS="$BAG_TOPICS /mission/result /scene/result /perception/event /perception/qr_text /qr/visible /qr/detections"
+[[ -n $REPORTER ]] && BAG_TOPICS="$BAG_TOPICS /mission/result /scene/result /robot/position /perception/event /perception/qr_text /qr/visible /qr/detections /perception/detections"
 [[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS /camera/depth/image_raw /camera/depth/camera_info /camera/color/image_raw/compressed /camera/color/camera_info"
 if [[ $BAG == 1 ]]; then
     BAG_NAME="${BAG_NAME:-explorer}_$(date +%d_%m_%H%M%S)"     # name_DD_MM_HHMMSS
@@ -251,12 +253,13 @@ GAIT_PANE=$(tmux split-window -t "$SESSION:status.4" -v -l 30% -P -F '#{pane_id}
 run "$GAIT_PANE" "CURRENT GAIT (gait_switcher)" \
     "ros2 topic echo /gait_switcher/gait std_msgs/msg/String --field data $LATCHED"
 
-# robot state as the robot reports it (UDP 0x0901 -> /robot_state, /robot_state/text): robot_state_bridge logs one
+# robot state as the robot reports it (UDP 0x0901 -> /robot_state, /robot_state/text). The motion host only reports to
+# 192.168.1.50 (jetson2motion); relay_robot_state.py there forwards it to STATE_IP:STATE_PORT. robot_state_bridge logs one
 # line per change, e.g. "robot state (6,13,1) stepping, RUG H-step  battery 87%", "(16,0,1) AI basic gait".
 # the mission's stairs mode uses /robot_state to resend AI on / off until the robot reports it.
 STATE_PANE=$(tmux split-window -t "$GAIT_PANE" -v -l 50% -P -F '#{pane_id}')
 run "$STATE_PANE" "ROBOT STATE (basic,gait|policy,motion)" \
-    "ros2 run lite3_explorer robot_state_bridge --ros-args -p port:=${STATE_PORT:-43897} || echo 'robot_state_bridge not found: colcon build --packages-select lite3_explorer'"
+    "ros2 run lite3_explorer robot_state_bridge --ros-args -p bind_ip:=${STATE_IP:-192.168.1.71} -p port:=${STATE_PORT:-43897} || echo 'robot_state_bridge failed: not built (colcon build --packages-select lite3_explorer), or STATE_IP ${STATE_IP:-192.168.1.71} is not an address of this computer (STATE_IP=0.0.0.0 = all interfaces)'"
 
 # controller in charge (Nav2 FollowPath RPP / MPPI, RecoveryMPPI, Spin, or the mission's own /cmd_vel): under the mode pane
 CTRL_PANE=$(tmux split-window -t "$SESSION:status.0" -v -l 60% -P -F '#{pane_id}')

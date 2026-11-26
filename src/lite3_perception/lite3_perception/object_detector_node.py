@@ -27,6 +27,8 @@ import uuid
 import cv2
 import numpy as np
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -283,9 +285,14 @@ class ObjectDetectorNode(Node):
         self.pub_key = self.create_publisher(CompressedImage, "/perception/keyframe", 10)
         self.pub_dets = self.create_publisher(String, "/perception/detections", 10)
         if self.qr_source in ("scanner", "both"):
-            self.create_subscription(String, g("qr_visible_topic"), self.on_qr_visible, 10)
-            self.create_subscription(String, g("qr_detections_topic"), self.on_qr_detection, 10)
-            self.create_timer(5.0, lambda: self.check_scanner_alive(time.time()))
+            # own callback group (main() runs a multi-threaded executor): the QR messages are read WHILE a detection runs.
+            # In the default group a QR that arrived during a detection waited for the next one too (a detection takes
+            # ~0.6 s > the 0.33 s timer, so the timer always went first): plusscenevote 26 Nov, the QR was in view
+            # 0.7 s before the survivor was confirmed and it still went out as M05 without QR.
+            qr_group = MutuallyExclusiveCallbackGroup()
+            self.create_subscription(String, g("qr_visible_topic"), self.on_qr_visible, 10, callback_group=qr_group)
+            self.create_subscription(String, g("qr_detections_topic"), self.on_qr_detection, 10, callback_group=qr_group)
+            self.create_timer(5.0, lambda: self.check_scanner_alive(time.time()), callback_group=qr_group)
 
         self.create_timer(1.0 / float(g("detect_hz")), self.tick)
         self.get_logger().info(f"listening on {topic}; QR from {self.qr_source}"
@@ -695,8 +702,10 @@ class ObjectDetectorNode(Node):
 def main():
     rclpy.init()
     node = ObjectDetectorNode()
+    executor = MultiThreadedExecutor(num_threads=2)   # detection + QR callbacks side by side (see the QR callback group)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

@@ -23,6 +23,16 @@ mission_reporter:
     scene_topic: /scene/result       # published (latched) by lite3_explorer mission_manager after each scene tile is looked at
     scene_from: topic                 # topic = only that topic decides; perception = use perception's guess first
     default_scene_type: ""
+    # "scene:task_id:label" = answer the task as soon as the room is identified as that scene (no detection needed;
+    # pos = the scene tile x 1.02). [""] = off.
+    scene_tasks: ["workshop:M01:hand_tools"]
+    scene_task_hold_s: 45.0           # wait this long before sending it: another tile named the same scene meanwhile ->
+                                      # the higher confidence wins (the AI can name a scene it sees beyond a wall)
+    # sightings while the robot faces a scene tile (/scene/looking, + scene_look_grace_s) wait for that tile's answer
+    # and get ITS room and position (tile x 1.02); no answer within scene_held_timeout_s -> reported the usual way
+    scene_looking_topic: /scene/looking
+    scene_look_grace_s: 3.0
+    scene_held_timeout_s: 90.0
     pending_max: 50                   # sightings queued while the room is unknown (oldest dropped); replayed once it is known
     require_scene: true               # never report with scene_type "": keep the task open until the room is known
 
@@ -32,7 +42,7 @@ mission_reporter:
     #                    pose_cov      (geometry_msgs/PoseWithCovarianceStamped)   odometry (nav_msgs/Odometry)
     #                    point / pose  (geometry_msgs/Point / Pose)
     # The LAST position received is used for each report (M04 always reports pos null).
-    position_topic: ""
+    position_topic: /robot/position   # mission_manager: tile the robot stands on x 1.02, "x,y"
     position_msg_type: string
 
     # M04 (task_type "qr"): its "message" is taken from this topic (std_msgs/String; plain text, or JSON with
@@ -45,9 +55,21 @@ mission_reporter:
     min_confidence: 0.0
     same_survivor_radius_m: 1.0       # a survivor this close to one already reported = the same one
     hold_unknown_scene_survivors: true
-    qr_near_survivor_m: 1.5           # a QR seen within this distance of a survivor = that survivor has a QR
+    qr_near_survivor_m: 1.0           # a QR seen (/qr/visible map_point) within this distance of the survivor's map position
+                                      # = that survivor has a QR, whenever it was read (fullrun_26_11_141104: 0.18 m apart).
+                                      # Kept under a tile so a QR in the next room does not count
     no_qr_min_bbox_h_frac: 0.25       # M05 only if the survivor fills >= 25% of image height (close enough to see a QR)  # while M03 is open, don't report survivors whose room is unknown
+    # M03 vs M05: a survivor counts as WITH a QR when the qr_scanner's qr_camera had a code in view within qr_window_s
+    # (either side) of the sighting; a survivor without one waits until qr_window_s after it before it goes out as M05
+    # (plusscenevote 26 Nov: the QR was read 0.7 s before the survivor was confirmed and it went out as M05)
+    qr_window_s: 3.0
+    no_qr_wait_s: 10.0                # a survivor with no QR yet waits this long before it can go out as M05 (a QR read
+                                      # near it meanwhile makes it M03). fullrun_26_11_141104: QR read 7.4 s after the
+                                      # survivor, 3 s was too short and it went out as M05
+    qr_camera: front
+    qr_visible_topic: /qr/visible
     require_position: true            # don't answer a task with "pos": null (except qr); wait for a located sighting
+    swap_xy: true                     # report "pos" as [y, x] (map x and y flipped); false = [x, y]
     report_each_task_once: true       # a task is answered by its first matching event, then closed
     output_dir: "~/lite3_mission_results"   # results.jsonl + results.json are written here
     republish_hz: 0.0                 # >0 = re-send all results periodically (late subscribers)

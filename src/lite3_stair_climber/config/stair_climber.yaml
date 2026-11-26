@@ -95,7 +95,7 @@ stair_climber:
 
     gait_switch_wait: 2.0           # only used when there is no /robot_state (robot_state_bridge not running)
     # Every gait / Enter AI / Exit AI code is checked against /robot_state (0x0901 report) and sent again
-    # (Move Mode first for gaits) until the robot reports it: gait -> (6, gait, *), Enter AI -> (16, 0, 1),
+    # (Move Mode first for gaits) until the robot reports it: gait -> (6, gait, *), Enter AI -> (16, 0, 14),
     # Exit AI -> basic state 6.
     verify_gait: true
     gait_retry_s: 3.0               # resend if not there this long after the last send (at least the waits above)

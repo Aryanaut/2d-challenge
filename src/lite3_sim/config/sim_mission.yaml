@@ -6,6 +6,9 @@ mission_manager:
     terrain_classify_service: ''           # no terrain classifier: every tile counts as seen
     output_dir: "~/lite3_sim_runs"         # run_<time>/events.jsonl, tiles.json
     reports_dir: "~/lite3_sim_runs/reports"
+    traversals:
+      route:
+        backend: follow_waypoints          # the sim has no navigate_through_poses action, only follow_waypoints
     modes:
       idle:
         start_wait_s: 15.0

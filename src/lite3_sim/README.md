@@ -2,7 +2,7 @@
 
 Tests **exploration, the tile grid, curtain mode and stairs mode** of `lite3_explorer` in mazes you draw yourself, and
 shows everything in RViz. It does **not** simulate gaits / gait switching, terrain, the climb itself (no pitch or
-height), pose / scene animations (quickscan) or the AI.
+height), pose / scene animations (quickscan) or the AI (except the scene answers: scene tiles `1`–`8`, below).
 
 `lite3_sim` stands in for everything *around* the mission manager: the robot, the lidar, slam_toolbox and Nav2.
 Your **unmodified** `mission_manager` runs against it. It gets the same topics, TF, actions and services it uses on
@@ -31,6 +31,9 @@ colcon build --packages-select lite3_explorer lite3_sim && source install/setup.
 ros2 launch lite3_sim sim.launch.py                               # mazes/arena_example.yaml + mission_manager + RViz
 ros2 launch lite3_sim sim.launch.py maze:=dead_ends               # a bundled maze by name
 ros2 launch lite3_sim sim.launch.py maze:=~/mazes/my_maze.yaml    # your own maze
+ros2 launch lite3_sim sim.launch.py maze:=mazeA reporter:=URLA    # + mission reporter, POSTs to .../task_report_A
+ros2 launch lite3_sim sim.launch.py maze:=mazeA reporter:=URLB    # ... to .../task_report_B
+ros2 launch lite3_sim sim.launch.py maze:=mazeA reporter:=local   # reporter without POSTing (topic + results file)
 ```
 
 Launch arguments:
@@ -45,13 +48,18 @@ Launch arguments:
 | `speed_scale` | `1.0` | robot speed multiplier. The mission's timeouts are wall-clock time, so stay ≤ ~3 |
 | `lidar_range` | from `config/sim.yaml` (4.0) | shorter range = tiles identified later |
 | `auto_start` | `true` | `false`: start with `ros2 service call /mission_manager/set_active std_srvs/srv/SetBool "{data: true}"` |
+| `scene_ai` | `auto` | answer the scene mode's AI with the maze's scene types (`1`–`8`). `auto`: on when the maze has such tiles |
+| `reporter` | `''` | `URLA` / `URLB`: also run `lite3_mission_reporter`, POSTing to `<reporter_host>/task_report_A` / `_B`; `local`: no POST |
+| `reporter_host` | `http://192.168.10.141:8001` | |
+| `reporter_output_dir` | `~/lite3_sim_runs/mission_results` | the reporter's `results.jsonl` / `results.json` |
 | `use_mission` | `true` | `false`: sim + RViz only, so you can run `mission_manager` yourself (e.g. under a debugger) |
 | `mission_params` | lite3_explorer's `config/mission.yaml` | your mission config |
 | `sim_params`, `sim_mission_params`, `rviz` / `rviz_config` | | |
 
 The mission manager gets `mission_params`, then `config/sim_mission.yaml` on top (`use_ai: false`, no terrain
 classifier, `classify_target: false`, `quickscan_on_edge: false`, `curtains: true`, run files in `~/lite3_sim_runs`),
-then `tiles.size_m` from the maze file. Everything else is your real configuration.
+then `tiles.size_m` from the maze file. Everything else is your real configuration. (`sim_mission.yaml` also sets
+`traversals.route.backend: follow_waypoints`: the sim has no `navigate_through_poses`.)
 
 Running the mission manager yourself:
 ```bash
@@ -95,7 +103,14 @@ extra:                   # optional free geometry, metres, origin = SW corner of
 |---|---|
 | horizontal edge (between `+`) | `---` wall panel, `~~~` curtain, `===` slit panel, spaces = open |
 | vertical edge | `\|` wall panel, `~` curtain, `!` slit panel, space = open |
-| inside a tile | `>` `<` `^` `v` start facing E W N S (or `S` + `start.heading`), `#` solid (not floor), `0` scene tile, `M` staircase, anything else = label shown in RViz (`R1`...) |
+| inside a tile | `>` `<` `^` `v` start facing E W N S (or `S` + `start.heading`), `#` solid (not floor), `0` scene tile, `1`–`8` scene tile of that scene type (below), `M` staircase, anything else = label shown in RViz (`R1`...) |
+
+Scene tiles: `1` clothes_shop, `2` fitness_centre, `3` kitchen, `4` market, `5` workshop, `6` clinic, `7` cleaning_room,
+`8` furniture_shop (`0` = a scene tile without a type). With such tiles the sim stands in for llm_client (`/llm/status`,
+`/llm/request`, `/llm/response`) and the mission manager runs with `use_ai: true`: when the scene mode looks at a scene
+tile it gets the type of the maze tile the robot faces (one picture, `modes.scene.quickscan: false`), and publishes it
+on `/scene/result` for the mission reporter, like on the robot. A `0` tile gets no scene type; facing no scene tile
+answers `traversable`. Tile reports of ordinary tiles get a placeholder description.
 
 - **wall panel**: blocks the lidar and the robot.
 - **curtain**: the lidar sees a wall (it hangs in the scan band); the robot walks through. The simulated depth camera
