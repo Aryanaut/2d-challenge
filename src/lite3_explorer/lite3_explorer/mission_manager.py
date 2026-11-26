@@ -284,6 +284,9 @@ class MissionManager(Node):
                                  scene_max_free=float(tcfg.get('scene_max_free', 0.80)),
                                  scene_margin_m=float(tcfg.get('scene_margin_m', 0.10)))
         self.tiles.align_on_entry = bool(tcfg.get('align_on_entry', True))
+        # explorer_26_11_223230: the curtain hung on the start tile's W edge, right in front of the robot, and every spot
+        # on it was masked out by this rule
+        self.tiles.no_curtain_on_initial = bool(tcfg.get('no_curtain_on_initial_tile', False))
         self.tiles.initial_clear_m = float(tcfg.get('initial_clear_m', 0.40))
         self.tiles.align_max_shift_m = float(tcfg.get('align_max_shift_m', 0.15))
         self.tiles.align_max_rot_deg = float(tcfg.get('align_max_rot_deg', 6.0))
@@ -427,6 +430,9 @@ class MissionManager(Node):
         self._curtain_drawn = None                     # grid the wall was last drawn with (redrawn when the grid moves)
         self._curtain_ignore_until = 0.0               # after a new map: the detector's last old-frame points are ignored
         self.curtain_marker_pub = self.create_publisher(MarkerArray, '~/curtain_markers', latched)
+        # the curtain wall's segment for curtain_costmap_filter, which clears it out of Nav2's /map_nav and /scan_nav
+        self.curtain_wall_pub = self.create_publisher(String, '/curtain/wall', latched)
+        self.curtain_wall_pub.publish(String(data=json.dumps({'segment': None})))
         self.create_timer(1.0, self._update_curtain_wall)
         self.create_subscription(String, '/curtain/points', self._on_curtain_points, latched)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -700,6 +706,25 @@ class MissionManager(Node):
             m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.9, 0.0, 0.9
         self._curtain_drawn = tg.as_dict() if m.action == Marker.ADD else None
         self.curtain_marker_pub.publish(MarkerArray(markers=[m]))
+        self._publish_curtain_wall()
+
+    def _publish_curtain_wall(self):
+        """/curtain/wall for curtain_costmap_filter (Nav2 plans through the curtain), and the edge left out of the
+        virtual walls. The costmaps are cleared when it changes: their obstacle layers keep the old scan / virtual-wall
+        marks on the curtain."""
+        tg = self.tiles.grid
+        seg = None
+        if self._curtain_wall is not None and tg is not None:
+            (x0, y0), (x1, y1) = tg.edge(*self._curtain_wall)
+            seg = [[round(x0, 3), round(y0, 3)], [round(x1, 3), round(y1, 3)]]
+        self.tiles.curtain_wall_key = T.edge_key(tg, *self._curtain_wall) if seg is not None else None
+        if seg == getattr(self, '_curtain_wall_sent', 'unsent'):
+            return
+        self._curtain_wall_sent = seg
+        self.curtain_wall_pub.publish(String(data=json.dumps({'segment': seg})))
+        if seg is not None:
+            self.log('info', 'Curtain wall cleared from the Nav2 costmaps (/map_nav, /scan_nav, no virtual wall).')
+        self.clear_costmaps()
 
     def curtain_points(self):
         return self._curtain_pts
@@ -1895,7 +1920,7 @@ class MissionManager(Node):
             nm['old_grid'], nm['crossed'] = self.tiles.grid, set(self.tiles.stairs_crossed)
             nm['initial'] = (self.tiles.initial_tile, self.tiles.initial_left)
             nm['not_curtains'] = list(self.tiles.not_curtains)
-            nm['forward'] = self.tiles.forward          # 'behind the stairs' stays relative to the original heading
+            nm['forward'] = self.tiles.forward          # 'behind the stairs' stays relative to the climb direction
             self.log('info', f'Map up to the staircase saved: {nm["base"]}.pgm/.yaml (+ _tiles.json, tile report {self.book.path}).')
             self.event('map_saved', path=nm['base'], tile_report=self.book.path)
             # clear: stop slam_toolbox; the launch file respawns it with an empty map (map frame = odom at that moment)

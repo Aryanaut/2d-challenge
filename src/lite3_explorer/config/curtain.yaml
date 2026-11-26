@@ -13,7 +13,7 @@ curtain_detector:
     # 0.32 m too high: a whole 0.5 m wall counted as "floor level", and every wall with people / clutter standing behind it
     # became a curtain (curtstair_26_11_213531: 74 spots along the wrong wall; 0 with -0.32).
     floor_z: -0.32
-    process_hz: 2.0             # LOW rate: depth frames processed per second
+    process_hz: 4.0             # every depth frame (~1.5-2 Hz arrive); the work runs on its own thread (bag fuck_26_11_212613)
     stride: 4                   # use every 4th pixel
     run_rows: 6                 # rows (after the stride) of smooth curtain above the hem
     max_step_m: 0.03            # depth change between neighbouring rows on the curtain (it may slant, not jump)
@@ -22,7 +22,7 @@ curtain_detector:
     max_range_m: 3.5
     min_columns: 0.30           # fraction of the image width that must show the curtain
     cell_m: 0.05
-    confirm_hits: 3             # a spot of curtain counts after this many sightings (frames) ...
+    confirm_hits: 2             # a drive-by sees the curtain in ~4 frames, odom drift 5-10 cm between them: 3 hits per 5 cm cell never confirmed it (fuck_26_11_212613, 272-275 s); the colour test fired on no other frame of the run
     min_view_sep_m: 0.0      # ... of which two were taken at least this far apart (0 = off): a robot standing still sees a wall's false detection every frame
     # 3D lidar pointcloud (no depth camera needed): the standard walls are 0.5-0.6 m tall, a curtain returns only floor-level
     # points (its hem) with the tall wall seen further on. Works when the camera sits too close / too low to see the bar.

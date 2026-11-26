@@ -78,7 +78,7 @@ LATCHED="--qos-durability transient_local --qos-reliability reliable"
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
 /exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers __SP__$CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /stairs/enable /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /robot_state /robot_state/text __SP__/imu/data __SP__/leg_odom2 /odom_rebase /scene/looking"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /curtain/wall /stairs/points /stairs/markers /stairs/enable /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /robot_state /robot_state/text __SP__/imu/data __SP__/leg_odom2 /odom_rebase /scene/looking"
 
 BAG=0
 BAG_NAME=""

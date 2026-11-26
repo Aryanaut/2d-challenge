@@ -8,6 +8,8 @@
              decision.
   scene      a scene tile (scanned, mostly not traversable) shares a side with the current tile: face it, ask the AI
              to describe it, mark it explored and go back to exploring. The robot never enters it.
+  curtain_scan  curtains: true and no reachable tile: turn to face each edge of the current tile with an unvisited tile
+             behind it and look (the curtain detector), then exploring again (a curtain found -> curtain mode).
   stairs     a staircase tile (depth camera, stairs_core.py) shares a side with the current tile: square up to it, turn
              the robot's AI mode on, climb over it into the tile beyond, AI mode off, wall the staircase off, exploring.
   roller     a roller tile (depth camera + 3D lidar, roller_core.py) shares a side with the current tile: square up to
@@ -103,7 +105,9 @@ class ScanningMode(Mode):
 
     def enter(self, reason, opening=False, **kw):
         self.opening = bool(opening) or not self.ctx.tiles.ready
-        self.after_stairs = kw.get('after_stairs')       # tile the stairs mode put the robot on: checked against the scan
+        # tile the stairs / curtain mode put the robot on (odom rebased there): checked against the scan
+        self.after_stairs = kw.get('after_stairs') if kw.get('after_stairs') is not None else kw.get('after_curtain')
+        self.relocate_what = 'curtain' if kw.get('after_curtain') is not None else 'stairs'
         self.slam_waited = False
         if self.opening and self.cfg.get('opening_stairs', False):
             self._stair_detection(True)          # stair detector on for the opening scan (off again in exit)
@@ -255,24 +259,27 @@ class ScanningMode(Mode):
         return None
 
     def _relocate_after_stairs(self):
-        """After a stairs climb the tile the robot was put on came from dead reckoning (odom rebased in AI mode). The scan
-        has let SLAM place the robot in the map: if its pose is in another tile, that tile is where it is."""
+        """After a stairs climb (or a curtain crossing) the tile the robot was put on came from dead reckoning (odom
+        rebased there). The scan has let SLAM place the robot in the map: if its pose is in another tile, that tile is
+        where it is."""
         assumed, self.after_stairs = getattr(self, 'after_stairs', None), None
+        what = getattr(self, 'relocate_what', 'stairs')
         tiles = self.ctx.tiles
         pose = self.ctx.pose()
         if assumed is None or pose is None or tiles.grid is None:
             return
-        actual = tiles.relocate(assumed, pose, 'stairs: placed by the scan')
+        actual = tiles.relocate(assumed, pose, f'{what}: placed by the scan')
         if actual is None:
             return
         gx, gy = tiles.grid.center(tuple(assumed))
-        self.ctx.event('stairs_relocated', assumed=T.tile_label(tuple(assumed)), actual=T.tile_label(actual),
+        self.ctx.event(f'{what}_relocated', assumed=T.tile_label(tuple(assumed)), actual=T.tile_label(actual),
                        pose=[round(float(v), 3) for v in pose[:3]],
                        offset_m=round(math.hypot(pose[0] - gx, pose[1] - gy), 3))
+        after = 'the stairs' if what == 'stairs' else 'the curtain'
         if tuple(actual) == tuple(assumed):
-            self.ctx.log('info', f'Scan after the stairs: SLAM puts the robot on tile {T.tile_label(actual)}, as assumed.')
+            self.ctx.log('info', f'Scan after {after}: SLAM puts the robot on tile {T.tile_label(actual)}, as assumed.')
         else:
-            self.ctx.log('warn', f'Scan after the stairs: SLAM puts the robot on tile {T.tile_label(actual)}, not '
+            self.ctx.log('warn', f'Scan after {after}: SLAM puts the robot on tile {T.tile_label(actual)}, not '
                                  f'{T.tile_label(tuple(assumed))} (dead reckoning was off); the tile is corrected.')
 
     def _opening_stairs(self):
@@ -417,6 +424,8 @@ class ExploringMode(Mode):
             out.append(c.get('scene_mode', 'scene'))
         if c.get('curtains', False):
             out.append(c.get('curtain_mode', 'curtain'))
+            if c.get('curtain_scan_when_stuck', True) and c.get('curtain_scan_mode', 'curtain_scan') in self.machine.modes:
+                out.append(c.get('curtain_scan_mode', 'curtain_scan'))   # optional: unused when not in mission.modes
         if c.get('stairs', False):
             out.append(c.get('stairs_mode', 'stairs'))
         if c.get('rollers', False):
@@ -523,6 +532,10 @@ class ExploringMode(Mode):
             if hop is not None:
                 return hop
             self.unreached += [v for v in self.via_only if v not in self.unreached]   # no split: as before
+        # no reachable tile: a curtain is a wall to the 2D lidar, so look at this tile's edges for one first
+        hop = self._curtain_scan('no reachable tile')
+        if hop is not None:
+            return hop
         if self.unreached:
             self.ctx.log('warn', f'No Nav2 path to any candidate ({", ".join(self.unreached)}).')
             self.ctx.event('no_path', targets=self.unreached)
@@ -1205,6 +1218,29 @@ class ExploringMode(Mode):
                                camera_min_span_m=float(self.cfg.get('curtain_camera_min_span_m', 0.30)))
         return edge
 
+    def _curtain_scan(self, why):
+        """curtains: true. Nothing reachable from here while tiles are left: go to curtain_scan_mode, which faces each
+        edge of the current tile with an unvisited tile behind it so the curtain detector gets a look at it. Once per
+        tile until a new tile is visited (retries / recoveries on the same tile do not scan again). None = no scan."""
+        c, tiles = self.cfg, self.ctx.tiles
+        mode = c.get('curtain_scan_mode', 'curtain_scan')
+        if (not c.get('curtains', False) or not c.get('curtain_scan_when_stuck', True) or mode not in self.machine.modes
+                or tiles.grid is None or tiles.current is None or not tiles.ready):
+            return None
+        if not (self.unreached or tiles.unexplored() or tiles.unreachable):
+            return None
+        key = (tuple(tiles.current), tiles.visited_count())
+        if key in self.machine.curtain_scans:
+            return None
+        sides = curtain_scan_sides(tiles, self.machine.curtains_tried)
+        if not sides:
+            return None
+        self.machine.curtain_scans.add(key)
+        here = T.tile_label(tiles.current)
+        self.ctx.log('info', f'{why}: looking for a curtain on the {", ".join(sides)} edge(s) of tile {here} first.')
+        self.ctx.event('curtain_scan', tile=here, sides=sides, why=why)
+        return self.go(mode, f'{why}: curtain scan of tile {here}', sides=sides)
+
     def _can_defer_curtain(self):
         """curtain_last: a curtain is walked through only after the other ways from its tile (needs backtracking)."""
         return (bool(self.cfg.get('curtain_last', True)) and bool(self.cfg.get('backtracking', False))
@@ -1681,7 +1717,10 @@ class CurtainMode(Mode):
     then, then_kwargs, from_tile, came_from = None, {}, None, None
 
     def targets(self):
-        return [self.cfg.get('next_mode', 'exploring'), self.cfg.get('low_move_mode', 'recovery')]
+        out = [self.cfg.get('next_mode', 'exploring'), self.cfg.get('low_move_mode', 'recovery')]
+        if self.cfg.get('scan_after', True) and self.cfg.get('scan_mode', 'scanning') in self.machine.modes:
+            out.append(self.cfg.get('scan_mode', 'scanning'))
+        return out
 
     @property
     def is_driving(self):
@@ -1761,9 +1800,21 @@ class CurtainMode(Mode):
             self.ctx.log('info', f'Curtain: h-step gait {"ON" if on else "released"}.')
             self.ctx.event('curtain_gait', on=on)
 
+    def _imu(self):
+        """(nose_up_deg, yaw_rad, gyro_z_rad_s) from /imu/data, or None (no IMU in this context, or stale)."""
+        f = getattr(self.ctx, 'imu', None)
+        r = f() if f is not None else None
+        if r is None or r[3] > float(self.cfg.get('imu_max_age_s', 0.5)):
+            return None
+        pitch, yaw, gz, _ = r
+        return float(self.cfg.get('nose_up_sign', -1.0)) * math.degrees(pitch), yaw, gz
+
     def _start_cross(self, pose):
         # the robot stands still when the cross starts and takes ~1.5 s to get walking: the stall window only
         # opens start_grace_s later (else a curtain right in front is called a wall before the first step)
+        # the squared-up heading in the IMU's own frame: the odom rebase after the cross adds the IMU's yaw drift to it
+        imu = self._imu()
+        self.cross_imu_ref = None if imu is None else imu[1] + self._yaw_error(pose)
         self.best = self._progress(pose)
         self.best_at = self.ctx.now() + float(self.cfg.get('start_grace_s', 2.0))
         self.set_phase('cross')
@@ -1787,14 +1838,47 @@ class CurtainMode(Mode):
         if through and self.from_tile is not None:
             self.ctx.tiles.add_curtain_edge(self.from_tile, self.edge['neighbour'])   # backtracking may walk it again
         if through:
+            beyond = self._relocalise_after_cross()
             if self.then:
                 return self.go(self.then, f'curtain: {why}', curtain_ok=True, **self.then_kwargs)
+            scan = self.cfg.get('scan_mode', 'scanning')
+            if beyond is not None and self.cfg.get('scan_after', True) and scan in self.machine.modes:
+                # as after the stairs: a scan lets SLAM place the robot in the map; the tile it stands on is corrected
+                return self.go(scan, f'curtain: {why}; scanning to place the robot', after_curtain=beyond)
             return self.go(self.cfg.get('next_mode', 'exploring'), f'curtain: {why}')
         self.ctx.event('curtain_failed', neighbour=list(self.edge['neighbour']), why=why, attempts=self.attempts,
                        back_to=self.came_from)
         if self.came_from == self.then:
             return self.go(self.then, f'curtain: {why}', curtain_ok=False, **self.then_kwargs)
         return self.go(self.came_from, f'curtain: {why}')
+
+    def _relocalise_after_cross(self):
+        """Through the curtain: re-anchor odom where the cross was meant to end, the way the stairs mode does after a
+        climb. The robot squared up to the edge normal at the centre of the tile in front and walked straight along
+        it (vy held the line, wz the heading), so it is on that line at the centre of the tile behind; its heading is
+        the squared-up one plus the IMU's yaw drift since. Walking through the fabric (it drapes over the lidar and
+        the body, the scans see it move) can throw slam_toolbox's match off; the rebase plus the scan after it
+        (scan_after, tiles.relocate) puts the robot back. Returns the tile behind (marked reached), or None when
+        rebase_odom is off / there is no grid."""
+        tiles, pose = self.ctx.tiles, self.ctx.pose()
+        if not self.cfg.get('rebase_odom', True) or tiles.grid is None or not hasattr(self.ctx, 'rebase_odom'):
+            return None
+        nx, ny = self.edge['normal']
+        cx, cy = self.edge['centre_xy']
+        bx, by = cx + nx * self.edge['through_m'], cy + ny * self.edge['through_m']   # on the line, behind the curtain
+        yaw = math.atan2(ny, nx)
+        imu, ref = self._imu(), getattr(self, 'cross_imu_ref', None)
+        if imu is not None and ref is not None:
+            yaw = T.wrap(yaw + T.wrap(imu[1] - ref))
+        self.ctx.rebase_odom(bx, by, yaw)
+        beyond = tuple(tiles.grid.tile_of(bx, by))
+        tiles.mark_goal_reached(beyond, tiles.grid.center(beyond), [bx, by, yaw])
+        self.ctx.log('info', f'Curtain: odom re-anchored on tile {T.tile_label(beyond)} at ({bx:.2f}, {by:.2f}, '
+                             f'{math.degrees(yaw):+.0f} deg).')
+        self.ctx.event('odom_rebase', tile=T.tile_label(beyond), reference='curtain',
+                       pose=[round(bx, 3), round(by, 3), round(yaw, 3)],
+                       was=[round(float(v), 3) for v in pose] if pose is not None else None)
+        return beyond
 
     def _failed_try(self, why, reject=False):
         """One try did not get through: back to the tile centre and try again, or give up (reject: the edge is
@@ -2276,15 +2360,6 @@ class StairsMode(CurtainMode):
         return None
 
     # ---- FIX 3 / 4: the crossing in AI mode from the IMU (pitch + yaw), never from the frozen map pose
-    def _imu(self):
-        """(nose_up_deg, yaw_rad, gyro_z_rad_s) from /imu/data, or None (no IMU in this context, or stale)."""
-        f = getattr(self.ctx, 'imu', None)
-        r = f() if f is not None else None
-        if r is None or r[3] > float(self.cfg.get('imu_max_age_s', 0.5)):
-            return None
-        pitch, yaw, gz, _ = r
-        return float(self.cfg.get('nose_up_sign', -1.0)) * math.degrees(pitch), yaw, gz
-
     def _held(self, cond, key, hold_s):
         """True once `cond` has been true for hold_s without a break."""
         now = self.ctx.now()
@@ -2691,6 +2766,99 @@ class RollerMode(CurtainMode):
         self._hstep(False)                                 # left mid-crossing (operator command, shutdown): release
         if next_mode != self.then:
             self.ctx.tiles.open_curtains = False           # backtracking lifted them; nobody hands back to it now
+
+
+# ----------------------------------------------------------------------------------------- curtain scan
+def curtain_scan_sides(tiles, tried=()):
+    """Sides of the current tile a curtain could hide a tile behind: the neighbour is not visited, not closed (below
+    a climbed staircase), not a staircase / roller tile and not already walked into through a curtain (tried). None on
+    the initial tile while its edges hold no curtain (tiles.no_curtain_on_initial, tiles.not_curtain_mask)."""
+    cur = tuple(tiles.current)
+    initial = getattr(tiles, 'initial_tile', None) if getattr(tiles, 'no_curtain_on_initial', True) else None
+    if initial is not None and tuple(initial) == cur:
+        return []
+    out = []
+    for side, (di, dj) in CC.SIDE_STEPS.items():
+        nb = (cur[0] + di, cur[1] + dj)
+        status = tiles.tiles.get(nb, {}).get('status')
+        if (status in ('visited', 'staircase', 'roller') or nb in tiles.trail or tiles.is_closed(nb) or nb in tried
+                or (initial is not None and nb == tuple(initial))):
+            continue
+        out.append(side)
+    return out
+
+
+@register_mode('curtain_scan')
+class CurtainScanMode(Mode):
+    """No reachable tile from here (exploring): a hanging curtain is a wall to the 2D lidar, and the camera may never
+    have looked at it (bag explorer_26_11_221940: boxed in on tile 0,-1 facing an OSB wall, the scan turn skipped for
+    'no room to turn', the curtain detector saw nothing all run while the robot cycled retry / recovery for a minute).
+    So face each edge of the current tile with an unvisited tile behind it (curtain_scan_sides), the smallest turn
+    first, and stand still dwell_s there so the curtain detector gets frames (it needs confirm_hits per spot). Then back
+    to next_mode (exploring), whose decision checks the current tile's edges for a curtain before anything else.
+
+    Turns in place with ctx.drive wz (Mode.turn_towards), not Nav2 Spin: Spin and the scan's room check refuse in a
+    1 m corridor, where this matters most. Phases: turning -> dwell, per side -> (next mode)."""
+
+    def targets(self):
+        return [self.cfg.get('next_mode', 'exploring')]
+
+    def enter(self, reason, sides=None, **kw):
+        tiles = self.ctx.tiles
+        self.tile = tuple(tiles.current) if tiles.current is not None else None
+        self.sides = list(sides) if sides is not None else (
+            curtain_scan_sides(tiles, self.machine.curtains_tried) if self.tile is not None else [])
+        self.side, self.yaw, self.looked = None, None, []
+        self.ctx.set_target(None, None, None)
+        self._next_side()
+
+    def _side_yaw(self, side):
+        g = self.ctx.tiles.grid
+        di, dj = CC.SIDE_STEPS[side]
+        (cx, cy), (nx, ny) = g.center(self.tile), g.center((self.tile[0] + di, self.tile[1] + dj))
+        return math.atan2(ny - cy, nx - cx)
+
+    def _next_side(self):
+        """The side with the smallest turn from the current heading next, or 'done'."""
+        pose = self.ctx.pose()
+        if not self.sides or pose is None or self.ctx.tiles.grid is None:
+            self.side = None
+            self.set_phase('done')
+            return
+        self.side = min(self.sides, key=lambda s: abs(T.wrap(self._side_yaw(s) - pose[2])))
+        self.sides.remove(self.side)
+        self.yaw = self._side_yaw(self.side)
+        self.set_phase('turning')
+
+    def tick(self):
+        c = self.cfg
+        if self.phase == 'turning':
+            pose = self.ctx.pose()
+            if pose is None:
+                return None
+            if self.turn_towards(T.wrap(self.yaw - pose[2]), float(c.get('align_tol_deg', 10.0))):
+                self.set_phase('dwell')
+            elif self.in_phase_s() > float(c.get('turn_timeout_s', 12.0)):
+                self.ctx.stop()
+                self.ctx.log('warn', f'Curtain scan: the turn to the {self.side} edge did not finish; looking from here.')
+                self.set_phase('dwell')
+            return None
+        if self.phase == 'dwell':
+            if self.in_phase_s() < float(c.get('dwell_s', 3.0)):
+                return None
+            self.looked.append(self.side)
+            self._next_side()
+            return None
+        if self.phase == 'done':
+            here = T.tile_label(self.tile) if self.tile is not None else '?'
+            self.ctx.event('curtain_scan_done', tile=here, looked=self.looked)
+            return self.go(c.get('next_mode', 'exploring'),
+                           f'curtain scan of tile {here} done ({", ".join(self.looked) or "no edge"})')
+        return None
+
+    def exit(self, next_mode, reason):
+        if self.phase == 'turning':
+            self.ctx.stop()
 
 
 # ----------------------------------------------------------------------------------------- quickscan

@@ -10,7 +10,7 @@ line whenever the one in charge changes:
   exploring / backtracking driving   Nav2 FollowPath (RegulatedPurePursuit or MPPI)
   recovery driving                   Nav2 RecoveryMPPI, or 'omni' (mission manager /cmd_vel) after a recovery_fallback
   scanning turning                   Nav2 behavior_server Spin
-  curtain / stairs / roller / mppi / scene    mission manager, direct /cmd_vel
+  curtain / curtain_scan / stairs / roller / mppi / scene    mission manager, direct /cmd_vel
   anything else                      nothing is driving
 
 It also reads each MPPI controller's motion_model, and publishes (latched):
@@ -29,7 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
-DIRECT = ('curtain', 'stairs', 'roller', 'mppi', 'scene')          # modes that publish /cmd_vel themselves
+DIRECT = ('curtain', 'curtain_scan', 'stairs', 'roller', 'mppi', 'scene')          # modes that publish /cmd_vel themselves
 NAV2_DRIVING = ('driving', 'to_split', 'to_curtain', 'to_roller', 'to_option')
 
 

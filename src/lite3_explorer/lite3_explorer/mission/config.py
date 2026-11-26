@@ -52,6 +52,7 @@ DEFAULTS: Dict[str, Any] = {
         'size_m': 1.0,
         'reach_radius_m': 0.30,           # a tile is reached (explored) this close to its centre
         'max_failures': 2,                # failed attempts before a tile is given up on (unreachable); 0 = never
+        'no_curtain_on_initial_tile': False,   # true: curtain spots on the initial tile's edges are ignored
         'min_known': 0.5,                 # share of a tile that must be scanned before it becomes a tile
         'scene_min_known': 0.85,          # scene tile: scanned at least this much ...
         'scene_max_free': 0.80,           # ... and less than this share of the SCANNED part traversable (drawn blue hatched in RViz)
@@ -110,8 +111,8 @@ DEFAULTS: Dict[str, Any] = {
     'mission': {
         # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
         # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
-        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'stairs', 'roller', 'scene', 'mppi',
-                  'backtracking', 'recovery', 'ending', 'complete'],
+        'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'curtain_scan', 'stairs', 'roller', 'scene',
+                  'mppi', 'backtracking', 'recovery', 'ending', 'complete'],
         'initial_mode': 'idle',
         'start_mode': 'scanning',         # where set_active(true) / auto start goes
         'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
@@ -245,6 +246,8 @@ DEFAULTS: Dict[str, Any] = {
             'scene_mode': 'scene',        # (scene tiles are never driven to; the scene mode looks at them from the neighbouring tile)
             'curtains': False,            # use_curtains:=true: a curtain on the current tile's edge -> curtain mode (walk through it)
             'curtain_mode': 'curtain',
+            'curtain_scan_when_stuck': True,   # no reachable tile: face this tile's edges for a curtain first (curtain_scan_mode)
+            'curtain_scan_mode': 'curtain_scan',
             'curtain_edge_tol_m': 0.30,   # curtain spots within this of the tile edge line count as on the edge
             'curtain_min_span_m': 0.40,   # ... spread over at least this much of it
             'curtain_camera_tol_m': 0.15,  # the camera spots confirming an edge: within this of its line ...
@@ -333,9 +336,22 @@ DEFAULTS: Dict[str, Any] = {
             'max_travel_m': 1.0,          # give up after moving this far from where it started
             'timeout_s': 20.0,
         },
+        'curtain_scan': {
+            'type': 'curtain_scan',
+            'next_mode': 'exploring',
+            'dwell_s': 3.0,               # stand still facing each edge this long (the detector confirms a spot over frames)
+            'align_tol_deg': 10.0,
+            'turn_timeout_s': 12.0,       # the turn to an edge did not finish: look from where it stopped
+            'min_turn_rad_s': 0.2,
+            'max_turn_rad_s': 0.4,
+            'turn_gain': 1.0,
+        },
         'curtain': {
             'type': 'curtain',
             'next_mode': 'exploring',
+            'rebase_odom': True,          # through: odom re-anchored at the centre of the tile behind (as after the stairs) ...
+            'scan_after': True,           # ... then a scan, and the tile is corrected from where SLAM puts the robot
+            'scan_mode': 'scanning',
             'speed_mps': 0.25,            # forward speed (vx) through the curtain
             'hstep': True,                # cross in the h-step gait only (rug_hstep, held via /step_up) ...
             'gait_settle_s': 2.0,         # ... standing this long after switching it on and after releasing it

@@ -264,6 +264,10 @@ def generate_launch_description():
         Node(package=PKG, executable='curtain_detector', name='curtain_detector', output='screen',
              parameters=[lc('curtain_params'), {'use_sim_time': lc('use_sim_time')}],
              condition=IfCondition(lc('use_curtains'))),
+        # always on: Nav2's costmaps read /map_nav and /scan_nav (nav2_params*.yaml) from it; without a curtain it
+        # passes /map and /scan through unchanged
+        Node(package=PKG, executable='curtain_costmap_filter', name='curtain_costmap_filter', output='screen',
+             parameters=[{'use_sim_time': lc('use_sim_time')}]),
         # use_stairs: detecting the whole mission; else only while the mission enables it (/stairs/enable: opening scan)
         Node(package=PKG, executable='stair_detector', name='stair_detector', output='screen',
              parameters=[lc('stairs_params'), {'use_sim_time': lc('use_sim_time'),

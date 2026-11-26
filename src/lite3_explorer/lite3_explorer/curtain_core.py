@@ -438,3 +438,18 @@ def edge_crossing(grid, tile, side: str) -> dict:
     cx, cy = grid.to_world(mid_u * size, mid_v * size)
     return {'side': side, 'neighbour': (tile[0] + di, tile[1] + dj), 'centre_xy': (cx, cy), 'normal': normal,
             'yaw': math.atan2(normal[1], normal[0]), 'through_m': 0.5 * size, 'spots': 0, 'span_m': size}
+
+
+def segment_band_mask(xs, ys, seg, half_width_m: float, end_margin_m: float = 0.0) -> np.ndarray:
+    """True for the points (xs, ys: same-shape arrays, map frame) within half_width_m of the segment seg ((x0, y0),
+    (x1, y1)), leaving out the last end_margin_m at each end (the wall posts the curtain hangs between stay).
+    Used to clear the curtain from the costmap inputs (curtain_costmap_filter)."""
+    (x0, y0), (x1, y1) = seg
+    xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+    length = math.hypot(x1 - x0, y1 - y0)
+    if length < 1e-6:
+        return np.zeros(xs.shape, bool)
+    ux, uy = (x1 - x0) / length, (y1 - y0) / length
+    along = (xs - x0) * ux + (ys - y0) * uy                    # distance along the segment from its start
+    across = -(xs - x0) * uy + (ys - y0) * ux                  # signed distance from its line
+    return (np.abs(across) <= half_width_m) & (along >= end_margin_m) & (along <= length - end_margin_m)

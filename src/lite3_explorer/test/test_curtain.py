@@ -670,3 +670,102 @@ def test_curtain_wall_moves_to_an_edge_with_clearly_more_camera_spots():
     assert pick_curtain_wall(g, np.array(wall + on_x(4.0, 16)), current=((1, 0), 'E')) is not None   # same edge, other name
     assert pick_curtain_wall(g, np.array(wall), current=((1, 0), 'E')) is None                  # already shown: keep
     assert pick_curtain_wall(g, np.array(on_x(4.0, 3)), current=cur) is not None                # current lost all spots
+
+
+# ------------------------------------------------------------------------------------------------ curtain scan
+def _stuck_on_tile_1(flat=None):
+    """3 m corridor, no Nav2 path to 2,0 (a curtain on the E edge of 1,0 looks like a wall to the lidar)."""
+    ctx, m = make({'modes.exploring.curtains': True, 'modes.exploring.scan_after_reach': False, **(flat or {})},
+                  length_m=3.0)
+    ctx.no_path = {'2,0'}
+    d = Drive(ctx, np.zeros((0, 4)))
+    return ctx, m, d
+
+
+def test_no_reachable_tile_scans_for_a_curtain_and_walks_through_it():
+    ctx, m, d = _stuck_on_tile_1()
+    curtain = spots(2.05, 0.1, 0.9)
+    # the detector only sees the curtain once the robot looks at it in the curtain scan
+    ctx.curtain_points = lambda: curtain if 'curtain_scan' in modes_seen(m) else np.zeros((0, 4))
+    assert run_until(ctx, m, lambda: 'curtain' in modes_seen(m))
+    seen = modes_seen(m)
+    assert seen.index('curtain_scan') < seen.index('curtain'), seen
+    scan = [dd for k, dd in ctx.events if k == 'curtain_scan']
+    assert scan and scan[0]['tile'] == '1,0' and 'E' in scan[0]['sides'] and 'W' not in scan[0]['sides']
+    assert 'recovery' not in seen[:seen.index('curtain')]
+
+
+def test_curtain_scan_faces_each_candidate_edge_once_per_tile():
+    ctx, m, d = _stuck_on_tile_1()
+    faced = []
+
+    def on_phase(mode, phase, orig=ctx.on_mode_change):
+        if mode == 'curtain_scan' and phase == 'dwell':
+            faced.append(round(math.degrees(ctx.pose_[2])) % 360)
+        orig(mode, phase)
+    ctx.on_mode_change = on_phase
+    run_until(ctx, m, lambda: modes_seen(m).count('recovery') >= 2, n=300)
+    seen = modes_seen(m)
+    assert seen.count('curtain_scan') == 1, seen              # retries / recoveries on the same tile: no second scan
+    sides = [dd for k, dd in ctx.events if k == 'curtain_scan_done'][0]['looked']
+    assert sides[0] == 'E' and sorted(sides) == sorted(['E', 'N', 'S'])   # smallest turn first, never back to 0,0
+    for a, want in zip(faced, (0, 90, 270)):
+        assert min(abs(a - want), 360 - abs(a - want)) <= 15, faced
+
+
+def test_no_curtain_scan_without_curtains():
+    ctx, m, d = _stuck_on_tile_1({'modes.exploring.curtains': False})
+    run_until(ctx, m, lambda: 'recovery' in modes_seen(m), n=200)
+    assert 'curtain_scan' not in modes_seen(m)
+
+
+def test_curtain_on_the_initial_tile_when_allowed():
+    """explorer_26_11_223230: the curtain was an edge of the start tile. With tiles.no_curtain_on_initial_tile false
+    (the robot's setting) it is walked through from the start tile."""
+    ctx, m, d = build(pose_yaw=0.0, initial_curtain=False)
+    ctx.tiles.no_curtain_on_initial = False
+    assert run_until(ctx, m, lambda: 'curtain' in modes_seen(m), n=60)
+    assert ctx.tiles.not_curtain_mask(d.pts).all()
+
+
+# ------------------------------------------------------------------------------------------- costmap filter
+def test_segment_band_mask_keeps_the_posts():
+    seg = ((0.0, 0.0), (1.0, 0.0))
+    xs = np.array([0.02, 0.5, 0.5, 0.98, 0.5])
+    ys = np.array([0.0, 0.1, 0.3, 0.0, -0.14])
+    assert cc.segment_band_mask(xs, ys, seg, 0.15, 0.08).tolist() == [False, True, False, False, True]
+
+
+def test_curtain_cleared_from_the_map_and_the_scan():
+    from nav_msgs.msg import OccupancyGrid
+    from sensor_msgs.msg import LaserScan
+    from lite3_explorer.curtain_costmap_filter import clear_map, scan_hits
+    g = OccupancyGrid()
+    g.info.width = g.info.height = 40                              # 2 x 2 m from (0, 0)
+    g.info.resolution = 0.05
+    g.info.origin.orientation.w = 1.0
+    data = np.zeros((40, 40), np.int8)
+    data[:, 20] = 100                                              # a wall along x = 1.0..1.05
+    data[5, 5] = 100                                               # something elsewhere
+    g.data = data.reshape(-1).tolist()
+    seg = ((1.0, 0.5), (1.0, 1.5))                                 # the curtain: the middle metre of that wall
+    assert clear_map(g, seg, 0.15, 0.08) > 0
+    out = np.array(g.data, np.int8).reshape(40, 40)
+    assert (out[12:28, 20] == 0).all()                             # y 0.6..1.4 free
+    assert out[2, 20] == 100 and out[38, 20] == 100 and out[5, 5] == 100   # the rest of the wall stays
+    s = LaserScan()
+    s.angle_min, s.angle_increment, s.range_min, s.range_max = -0.5, 0.5, 0.1, 10.0
+    s.ranges = [1.0 / math.cos(0.5), 1.0, 1.0 / math.cos(0.5)]     # from (0, 1) facing +x: hits x = 1 at y 0.45, 1, 1.55
+    assert scan_hits(s, (0.0, 1.0, 0.0), seg, 0.2, 0.08).tolist() == [1]
+
+
+def test_detected_curtain_edge_is_no_virtual_wall():
+    from lite3_explorer import tiles as TT
+    ctx, m, d = build(pose_yaw=0.0)
+    run_until(ctx, m, lambda: ctx.tiles.ready, n=20)
+    tg = ctx.tiles.grid
+    north = tg.edge((0, 0), 'N')                                   # the corridor wall along y = 1
+    rounded = lambda segs: {tuple((round(x, 3), round(y, 3)) for x, y in sg) for sg in segs}
+    assert tuple((round(x, 3), round(y, 3)) for x, y in north) in rounded(ctx.tiles.virtual_walls())
+    ctx.tiles.curtain_wall_key = TT.edge_key(tg, (0, 0), 'N')
+    assert tuple((round(x, 3), round(y, 3)) for x, y in north) not in rounded(ctx.tiles.virtual_walls())

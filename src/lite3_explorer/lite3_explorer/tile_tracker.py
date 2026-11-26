@@ -81,6 +81,8 @@ class TileTracker:
         # a wall, so these edges become virtual walls; with open_curtains (backtracking) they are left out.
         self.curtain_edges: Dict[tuple, tuple] = {}
         self.open_curtains = False
+        self.curtain_wall_key = None       # edge key of the detected curtain (mission_manager): never a virtual wall
+        self.no_curtain_on_initial = True  # the initial tile's edges never hold a curtain (tiles.no_curtain_on_initial_tile)
         # curtains left for later: a curtain on an edge of a split tile whose other way was taken first.
         # {tile behind the curtain: {'tile': split tile, 'side': edge side}}. Backtracking walks through them.
         self.deferred_curtains: Dict[tuple, dict] = {}
@@ -100,8 +102,8 @@ class TileTracker:
         # staircase may be taken although tiles are still unexplored (stairs_ready)
         self.stairs_forced = False
         # (axis, sign): the grid axis (0 = i, 1 = j) closest to the robot's original heading in the start tile and the
-        # direction along it (+1 / -1), set by establish, carried over to a new map. 'Behind' / 'beyond' the staircase
-        # are measured along it (is_closed).
+        # direction along it (+1 / -1), set by establish, replaced by the staircase's climb direction once it is found
+        # (_assign_stairs), carried over to a new map. 'Behind' / 'beyond' the staircase are measured along it (is_closed).
         self.forward: Optional[Tuple[int, int]] = None
         # reference tiles beyond staircases (stairs_core.beyond_reference): off-grid squares turned to the staircase, one
         # tile past it along the steps. The stairs mode makes one per climb and rebases odom to it afterwards ('used').
@@ -326,6 +328,8 @@ class TileTracker:
         open_curtains (backtracking) edges with a curtain are left out."""
         segs = []
         skip = set(self.curtain_edges) if self.open_curtains else set()
+        if self.curtain_wall_key is not None:
+            skip.add(self.curtain_wall_key)             # Nav2 may plan through the detected curtain (curtain_costmap_filter)
         if start_wall and getattr(self, 'start_wall', None):
             segs.append(self.start_wall)
         if self.grid is not None:
@@ -796,10 +800,10 @@ class TileTracker:
         self.version += 1
 
     def not_curtain_edges(self) -> List[tuple]:
-        """(tile, side) of every edge that cannot hold a curtain: the rejected ones and the four edges of the initial
-        tile."""
+        """(tile, side) of every edge that cannot hold a curtain: the rejected ones and (no_curtain_on_initial) the four
+        edges of the initial tile."""
         out = list(self.not_curtains)
-        if self.initial_tile is not None:
+        if self.initial_tile is not None and self.no_curtain_on_initial:
             out += [(tuple(self.initial_tile), side) for side in 'NESW']
         return out
 
@@ -875,6 +879,11 @@ class TileTracker:
             return False
         tile = max(sorted(found), key=lambda t: found[t]['points'])
         self.stairs = {tile: found[tile]}
+        # 'beyond' the staircase is where its steps lead, not where the robot faced at the start: the maze may have turned
+        # back since, and then the start heading would close the very tiles that lead up to the stairs
+        ux, uy = found[tile]['ascent']
+        if ux or uy:
+            self.forward = forward_axis(math.atan2(uy, ux) - self.grid.yaw)
         return True
 
     def stairs_ready(self) -> bool:
@@ -910,8 +919,8 @@ class TileTracker:
         return next(iter(self.stairs)) if self.stairs else None
 
     def is_closed(self, tile) -> bool:
-        """Tiles the robot may not traverse because of the staircase, along the grid axis (i or j) of the robot's
-        original heading in the start tile (forward):
+        """Tiles the robot may not traverse because of the staircase, along the grid axis (i or j) its steps climb
+        (forward, set when the staircase is found):
           before the climb (staircase found, not crossed): every tile BEYOND it (further along forward than it);
           after the climb: every tile BEHIND it (on the start side) -- no way back over or around the stairs.
         Tiles level with the staircase (same i, or same j when heading along j) stay open. Nothing is closed before a

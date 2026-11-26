@@ -796,6 +796,19 @@ def test_facing_minus_j():
     assert _closed(tiles) == _row(tiles, 0)
 
 
+def test_the_closed_side_follows_the_climb_direction_not_the_start_heading():
+    from test_mission import corridor
+    tiles = TileTracker()
+    tiles.align_on_entry = False
+    tiles.set_map(*corridor(4.0, 4.0))
+    tiles.establish([0.5, 1.5, math.pi])                                      # started facing -x ...
+    tiles.scanned_open_tiles = lambda: set()
+    assert tiles.set_stair_points([[2.3 + 0.1 * k, 1.5, 1.0, 0.0] for k in range(5)])   # ... the steps climb towards +x
+    tiles.update(force=True)
+    assert tiles.forward == (0, 1)
+    assert _closed(tiles) == _column(tiles, 3)                                # the approach (columns 0, 1) stays open
+
+
 def test_forward_axis_picks_the_closest_grid_axis():
     from lite3_explorer.tile_tracker import forward_axis
     assert forward_axis(0.3) == (0, 1)

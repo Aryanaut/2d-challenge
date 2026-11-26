@@ -209,7 +209,7 @@ local_costmap:
         enabled: true
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_nav                 # /scan without the curtain (curtain_costmap_filter)
           max_obstacle_height: 2.0
           clearing: true
           marking: true
@@ -243,12 +243,13 @@ global_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
+        map_topic: /map_nav                  # /map with the curtain cleared (curtain_costmap_filter)
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
         observation_sources: scan virtual_walls
         scan:
-          topic: /scan
+          topic: /scan_nav                 # /scan without the curtain (curtain_costmap_filter)
           max_obstacle_height: 2.0
           clearing: true
           marking: true

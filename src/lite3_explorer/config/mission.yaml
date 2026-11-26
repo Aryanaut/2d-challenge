@@ -40,6 +40,8 @@ mission_manager:
                                              # start read 0.55-0.70 scanned / free 0.5-0.8). 0 = off. Runtime:
                                              #   ros2 param set /mission_manager tiles.scene_lidar_min_known 0.0
       initial_clear_m: 0.40                  # the initial tile is closed (walled off) only once the robot is this far outside it
+      no_curtain_on_initial_tile: false      # true: curtain spots on the initial tile's edges are ignored (false: explorer_26_11_223230,
+                                             # the curtain was the start tile's W edge, right in front of the robot)
       align_on_entry: true                   # every tile entry: nudge the grid so that tile's edges lie on the detected walls ...
       align_max_shift_m: 0.15                # ... (an edge further than this from its wall is left alone)
       align_max_rot_deg: 6.0                 # ... (turn at most this much towards the wall angle)
@@ -82,7 +84,7 @@ mission_manager:
 
     # ---------------------------------------------------------------- mission manager
     mission:
-      modes: [idle, scanning, exploring, quickscan, curtain, stairs, roller, scene, mppi, backtracking, recovery, ending, complete]   # instances to build (configured under modes.<name>)
+      modes: [idle, scanning, exploring, quickscan, curtain, curtain_scan, stairs, roller, scene, mppi, backtracking, recovery, ending, complete]   # instances to build (configured under modes.<name>)
       initial_mode: idle
       start_mode: scanning                   # set_active(true) / auto start goes here
       recovery_mode: recovery                # the stuck supervisor sends the robot here
@@ -266,6 +268,10 @@ mission_manager:
         curtain_lidar_only: false             # no camera spots at all: walk through the lidar-only edge with the most spots (false = never)
         curtain_last: true                   # another reachable tile beside the curtain's tile: explore it first (the tile becomes the
                                              # last split); backtracking returns and walks through the curtain afterwards
+        curtain_scan_when_stuck: true        # no reachable tile while tiles are left: curtain_scan first (face each edge of this tile with an
+                                             # unvisited tile behind it, look dwell_s), once per tile until a new tile is visited
+                                             # (explorer_26_11_221940: boxed in facing a wall, no room for the scan turn, curtain never seen)
+        curtain_scan_mode: curtain_scan
         stairs: false                        # use_stairs:=true (launch / explorer.sh --stairs): a staircase tile (stair_detector) shares a
                                              # side with the current tile -> stairs mode: AI mode on, climb over it, AI mode off, wall it off
         stair_min_facing: 0.5                # climb only from a side the steps go up from (cos of ascent vs the way across; 0.5 = 60 deg)
@@ -340,6 +346,16 @@ mission_manager:
         search_m: 1.0                        # how far around the robot to look for clear floor
         max_travel_m: 1.0
         timeout_s: 20.0
+      curtain_scan:
+        type: curtain_scan                   # no reachable tile: turn in place (direct wz, not Nav2 Spin) to face each candidate edge, look, then exploring
+        next_mode: exploring
+        dwell_s: 3.0                         # stand still facing each edge this long (depth ~1.5-2 Hz, confirm_hits frames per spot)
+        align_tol_deg: 10.0
+        turn_timeout_s: 12.0                 # the turn to an edge did not finish: look from where it stopped
+        min_turn_rad_s: 0.2
+        max_turn_rad_s: 0.4
+        turn_gain: 1.0
+        turn_lead_s: 0.6                     # the dog turns on ~this long after wz drops (Mode.turn_towards)
       curtain:
         type: curtain                        # a curtain along the current tile's edge: go to the tile centre, square up, walk through with vx, go back to exploring
         next_mode: exploring                 # through it (backtracking: back to backtracking); given up: back to the mode that was running before
@@ -360,8 +376,12 @@ mission_manager:
         blocked_gives_up: true               # blocked = give up on this curtain at once (it was a wall); false: retry up to max_attempts
         timeout_gives_up: true               # cross_timeout_s ran out = give up at once and unmark the edge as a curtain (detection goes on
                                              # elsewhere); false: retry up to max_attempts, unmarked when given up. Blocked unmarks too.
-                                             # The initial tile's edges never hold a curtain.
+                                             # The initial tile's edges hold no curtain only with tiles.no_curtain_on_initial_tile.
         max_attempts: 3                      # tries (back to the centre, square up, walk) before giving up
+        rebase_odom: true                    # through: odom re-anchored at the centre of the tile behind, on the line walked, heading =
+                                             # squared-up heading + IMU yaw drift (as stairs rebase_yaw: heading)
+        scan_after: true                     # ... then a scan (scan_mode) and the tile is corrected from where SLAM puts the robot
+        scan_mode: scanning                  # (not when backtracking walked it: back to backtracking straight away)
         speed_mps: 0.25                      # forward speed (vx) through the curtain
         hstep: true                          # cross only in the h-step gait (rug_hstep, held via /step_up from squared up to through)
         gait_settle_s: 2.0                   # stand still this long after switching h-step on and after releasing it

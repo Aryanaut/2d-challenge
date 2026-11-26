@@ -163,6 +163,7 @@ class ModeMachine:
         self.scenes_done = set()           # scene tiles already looked at (never twice)
         self.scene_calls = {}              # scene tile label -> (pose, AI call): described in the background (scene mode)
         self.curtains_tried = set()        # tiles behind a curtain that was already walked into (never twice)
+        self.curtain_scans = set()         # (tile, visited count) a curtain scan ran on (once per tile until a new tile is visited)
         self.stairs_tried = set()          # staircase tiles the stairs mode already went for (never twice)
         self.scanned_tile = None           # tile the last scan finished on (the end condition waits for a scan on the last tile)
         self.rollers_tried = set()         # roller tiles the roller mode already went for (never twice)
@@ -181,6 +182,7 @@ class ModeMachine:
     def reset_for_new_map(self):
         """A new map (and tile grid) starts: everything remembered by tile label belongs to the old grid."""
         self.scenes_done, self.curtains_tried, self.stairs_tried = set(), set(), set()
+        self.curtain_scans = set()
         if self.scene_calls:
             self.ctx.log('warn', f'New map: dropping {len(self.scene_calls)} scene description(s) still pending '
                                  f'({", ".join(sorted(self.scene_calls))}): their tile labels belong to the old grid.')
