@@ -74,7 +74,7 @@ from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import ComputePathToPose, Spin
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import OccupancyGrid, Path
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import Log, SetParametersResult
 from sensor_msgs.msg import CameraInfo, Imu, LaserScan, PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, Empty, Int32MultiArray, String
@@ -93,6 +93,7 @@ from lite3_explorer.llm_link import LlmLink
 from lite3_explorer.mission.config import DEFAULTS, merge_flat, mode_cfg
 from lite3_explorer.mission.core import ModeMachine
 from lite3_explorer.mission.traversal import FAILED, SUCCEEDED, build_traversal
+from lite3_explorer.mission_log import MissionLog, kind_of
 from lite3_explorer.tile_reports import TileReportBook
 from lite3_explorer.tile_tracker import TileTracker
 
@@ -114,6 +115,9 @@ class Nav2Scanner:
         self.behavior_active = False
         self._state_future = None
         self.seq, self.handle, self.status = 0, None, None
+        # The dog keeps turning after Spin's last command (bag fullrun_26_11_210206: -60 deg ended 7 deg past, +80 deg
+        # ~10 deg past, in rug_hstep): ask for this much less, never less than half the turn (modes.scanning.spin_lead_deg).
+        self.lead_deg = 6.0
 
     def poll_behavior_server(self):
         """The spin server exists once behavior_server is configured, but rejects goals until it is ACTIVE."""
@@ -140,9 +144,10 @@ class Nav2Scanner:
         seq = self.seq
         self.handle, self.status = None, None
         goal = Spin.Goal()
-        goal.target_yaw = math.radians(deg)
+        ask = math.copysign(max(abs(deg) - self.lead_deg, 0.5 * abs(deg)), deg)
+        goal.target_yaw = math.radians(ask)
         goal.time_allowance = DurationMsg(sec=int(time_allowance_s))
-        self.node.get_logger().info(f'Spin {deg:+.0f} deg.')
+        self.node.get_logger().info(f'Spin {deg:+.0f} deg (asking {ask:+.0f}: coasts the rest).')
         if not self.client.wait_for_server(timeout_sec=0.5):
             self.status = FAILED
             return
@@ -267,6 +272,10 @@ class MissionManager(Node):
                                    self.run_dir, self.use_ai, float(tcfg['reach_radius_m']))
         self.report_args, self.report_tries, self.report_calls = {}, {}, {}
         self.query_count = 0
+        mlc = cfg.get('mission_log', {})
+        self.mission_log = MissionLog(self.run_dir, time.time(), int(mlc.get('log_tail', 300))) \
+            if mlc.get('enabled', True) else None
+        self.book.mission_log = self.mission_log
 
         self.tiles = TileTracker(float(tcfg['size_m']), float(tcfg['reach_radius_m']), int(tcfg['max_failures']),
                                  on_reached=self._on_tile_reached,
@@ -306,6 +315,7 @@ class MissionManager(Node):
         self._action_clients = {}
         self._traversals = {}
         self.scanner = Nav2Scanner(self)
+        self.scanner.lead_deg = float(cfg['modes'].get('scanning', {}).get('spin_lead_deg', 6.0))
         self.paths = Nav2PathChecker(self)
         self.wall_paths = Nav2PathChecker(self)      # own checker: re-evaluates the tiles after the virtual walls change
         self._walls_sig = None
@@ -377,7 +387,15 @@ class MissionManager(Node):
         self.roller_mode_pub = self.create_publisher(Bool, '/roller_mode', latched)
         self.roller_mode_pub.publish(Bool(data=False))
         self._rise_target, self._rise_from, self._rise_max = None, 0.0, None
+        # depth fallback (step_up_depth): a step up seen ahead by step_ahead_detector switches /step_up for the tile being
+        # driven to as well, where the tile elevations miss it
+        self._step_ahead = None                        # (detection dict, time) of the last {"step": true} frame
+        self._depth_tile, self._depth_step = None, None  # the step tile a depth step was seen for, and that detection
+        self.create_subscription(String, '/step_ahead', self._on_step_ahead, 10)
         self.complete_pub.publish(Bool(data=False))
+
+        if self.mission_log is not None:
+            self._setup_mission_log(cfg.get('mission_log', {}))
 
         self.machine = ModeMachine(self, cfg)
         self.get_logger().info(
@@ -747,6 +765,21 @@ class MissionManager(Node):
             self.tiles.update()
         return SetParametersResult(successful=True)
 
+    def _prop_this_side(self, p, x0, y0, push):
+        """A prop point that prop_votes.place pushed across a WALLED tile edge goes back to the camera's side of it: the
+        ray stopped at the prop (or the wall it stands against), and the camera cannot see through a wall. Bag
+        fuck_26_11_212613: the cleaning-room cart against tile 2,0's E wall voted 3,0 a scene tile 9 times, 2,0 never,
+        and the robot drove into the cleaning room."""
+        r = math.hypot(p[0] - x0, p[1] - y0)
+        if r < 1e-6:
+            return p
+        back = push + 0.10                                   # behind the hit, a little inside the near tile
+        bx, by = p[0] - back * (p[0] - x0) / r, p[1] - back * (p[1] - y0) / r
+        far, near = tuple(self.tiles.grid.tile_of(p[0], p[1])), tuple(self.tiles.grid.tile_of(bx, by))
+        if far != near and T.side_towards(near, far) is not None and not self.tiles._open_between(near, far):
+            return (round(bx, 3), round(by, 3)) + tuple(p[2:])
+        return p
+
     def _on_detections(self, msg):
         """/perception/detections: place the scene props on the map (prop_votes.place) and count them per tile."""
         if not self.tiles.ready or self.tiles.map is None:
@@ -769,9 +802,12 @@ class MissionManager(Node):
             if rate > float(tcfg.get('prop_max_turn_dps', 30.0)):
                 return
         grid, info = self.tiles.map
+        cam_x, push = float(tcfg.get('prop_camera_x_m', 0.252)), float(tcfg.get('prop_push_m', 0.15))
         pts = PV.place(dets, pose, grid, info, fx=self._prop_cam[0], cx=self._prop_cam[1],
-                       cam_x=float(tcfg.get('prop_camera_x_m', 0.252)), props=labels,
+                       cam_x=cam_x, props=labels, push_m=push,
                        min_conf=float(tcfg.get('prop_min_conf', 0.35)), max_range_m=float(tcfg.get('prop_max_range_m', 3.0)))
+        x0, y0 = pose[0] + cam_x * math.cos(pose[2]), pose[1] + cam_x * math.sin(pose[2])
+        pts = [self._prop_this_side(p, x0, y0, push) for p in pts]
         here = tuple(self.tiles.grid.tile_of(pose[0], pose[1]))
         pts = [p for p in pts if tuple(self.tiles.grid.tile_of(p[0], p[1])) != here]   # the tile the robot stands on is no scene
         for tile in self.tiles.add_prop_points(pts):
@@ -945,6 +981,7 @@ class MissionManager(Node):
             return                                # recovery keeps the gait: /step_up stays as it was
         on = False
         step_tile = (self._step_tile or self.target[0]) if self.target else None
+        depth = self._update_depth_step(step_tile)
         if self.cfg.get('step_up_gait', True) and step_tile and self.tiles.ready:
             if self._rise_target != step_tile:
                 self._rise_target, self._rise_max = step_tile, None
@@ -964,14 +1001,45 @@ class MissionManager(Node):
         else:
             self._rise_target, self._rise_max = None, None
         rise = on
-        on = on or getattr(self, '_hstep_hold', False)       # the roller mode crossing a roller
+        on = on or depth is not None or getattr(self, '_hstep_hold', False)   # depth fallback; the roller mode crossing
         if on != self._step_up:
             self._step_up = on
             self.step_up_pub.publish(Bool(data=on))
-            self.log('info', 'Crossing a roller / curtain: h-step gait.' if on and not rise else
-                     f'Target tile {step_tile or "-"}: '
-                     + (f'{self._rise_max:+.2f} m above the start tile: h-step gait.' if on else 'no step up: terrain gait.'))
-            self.event('step_up', on=on, tile=step_tile)
+            self.log('info', f'Target tile {step_tile or "-"}: '
+                     + (f'{self._rise_max:+.2f} m above the start tile: h-step gait.' if rise else
+                        f'depth camera sees a step up {depth["rise_m"] * 100:+.0f} cm, {depth["dist_m"]:.2f} m ahead: '
+                        f'h-step gait.' if depth is not None else
+                        'crossing a roller / curtain: h-step gait.' if on else 'no step up: terrain gait.'))
+            self.event('step_up', on=on, tile=step_tile, by='elevation' if rise else 'depth' if depth is not None
+                       else 'hstep_hold' if on else None)
+
+    def _on_step_ahead(self, msg):
+        """step_ahead_detector: one JSON per depth frame; {"step": true, ...} = a step up ahead of the body."""
+        try:
+            det = json.loads(msg.data)
+        except ValueError:
+            return
+        if not det.get('step'):
+            return
+        self._step_ahead = (det, self.now())
+        if self._depth_step is None and self.cfg.get('step_up_depth', True):
+            self._update_step_up()
+
+    def _update_depth_step(self, step_tile):
+        """The depth fallback for /step_up: a step seen ahead (in the last step_up_depth_max_age_s) while driving to
+        step_tile holds the h-step gait until step_tile changes, like the elevation rule (the step leaves the camera view
+        before the rear legs are up). Returns that detection, or None."""
+        if not (self.cfg.get('step_up_gait', True) and self.cfg.get('step_up_depth', True) and step_tile):
+            self._depth_tile, self._depth_step = None, None
+            return None
+        if self._depth_tile != step_tile:
+            self._depth_tile, self._depth_step = step_tile, None
+        if self._depth_step is None and self._step_ahead is not None:
+            det, t = self._step_ahead
+            if self.now() - t <= float(self.cfg.get('step_up_depth_max_age_s', 1.0)):
+                self._depth_step = det
+                self.event('step_ahead', tile=step_tile, **{k: det.get(k) for k in ('rise_m', 'dist_m', 'at_edge')})
+        return self._depth_step
 
     def publish_goal(self, pose_stamped, profile):
         self.goal_pub.publish(pose_stamped)
@@ -1408,6 +1476,125 @@ class MissionManager(Node):
         except OSError as exc:
             self.get_logger().error(f'Cannot write the tile report {self.book.path}: {exc}', throttle_duration_sec=30.0)
 
+    # ===================================================== perception + mission reporter, into the tile report
+    def _setup_mission_log(self, mlc):
+        self._ml_dirty = False
+        self._ml_groups = {**{n.lstrip('/'): 'perception' for n in mlc.get('perception_nodes', [])},
+                           **{n.lstrip('/'): 'reporter' for n in mlc.get('reporter_nodes', [])}}
+        self._ml_min_level = int(mlc.get('min_log_level', 20))
+        def safe(cb):          # the report is a side job: a bad message must never take the mission manager down
+            def run(msg):
+                try:
+                    cb(msg)
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().error(f'tile report ({cb.__name__}): {exc!r}', throttle_duration_sec=10.0)
+            return run
+        if mlc.get('event_topic'):
+            self.create_subscription(String, mlc['event_topic'], safe(self._on_perception_event), 50)
+        if mlc.get('qr_topic'):
+            self.create_subscription(String, mlc['qr_topic'], safe(self._on_qr_detection), 20)
+        if mlc.get('qr_text_topic'):
+            self.create_subscription(String, mlc['qr_text_topic'], safe(self._on_qr_text), 20)
+        if mlc.get('result_topic'):    # latched + reliable like the reporter's publisher
+            self.create_subscription(String, mlc['result_topic'], safe(self._on_mission_result), QoSProfile(
+                depth=50, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        if self._ml_groups:
+            self.create_subscription(Log, '/rosout', safe(self._on_rosout), QoSProfile(
+                depth=1000, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE))
+        self.create_timer(5.0, self._flush_mission_log)    # log lines only mark the report dirty
+
+    def _tile_at(self, xy):
+        """Tile label "i,j" of a map point (None before the tile grid exists)."""
+        if xy is None or not self.tiles.ready:
+            return None
+        return T.tile_label(self.tiles.grid.tile_of(float(xy[0]), float(xy[1])))
+
+    def _record_sighting(self, kind, label, thing_xy=None, robot_xy=None, t=None, **kw):
+        if robot_xy is None:
+            p = self.pose()
+            robot_xy = p[:2] if p is not None else None
+        tile = self._tile_at(thing_xy if thing_xy is not None else robot_xy)
+        if self.tiles.ready:
+            self.mission_log.fill_tiles(self._tile_at)   # those seen before the grid existed (so they merge with this one)
+        s = self.mission_log.sighting(t or time.time(), kind, label, tile=tile,
+                                      pos=thing_xy if thing_xy is not None else robot_xy,
+                                      robot_tile=self._tile_at(robot_xy), robot_pos=robot_xy, **kw)
+        if s is None:
+            return
+        self.event('detection', what=kind, label=label, tile=tile, pos=s['pos'], robot_tile=s['robot_tile'])
+        self.log('info', f'Detected {kind} {label!r} on tile {tile or "?"} (robot on {s["robot_tile"] or "?"}).')
+        self._write_book(finished=self.machine.finished_reason is not None)
+
+    @staticmethod
+    def _json(msg):
+        try:
+            d = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return d if isinstance(d, dict) else None
+
+    def _on_perception_event(self, msg):
+        ev = self._json(msg)
+        if ev is None:
+            return
+        loc, rp = ev.get('location') or {}, ev.get('robot_pose') or {}
+        xy = loc.get('xy')
+        robot_xy = [rp['x'], rp['y']] if 'x' in rp and 'y' in rp else None
+        st = ev.get('stamp') or {}
+        t = st.get('sec', 0) + st.get('nanosec', 0) * 1e-9 if st.get('sec') else None
+        kind = kind_of(ev)
+        notes = [f'{loc["range_m"]:.1f} m' if isinstance(loc.get('range_m'), (int, float)) else '']
+        if kind == 'survivor' and 'qr_in_view' in ev:
+            notes.append('QR in view' if ev['qr_in_view'] else 'no QR in view')
+        if ev.get('simulated'):
+            notes.append('sim')
+        self._record_sighting(kind, str(ev.get('label', '')), xy if xy and len(xy) >= 2 else None, robot_xy, t,
+                              confidence=ev.get('confidence'), source='perception',
+                              note=', '.join(n for n in notes if n))
+
+    def _on_qr_detection(self, msg):
+        d = self._json(msg)
+        if d is None:
+            return
+        mp = d.get('map_point')
+        xy = mp[:2] if isinstance(mp, (list, tuple)) and len(mp) >= 2 and None not in mp[:2] else None
+        text = str(d.get('decoded') or d.get('text') or '')
+        note = f'raw {d["text"]!r}' if d.get('text') and d.get('decoded') and d['text'] != d['decoded'] else ''
+        if isinstance(d.get('distance_m'), (int, float)):
+            note = ', '.join(x for x in (note, f'{d["distance_m"]:.1f} m') if x)
+        self._record_sighting('qr', text, xy, t=d.get('first_seen_unix'),
+                              source=f'qr_scanner ({d.get("camera", "?")} camera)', note=note)
+
+    def _on_qr_text(self, msg):
+        txt = msg.data.strip()
+        if txt.startswith('{'):
+            d = self._json(msg) or {}
+            txt = str(d.get('message') or d.get('decoded') or d.get('text') or '').strip()
+        if txt:
+            self._record_sighting('qr', txt, source='perception qr_text')
+
+    def _on_mission_result(self, msg):
+        d = self._json(msg)
+        if d is None:
+            return
+        self.mission_log.result(time.time(), d)
+        self.event('mission_result', result=d)
+        self._write_book(finished=self.machine.finished_reason is not None)
+
+    def _on_rosout(self, msg):
+        group = self._ml_groups.get(msg.name.lstrip('/').split('.')[-1]) or self._ml_groups.get(msg.name.lstrip('/'))
+        if group is None or msg.level < self._ml_min_level:
+            return
+        self.mission_log.log_line(group, msg.stamp.sec + msg.stamp.nanosec * 1e-9, msg.level, msg.name, msg.msg)
+        self._ml_dirty = True
+
+    def _flush_mission_log(self):
+        if self.tiles.ready and self.mission_log.fill_tiles(self._tile_at):
+            self._ml_dirty = True
+        if self._ml_dirty:
+            self._ml_dirty = False
+            self._write_book(finished=self.machine.finished_reason is not None)
+
     def _publish_tile_report(self, label):
         entry = self.book.entries[label]
         self.tile_report_pub.publish(String(data=json.dumps(entry, ensure_ascii=False, default=str)))   # no RViz text: the descriptions are in the tile report
@@ -1734,6 +1921,7 @@ class MissionManager(Node):
         self.book = TileReportBook(os.path.join(os.path.expanduser(self.cfg['reports_dir']),
                                                 f'tile_report_{stamp}_part{self._map_parts}.md'),
                                    self.run_dir, self.use_ai, float(self.cfg['tiles']['reach_radius_m']))
+        self.book.mission_log = self.mission_log      # detections / reporter results go on in the new part
         self.report_args, self.report_tries, self.report_calls = {}, {}, {}
         self.tiles.reset()
         self.tiles.set_map(*self._last_map)

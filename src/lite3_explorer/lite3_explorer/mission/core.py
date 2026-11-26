@@ -31,6 +31,8 @@ The context object (`ctx`, the ROS node in production, a fake in tests) gives mo
 """
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -84,6 +86,35 @@ class Mode:
 
     def in_phase_s(self) -> float:
         return self.ctx.now() - self.phase_since
+
+    def turn_towards(self, err: float, tol_deg: float) -> bool:
+        """One tick of an in-place turn (ctx.drive wz) towards the heading error err (rad). True = done: it stopped.
+
+        The dog keeps turning for ~0.5 s after /cmd_vel drops (bag fullrun_26_11_210206: in-place aligns at 0.6 rad/s
+        coasted 20-25 deg past the target, the Nav2 spins 7-10 deg). So the turn counts the coast as already turned:
+        the remaining error is |err| - turn_lead_s * |last wz|, and both the stop (remaining <= tol) and the slow-down
+        (wz = turn_gain * remaining) use it. The lead fades in over the first turn_lead_s of a turn, while the robot is
+        still getting going (a short turn would otherwise stop before it ever moved)."""
+        c = self.cfg
+        now = self.ctx.now()
+        prev = getattr(self, '_turn_state', None)
+        if prev is None or prev[0] != self.phase_since:
+            prev = (self.phase_since, 0.0, now)          # a new turn: (phase, last wz, started)
+        _, w_prev, started = prev
+        lead_s = float(c.get('turn_lead_s', 0.0))   # 0 = off (sim / tests: no lag); mission.yaml sets the robot's
+        remaining = abs(err)
+        if w_prev and (w_prev > 0) == (err > 0) and lead_s > 0:
+            remaining -= lead_s * abs(w_prev) * min(1.0, (now - started) / lead_s)
+        if remaining <= math.radians(tol_deg):
+            self.ctx.stop()
+            self._turn_state = None
+            return True
+        w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.4)),
+                                                          float(c.get('turn_gain', 1.0)) * remaining))
+        w = math.copysign(w, err)
+        self.ctx.drive(0.0, w)
+        self._turn_state = (self.phase_since, w, started)
+        return False
 
     def go(self, mode: str, reason: str, **kwargs) -> Transition:
         return Transition(mode, reason, kwargs)

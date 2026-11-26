@@ -392,6 +392,8 @@ class ExploringMode(Mode):
         self.stuck_rounds = 0         # retry rounds with nothing reachable left (reset when a new tile is visited)
         self.stairs_backtracks = 0    # backtracks started towards the tile in front of a forced staircase
         self._stuck_visited = None    # tiles.visited_count() when stuck_rounds was last counted
+        self.nearest_tried = set()    # (tile, unvisited tile) splits already made by _split_at_nearest_unvisited
+        self._nearest_visited = None  # tiles.visited_count() when nearest_tried was last reset
         self.valid_checked_at = 0.0
         self.tile_traversals = self._overrides('tile_traversals', lambda k: k.replace(' ', ''))
         self.kind_traversals = self._overrides('kind_traversals', str.strip)
@@ -642,6 +644,7 @@ class ExploringMode(Mode):
             getattr(strat, 'strikes', {}).clear()
         self.machine.recoveries = 0
         self.avoid.clear()
+        self.nearest_tried.clear()
         if self.cfg.get('retry_clear_costmaps', True):
             self.ctx.clear_costmaps()
         self.ctx.log('info', f'Retrying for Nav2 paths: {len(tiles.unexplored())} tile(s) to visit'
@@ -702,10 +705,34 @@ class ExploringMode(Mode):
             self.index += 1
             self.set_phase('decide')
             return None
+        if self._chosen_scene_props(reachable):
+            self._new_decision()                    # again: the scene mode may look at it now, or another tile is chosen
+            return None
         if self.curtain is not None:
             return self._defer_curtain(strat, reachable)
         self._note_split(reachable)
         return self._drive_to(strat, self.choose_target(reachable))
+
+    def _chosen_scene_props(self, reachable) -> bool:
+        """tiles.chosen_prop_check: run the tile that would be driven to (choose_target) against the perception
+        checker (scene-prop sightings placed on the map, prop_votes.py). Anything scene-related seen on it -> it is a scene
+        tile (looked at from beside, never entered) and the robot does not drive there. True = a tile was marked."""
+        tcfg = self.ctx.cfg.get('tiles', {})
+        tiles = self.ctx.tiles
+        if not tcfg.get('chosen_prop_check', True) or not tiles.ready or not hasattr(tiles, 'check_chosen_props'):
+            return False
+        target = self.choose_target(reachable)
+        if target.get('kind', 'tile') != 'tile' or not target.get('tile'):
+            return False
+        tile = tuple(int(v) for v in target['tile'].split(','))
+        e = tiles.check_chosen_props(tile, int(tcfg.get('chosen_prop_min_frames', 1)),
+                                     float(tcfg.get('chosen_prop_min_score', 0.0)))
+        if e is None:
+            return False
+        self.ctx.log('info', f'Chosen tile {target["tile"]}: scene props seen on it ({e["frames"]} sighting(s), '
+                             f'{e["labels"]}): a scene tile, not driven into.')
+        self.ctx.event('chosen_prop_scene', tile=target['tile'], frames=e['frames'], score=e['score'], labels=e['labels'])
+        return True
 
     def _adjacent(self, label):
         ci, cj = self.ctx.tiles.current
@@ -810,12 +837,57 @@ class ExploringMode(Mode):
         if split is None:
             split = self._split_at_roller()
         if split is None:
+            split = self._split_at_nearest_unvisited()
+        if split is None:
             return None
         label = T.tile_label(split['tile'])
         left = len(tiles.unexplored()) + len(tiles.unreachable)
         self.ctx.log('info', f'{why}, but {left} tile(s) are still unexplored: backtracking to the last split tile '
                              f'{label} (untravelled: {", ".join(tiles.split_remaining(split, include_unreachable=True))}).')
         return self.go(mode, f'{why}; {left} tile(s) still unexplored', split=label)
+
+    def _split_at_nearest_unvisited(self):
+        """No split is left (every split's options were travelled to / dropped), yet tiles are still unvisited: the
+        nearest reachable unvisited tile becomes the last split's option. Its split tile is a visited tile sharing an
+        open side with it (not the current tile: exploring already had its chance from here) that the robot can get
+        back to along moves already made (tiles.known_route); the shortest way back wins (to_visit before given-up
+        tiles, then straight-line distance). Each (tile, unvisited tile) pair is tried once until a new tile is
+        visited or the retry round restores the given-up tiles, so a failed backtrack never loops."""
+        tiles = self.ctx.tiles
+        if not self.cfg.get('backtrack_to_nearest_unvisited', True) or tiles.current is None or tiles.grid is None:
+            return None
+        visited = tiles.visited_count()
+        if visited != self._nearest_visited:
+            self._nearest_visited, self.nearest_tried = visited, set()
+        here = tuple(tiles.current)
+        trail = set(tiles.trail)
+        best = None
+        for tile, d in tiles.tiles.items():
+            status = d.get('status')
+            if status not in ('to_visit', 'unreachable') or not tiles._drivable(T.tile_label(tile)):
+                continue
+            for side in T.SIDES:
+                prev = T._step(tile, side)
+                if prev == here or prev not in trail or tiles.is_closed(prev) or (prev, tile) in self.nearest_tried \
+                        or not T._joined(tiles.tiles, tile, side):
+                    continue
+                route = tiles.known_route(here, prev)
+                if route is None:
+                    continue
+                key = (len(route), status == 'unreachable',
+                       math.dist(tiles.grid.center(tile), tiles.grid.center(here)))
+                if best is None or key < best[0]:
+                    best = (key, prev, tile)
+        if best is None:
+            return None
+        _, prev, tile = best
+        self.nearest_tried.add((prev, tile))
+        option = T.tile_label(tile)
+        tiles.mark_split(prev, [option])
+        self.ctx.log('info', f'No split left: tile {T.tile_label(prev)} beside the nearest reachable unvisited tile '
+                             f'{option} ({best[0][0] - 1} tile(s) back) is the last split.')
+        self.ctx.event('split', tile=T.tile_label(prev), options=[option], nearest_unvisited=True)
+        return next((x for x in tiles.splits if x['tile'] == prev), None)
 
     def _split_at_roller(self):
         """The robot crossed a roller and the tiles still to visit lie on its other side (Nav2 sees the roller as a wall, so
@@ -1520,18 +1592,14 @@ class SceneMode(Mode):
                 err -= math.copysign(2 * math.pi, err)         # almost behind: carry on the way it started, do not flip
             elif abs(err) > math.radians(float(c.get('align_tol_deg', 6.0))):
                 self.turn_dir = 1 if err > 0 else -1
-            if abs(err) <= math.radians(float(c.get('align_tol_deg', 6.0))):
-                self.ctx.stop()
-                self.set_phase('settle')
-                return None
             if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
                 self.ctx.log('warn', f'Scene tile {self.label}: could not turn to face it; describing from here.')
                 self.ctx.stop()
                 self.set_phase('settle')
                 return None
-            w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
-                                                              float(c.get('turn_gain', 1.0)) * abs(err)))
-            self.ctx.drive(0.0, math.copysign(w, err))
+            if self.turn_towards(err, float(c.get('align_tol_deg', 6.0))):
+                self.set_phase('settle')
+                return None
         elif self.phase == 'settle':
             if not self.looking_sent:
                 # facing the scene tile from here on: what perception reports now is on THAT tile (its room / position)
@@ -1784,7 +1852,7 @@ class CurtainMode(Mode):
             # no omni motion: turn towards the centre, then drive there with vx and wz only (the way a Nav2 goal is driven)
             bearing = self._yaw_error(pose, math.atan2(dy, dx))
             if abs(bearing) > math.radians(float(c.get('center_turn_deg', 30.0))):
-                w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+                w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.4)),
                                                                   float(c.get('turn_gain', 1.0)) * abs(bearing)))
                 self.ctx.drive(0.0, math.copysign(w, bearing))
             else:
@@ -1796,19 +1864,17 @@ class CurtainMode(Mode):
             prev, self.prev_err = getattr(self, 'prev_err', None), err
             # square within the tolerance, or the heading swept through the target (the pose lags the turn: overshoot)
             crossed = prev is not None and prev * err < 0 and abs(err) < math.radians(float(c.get('align_cross_deg', 30.0)))
-            if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))) or crossed:
+            if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
+                return self._failed_try('could not square up to it')
+            if crossed:
                 self.ctx.stop()
+            if crossed or self.turn_towards(err, float(c.get('align_tol_deg', 5.0))):
                 if c.get('hstep', True):                 # curtains are crossed in rug_hstep only: switch, stand, then walk
                     self._curtain_hstep(True)
                     self.set_phase('gait_on')
                     return None
                 self._start_cross(pose)
                 return None
-            if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
-                return self._failed_try('could not square up to it')
-            w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
-                                                              float(c.get('turn_gain', 1.0)) * abs(err)))
-            self.ctx.drive(0.0, math.copysign(w, err))
             return None
         if self.phase == 'cross':
             prog = self._progress(pose)
@@ -2155,7 +2221,7 @@ class StairsMode(CurtainMode):
             # no omni motion: turn towards the centre, then drive there with vx and wz only (the way a Nav2 goal is driven)
             bearing = self._yaw_error(pose, math.atan2(dy, dx))
             if abs(bearing) > math.radians(float(c.get('center_turn_deg', 30.0))):
-                w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+                w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.4)),
                                                                   float(c.get('turn_gain', 1.0)) * abs(bearing)))
                 self.ctx.drive(0.0, math.copysign(w, bearing))
             else:
@@ -2182,16 +2248,11 @@ class StairsMode(CurtainMode):
                 return self._finish('could not stand still before AI mode')
             return None
         if self.phase == 'align':
-            if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))):
-                self.ctx.stop()
-                self._predict_beyond()                   # squared up: only now predict the tile beyond the stairs
-                self.set_phase('still')                  # FIX 1: stand still first, Enter AI only then
-                return None
             if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
                 return self._finish(f'could not square up to it ({math.degrees(err):+.0f} deg off)')
-            w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
-                                                              float(c.get('turn_gain', 1.0)) * abs(err)))
-            self.ctx.drive(0.0, math.copysign(w, err))
+            if self.turn_towards(err, float(c.get('align_tol_deg', 5.0))):
+                self._predict_beyond()                   # squared up: only now predict the tile beyond the stairs
+                self.set_phase('still')                  # FIX 1: stand still first, Enter AI only then
             return None
         if self.phase == 'cross':
             prog = self._progress(pose)
@@ -2485,7 +2546,7 @@ class RollerMode(CurtainMode):
 
     def _turn(self, err):
         c = self.cfg
-        w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
+        w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.4)),
                                                           float(c.get('turn_gain', 1.0)) * abs(err)))
         self.ctx.drive(0.0, math.copysign(w, err))
 
@@ -2580,19 +2641,16 @@ class RollerMode(CurtainMode):
             return None
         err = self._yaw_error(pose)
         if self.phase == 'align':
-            if abs(err) <= math.radians(float(c.get('align_tol_deg', 4.0))):
-                self.ctx.stop()
+            if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
+                why = f'could not square up to it ({math.degrees(err):+.0f} deg off)'
+                return self._done(why) if self.gait_on else self._finish(why)
+            if self.turn_towards(err, float(c.get('align_tol_deg', 4.0))):
                 if self.gait_on:                         # squared up again after backing off: straight on
                     self.best, self.best_at = self._progress(pose), self.ctx.now()
                     self.set_phase('cross')
                 else:
                     self._hstep(True)
                     self.set_phase('gait_on')
-                return None
-            if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
-                why = f'could not square up to it ({math.degrees(err):+.0f} deg off)'
-                return self._done(why) if self.gait_on else self._finish(why)
-            self._turn(err)
             return None
         if self.phase == 'back':
             start = self._progress(tuple(self.tile_centre) + (0.0,))      # where it squared up, past the edge line
@@ -2830,6 +2888,7 @@ class BacktrackingMode(Mode):
     def _next_hop(self):
         """Turn in place at the tile the robot is on until it faces the next tile (align), then drive that hop."""
         self.align_yaw = self.hops[0][0][2]
+        self._realigned = False
         self.set_phase('align')
 
     def _drive_hop(self):
@@ -3000,18 +3059,29 @@ class BacktrackingMode(Mode):
         if self.phase == 'align':
             pose = self.ctx.pose()
             err = A.wrap(self.align_yaw - pose[2]) if pose is not None and len(pose) >= 3 else 0.0
-            if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))):
-                self.ctx.stop()
-                return self._drive_hop()
             if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
                 self.ctx.stop()
                 self.ctx.log('warn', f'Backtracking: could not turn to face the next tile ({math.degrees(err):+.0f} deg '
                                      f'off); driving on.')
                 return self._drive_hop()
-            w = max(float(c.get('min_turn_rad_s', 0.2)), min(float(c.get('max_turn_rad_s', 0.6)),
-                                                              float(c.get('turn_gain', 1.0)) * abs(err)))
-            self.ctx.drive(0.0, math.copysign(w, err))
+            if self.turn_towards(err, float(c.get('align_tol_deg', 5.0))):
+                self.set_phase('align_settle')
             return None
+        if self.phase == 'align_settle':
+            # stand still before Nav2 drives the hop: it used to take over mid-coast and the robot swung 25-70 deg past
+            # the hop heading (bag fullrun_26_11_210206, 92 s and 124 s)
+            self.ctx.drive(0.0, 0.0)
+            if self.in_phase_s() < float(c.get('align_settle_s', 0.6)):
+                return None
+            pose = self.ctx.pose()
+            err = A.wrap(self.align_yaw - pose[2]) if pose is not None and len(pose) >= 3 else 0.0
+            tol = float(c.get('align_tol_deg', 5.0)) + float(c.get('still_drift_deg', 5.0))
+            if abs(err) > math.radians(tol) and not getattr(self, '_realigned', False):
+                self._realigned = True                   # coasted off: square up once more (once per hop)
+                self.set_phase('align')
+                return None
+            self.ctx.stop()
+            return self._drive_hop()
         if self.phase == 'checking_paths':
             results = self.ctx.paths.poll()
             if results is None and self.in_phase_s() <= float(c.get('path_check_timeout_s', 10.0)):
@@ -3077,7 +3147,7 @@ class BacktrackingMode(Mode):
     def exit(self, next_mode, reason):
         if self.phase == 'checking_paths':
             self.ctx.paths.cancel()
-        if self.phase == 'align':
+        if self.phase in ('align', 'align_settle'):
             self.ctx.stop()
         self.hops = []
         if self.phase in ('to_split', 'to_curtain', 'to_roller', 'to_option') and self.traversal is not None:

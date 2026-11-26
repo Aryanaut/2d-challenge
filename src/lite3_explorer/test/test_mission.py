@@ -952,6 +952,40 @@ def test_unreachable_split_option_is_retried_by_backtracking():
     assert ctx.complete and ctx.tiles.unexplored() == []
 
 
+def test_no_split_left_backtracks_to_the_tile_beside_the_nearest_unvisited_tile():
+    """The split was forgotten (e.g. dropped after a failed backtrack) but a tile is still unvisited: the visited tile
+    beside the nearest reachable unvisited tile becomes the last split and backtracking takes the robot there."""
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.exploring.split_on_discovery': False},
+                  world=tee_world())
+    for _ in range(200):                       # until the robot has left the split tile for one of its options
+        run(ctx, m, steps=1, until_complete=False)
+        trail = [T.tile_label(t) for t in ctx.tiles.trail]
+        if '1,0' in trail and trail[-1] in ('1,1', '2,0'):
+            break
+    other = '1,1' if trail[-1] == '2,0' else '2,0'
+    ctx.tiles.drop_split((1, 0))
+    assert ctx.tiles.last_split() is None
+    run(ctx, m, steps=400)
+    nearest = [d for k, d in ctx.events if k == 'split' and d.get('nearest_unvisited')]
+    assert nearest and nearest[0]['tile'] == '1,0' and nearest[0]['options'] == [other]
+    assert any(k == 'backtracked' and d['tile'] == other for k, d in ctx.events)
+    assert ctx.complete and ctx.tiles.unexplored() == []
+
+
+def test_no_split_left_and_nearest_unvisited_fallback_off_waits_and_retries():
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.exploring.split_on_discovery': False,
+                   'modes.exploring.backtrack_to_nearest_unvisited': False}, world=tee_world())
+    for _ in range(200):
+        run(ctx, m, steps=1, until_complete=False)
+        trail = [T.tile_label(t) for t in ctx.tiles.trail]
+        if '1,0' in trail and trail[-1] in ('1,1', '2,0'):
+            break
+    ctx.tiles.drop_split((1, 0))
+    run(ctx, m, steps=60, until_complete=False)
+    assert not any(k == 'split' and d.get('nearest_unvisited') for k, d in ctx.events)
+    assert any('retrying for Nav2 paths' in msg for _, msg in ctx.logs)
+
+
 def test_backtracking_drives_through_tile_centres_with_three_waypoints_per_hop():
     # the fake turns 0.2 s worth per 1 s tick: give the in-place turns time to finish
     ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.backtracking.align_timeout_s': 120.0},

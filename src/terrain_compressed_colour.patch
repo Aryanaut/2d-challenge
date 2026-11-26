@@ -1,0 +1,16 @@
+diff -ruN -x __pycache__ a/lite3_terrain_classifier/config/terrain.yaml b/lite3_terrain_classifier/config/terrain.yaml
+--- a/lite3_terrain_classifier/config/terrain.yaml	2026-11-27 05:07:40
++++ b/lite3_terrain_classifier/config/terrain.yaml	2026-11-27 05:07:48
+@@ -15,7 +15,11 @@
+     use_depth: true
+     use_color: true               # the colour camera only feeds the slats lines (terrain_kinds.yaml)
+     color:
+-      image_topic: /camera/color/image_raw
++      # Raw colour is 900 KB per frame and every frame goes through the System Computer's domain bridge, the same
++      # thread that carries /imu/data: subscribing to it slowed the IMU. Only the compressed image is read now
++      # (the raw topic name below has no publisher). Revert: image_topic: /camera/color/image_raw, no compressed_topic.
++      image_topic: /camera/color/image_raw_unused
++      compressed_topic: /camera/color/image_raw/compressed
+     publish_debug_clouds: true    # ~/lidar_points, ~/depth_points (intensity = height above ground plane)
+     start_enabled: true
+     trigger_mode: false           # true: classify only on ~/classify (once at startup too), then hold the label

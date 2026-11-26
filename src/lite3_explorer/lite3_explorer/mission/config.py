@@ -36,6 +36,9 @@ DEFAULTS: Dict[str, Any] = {
     'prefer_flat_tiles': True,        # classifier elevation option on: go to the reachable tile with the least elevation change (up or down) from the current one
     'flat_tile_tolerance_m': 0.03,    # ... elevation changes within this of the best count as equal (the strategy's ranking decides)
     'step_up_min_rise_m': 0.04,       # ... when it is at least this much higher
+    'step_up_depth': True,            # ... and when step_ahead_detector sees a step up ahead in the depth image while driving to a
+                                      # tile (fallback where the tile elevations miss it); held until the tile changes
+    'step_up_depth_max_age_s': 1.0,   # ... a detection older than this does not count for a new tile
     'step_up_from_max_slope_deg': 15.0,  # ... the current tile's elevation is ignored (start floor, 0 m, used instead) when
                                       # its plane is steeper than this: a wall panel read as floor (fullrun_26_11_120359: the
                                       # current tile read 0.55 m at 22.6 deg, so the higher target looked lower)
@@ -78,10 +81,30 @@ DEFAULTS: Dict[str, Any] = {
         'prop_cx': 320.1,
         'prop_camera_x_m': 0.252,         # camera ahead of base_link
         'prop_min_conf': 0.35,
+        # chosen-tile check: the tile the exploration picks as its target is run against the scene-prop sightings; any
+        # on it (this many sightings, summed confidence) -> a scene tile, not driven into. Independent of prop_votes;
+        # an AI 'traversable' answer reopens it.
+        'chosen_prop_check': True,
+        'chosen_prop_min_frames': 1,
+        'chosen_prop_min_score': 0.0,
         'prop_max_range_m': 3.0,
         'prop_max_turn_dps': 30.0,        # ignore detections while the robot turns faster than this (pose / frame mismatch)
         'prop_labels': ['tool_bench', 'hand_tools', 'kitchen', 'utensils', 'market_stall', 'cart', 'food',
                         'cleaning_cart', 'medical_kit'],   # any of them = "a prop is here"; the label is not trusted
+    },
+
+    # Tile report: detections (when + tile of every QR / hazard / survivor), the mission reporter's results and the
+    # perception / reporter /rosout lines. Filled only while those nodes run (explorer.sh --reporter, the sim).
+    'mission_log': {
+        'enabled': True,
+        'event_topic': '/perception/event',        # object / hazard / survivor sightings
+        'qr_topic': '/qr/detections',              # qr_scanner: once per newly confirmed code
+        'qr_text_topic': '/perception/qr_text',    # perception's own decoder (same text only once)
+        'result_topic': '/mission/result',         # what the reporter sent
+        'perception_nodes': ['object_detector', 'qr_scanner', 'llm_event_bridge', 'sim_perception'],
+        'reporter_nodes': ['mission_reporter'],
+        'min_log_level': 20,                       # /rosout lines at or above this (20 INFO, 30 WARN)
+        'log_tail': 300,                           # log lines shown per group in the report (all of them in run_dir/*.log)
     },
 
     'mission': {
@@ -177,7 +200,8 @@ DEFAULTS: Dict[str, Any] = {
         'omni': {'type': 'omni', 'speed_mps': 0.20, 'min_speed_mps': 0.06, 'gain': 0.8, 'tolerance_m': 0.10,
                  'heading_kp': 1.5, 'wz_max': 0.3, 'block_cost': 100, 'lookahead_m': 0.30, 'body_length_m': 0.61, 'body_width_m': 0.37,
                  'body_pad_m': 0.03, 'timeout_s': 30.0,
-                 'stall_s': 6.0, 'min_progress_m': 0.05},
+                 'stall_s': 6.0, 'min_progress_m': 0.05,
+                 'lead_s': 0.0, 'heading_latch_s': 0.0},   # lag compensation, off here (mission.yaml sets the robot's)
     },
 
     'modes': {
@@ -195,6 +219,7 @@ DEFAULTS: Dict[str, Any] = {
             'opening_min_turn_deg': 160.0,    # the opening spin may stop early (map not sparse) only after turning this far
             'return_tolerance_deg': 3.0,  # after the opening sweep turn back to the starting heading
             'time_allowance_s': 20.0,
+            'spin_lead_deg': 6.0,         # Nav2 Spin asks for this much less (the dog coasts past; Nav2Scanner only)
             'use_crawl': False,           # true: crawl gait while turning (gait_switcher /spin_crawl); false: keep the current gait
             'settle_s': 1.0,
             'check_room': True,           # skip the turn where the body would hit the local costmap
@@ -284,7 +309,7 @@ DEFAULTS: Dict[str, Any] = {
             'commit_deg': 150.0,          # target further round than this: keep the direction the turn started in (no flip at 180 deg)
             'align_timeout_s': 15.0,
             'min_turn_rad_s': 0.2,
-            'max_turn_rad_s': 0.6,
+            'max_turn_rad_s': 0.4,
             'turn_gain': 1.0,
             'settle_s': 1.0,              # stand still facing it before the AI looks (sharp image)
             'quickscan': True,            # take 3 pictures (yaw left, centre, right: the scenescan animation) instead of one
@@ -317,7 +342,7 @@ DEFAULTS: Dict[str, Any] = {
             'align_tol_deg': 5.0,         # square to the edge within this before walking
             'align_timeout_s': 15.0,
             'min_turn_rad_s': 0.2,
-            'max_turn_rad_s': 0.6,
+            'max_turn_rad_s': 0.4,
             'turn_gain': 1.0,
             'heading_gain': 1.0,          # wz that holds the heading while walking
             'extra_m': 0.0,               # stop this much beyond the next tile's centre
@@ -348,7 +373,7 @@ DEFAULTS: Dict[str, Any] = {
             'align_tol_deg': 5.0,         # square to the edge within this before climbing
             'align_timeout_s': 15.0,      # could not square up: give up (AI mode never turned on)
             'min_turn_rad_s': 0.2,
-            'max_turn_rad_s': 0.6,
+            'max_turn_rad_s': 0.4,
             'turn_gain': 1.0,
             'speed_mps': 0.20,            # forward speed (vx) over the stairs in AI mode
             'heading_gain': 1.0,          # wz that holds the heading while climbing
@@ -398,7 +423,7 @@ DEFAULTS: Dict[str, Any] = {
             'approach_until_m': 0.0,      # ... until the roller tile's edge line; then square up and cross
             'align_timeout_s': 15.0,      # could not square up: give up (never crossed), back to the mode before
             'min_turn_rad_s': 0.2,
-            'max_turn_rad_s': 0.6,
+            'max_turn_rad_s': 0.4,
             'turn_gain': 1.0,
             'speed_mps': 0.20,            # forward speed (vx) over the roller in the h-step gait
             'heading_gain': 1.0,          # wz that holds the heading while crossing
@@ -428,8 +453,9 @@ DEFAULTS: Dict[str, Any] = {
             'align_at_tiles': True,       # at each tile centre turn in place to face the next tile, then drive that hop
             'align_tol_deg': 5.0,
             'align_timeout_s': 15.0,      # not facing it by then: drive on anyway
+            'align_settle_s': 0.6,        # squared up: stand still this long before Nav2 drives the hop
             'min_turn_rad_s': 0.2,
-            'max_turn_rad_s': 0.6,
+            'max_turn_rad_s': 0.4,
             'turn_gain': 1.0,
             'min_clearance_m': 0.25,      # goal point in a tile: this far from walls
             'path_check_timeout_s': 10.0,

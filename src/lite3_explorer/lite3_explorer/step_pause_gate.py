@@ -12,8 +12,10 @@ after gait_wait_max_s (0 = never).
 Gait switch hold: while /gait_switching (gait_switcher) is true the robot is held too (zero velocity), so a gait is
 only switched while it stands still. This one holds even when Nav2 is not driving.
 
-Pauses only start while Nav2 is actually driving (a non-zero command arrived in the last driving_timeout_s): the curtain
-and roller modes also set /step_up (h-step gait) but publish /cmd_vel themselves, and are left alone.
+Pauses only start while Nav2 is actually driving FORWARD (a command with linear speed >= min_forward_mps arrived in the
+last driving_timeout_s): turning in place at the step edge tilts the nose too, and must not use the pauses up before
+the climb (fullrun_26_11_210206). The curtain and roller modes also set /step_up (h-step gait) but publish /cmd_vel
+themselves, and are left alone.
 
   sub  in_topic (/cmd_vel_nav_smoothed)  geometry_msgs/Twist   Nav2 velocity smoother output
   sub  /step_up                          std_msgs/Bool         mission manager: driving to a higher tile
@@ -52,6 +54,7 @@ class StepPauseGate(Node):
         self.nose_up_sign = float(p('nose_up_sign', -1.0))     # ROS pitch: + = nose DOWN
         self.imu_max_age_s = float(p('imu_max_age_s', 0.5))
         self.driving_timeout_s = float(p('driving_timeout_s', 0.3))
+        self.min_forward_mps = float(p('min_forward_mps', 0.05))
         self.wait_for_hstep = bool(p('wait_for_hstep', True))
         self.gait_wait = GaitWait(hstep_state=int(p('hstep_state', 13)), max_wait_s=float(p('gait_wait_max_s', 4.0)))
         self.robot_state_max_age_s = float(p('robot_state_max_age_s', 1.0))
@@ -62,6 +65,7 @@ class StepPauseGate(Node):
         self.gait_switching = False
         self.nose = None              # (nose_up_deg, monotonic time)
         self.last_drive_t = -math.inf
+        self.last_forward_t = -math.inf
         self.was_paused = False
         self.was_gait_held = False
         self.cmd_pub = self.create_publisher(Twist, p('out_topic', '/cmd_vel'), 10)
@@ -99,6 +103,8 @@ class StepPauseGate(Node):
     def _on_cmd(self, msg):
         if abs(msg.linear.x) > 1e-3 or abs(msg.linear.y) > 1e-3 or abs(msg.angular.z) > 1e-3:
             self.last_drive_t = time.monotonic()
+        if math.hypot(msg.linear.x, msg.linear.y) >= self.min_forward_mps:
+            self.last_forward_t = time.monotonic()
         if not self._tick():
             self.cmd_pub.publish(msg)
 
@@ -121,7 +127,8 @@ class StepPauseGate(Node):
             if self.gait_wait.event:
                 log = self.get_logger().warn if self.gait_wait.gave_up else self.get_logger().info
                 log(self.gait_wait.event)
-        paused = self.logic.update(now, self.step_up, nose, driving=driving)
+        forward = now - self.last_forward_t <= self.driving_timeout_s
+        paused = self.logic.update(now, self.step_up, nose, driving=forward)
         if self.logic.started:
             self.get_logger().info(self.logic.started)
         paused = paused or held or self.gait_switching

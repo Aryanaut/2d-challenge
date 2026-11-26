@@ -40,6 +40,8 @@ setup(
             'controller_monitor = lite3_explorer.controller_monitor:main',
             'robot_state_bridge = lite3_explorer.robot_state_bridge:main',
             'step_pause_gate = lite3_explorer.step_pause_gate:main',
+            'step_ahead_detector = lite3_explorer.step_ahead_detector:main',
+            'sensor_relay = lite3_explorer.sensor_relay:main',
         ],
     },
 )

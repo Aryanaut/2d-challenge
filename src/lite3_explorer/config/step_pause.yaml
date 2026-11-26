@@ -5,7 +5,7 @@ step_pause_gate:
     # pause_s at each of pause_offsets_s, counted from when the nose tilts up the step. step_pause:=false = no gate at all
     # (neither the pauses nor the h-step gait wait below).
     enabled: true                   # false: plain relay (the gate stays in the /cmd_vel path)
-    pause_offsets_s: [0.0, 0.7]     # seconds after the climb tilt: front legs going up, then the rear legs ([0.0] = one pause)
+    pause_offsets_s: [0.0, 0.7]     # seconds of forward driving after the climb tilt: front legs going up, then the rear legs ([0.0] = one pause)
     pause_s: 0.2                    # length of each pause
     climb_start_deg: 6.0            # nose up beyond this ...
     tilt_hold_s: 0.1                # ... for this long = stepping up
@@ -17,6 +17,8 @@ step_pause_gate:
     step_up_topic: /step_up
     driving_timeout_s: 0.3          # pause only while Nav2 sent a non-zero command this recently (curtain / roller modes
                                     # also set /step_up but drive /cmd_vel themselves)
+    min_forward_mps: 0.05           # ... with at least this linear speed: a tilt while turning in place at the step edge
+                                    # is no climb, and the pause offsets count forward-driving time only
     # h-step gait wait: from /step_up going on, hold the robot (zero velocity) until /robot_state reports the h-step gait,
     # so it never drives onto the step in the flat gait (fullrun_26_11_120359: entered tile -2,-2 before the switch).
     wait_for_hstep: true

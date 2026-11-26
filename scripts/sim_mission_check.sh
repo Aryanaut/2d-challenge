@@ -9,7 +9,11 @@ OUT=$HOME/lite3_sim_runs/mission_check_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUT"
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-83}          # own domain: other sessions / the robot are not disturbed
+# ALWAYS an own domain: ~/.bashrc exports ROS_DOMAIN_ID=1, the ROBOT's domain (lite3_domain_bridge_1 forwards /cmd_vel and
+# /simple_cmd to the dog). A sim there sends the mission manager's commands to the real robot.
+export ROS_DOMAIN_ID=${SIM_ROS_DOMAIN_ID:-83}
+if [[ $ROS_DOMAIN_ID == 1 || $ROS_DOMAIN_ID == 0 ]]; then echo "refusing ROS_DOMAIN_ID=$ROS_DOMAIN_ID (robot / default)"; exit 2; fi
+export ROS_LOCALHOST_ONLY=1                         # and never on the network
 echo "maze $MAZE, ${DUR}s, domain $ROS_DOMAIN_ID, output $OUT"
 
 python3 -m lite3_sim.sim_perception --ros-args -p maze:="$MAZE" > "$OUT/perception.log" 2>&1 &
@@ -28,8 +32,11 @@ except Exception:
 EOF
 REC=$!
 
+# the mission manager's run files into $OUT too (other sessions write their sim runs to ~/lite3_sim_runs)
+sed -e "s|output_dir: .*|output_dir: \"$OUT\"|" -e "s|reports_dir: .*|reports_dir: \"$OUT/reports\"|" \
+    src/lite3_sim/config/sim_mission.yaml > "$OUT/sim_mission.yaml"
 timeout -s INT "$DUR" ros2 launch lite3_sim sim.launch.py maze:="$MAZE" rviz:=false reporter:=local \
-    reporter_output_dir:="$OUT" > "$OUT/launch.log" 2>&1
+    reporter_output_dir:="$OUT" sim_mission_params:="$OUT/sim_mission.yaml" > "$OUT/launch.log" 2>&1
 kill -INT $PERC $REC 2>/dev/null
 wait $PERC $REC 2>/dev/null
 python3 scripts/sim_mission_check.py "$MAZE" "$OUT"

@@ -71,8 +71,7 @@ def main():
             check(r.get('message') == msg, f'{tid}: message {r.get("message")!r}')
 
     # the mission manager's run folder: newest run_* started after this check's output dir was made
-    runs = sorted(glob.glob(os.path.expanduser('~/lite3_sim_runs/run_*/events.jsonl')), key=os.path.getmtime)
-    runs = [r for r in runs if os.path.getmtime(r) >= os.path.getmtime(out)]
+    runs = sorted(glob.glob(os.path.join(out, 'run_*', 'events.jsonl')), key=os.path.getmtime)   # this run's only
     print(f'== scene tiles ({runs[-1] if runs else "no mission events found"})')
     if runs:
         ev = [json.loads(line) for line in open(runs[-1]) if line.strip()]
@@ -101,7 +100,11 @@ def main():
     print('== crashes')
     for log in sorted(glob.glob(os.path.join(out, '*.log'))):
         txt = open(log, errors='replace').read()
-        bad = [line for line in txt.splitlines() if 'Traceback' in line or 'process has died' in line]
+        cut = txt.find("sending signal 'SIGINT'")          # the launch's Ctrl-C at the end: what dies after it is shutdown
+        txt = txt if cut < 0 else txt[:cut]
+        lines = txt.splitlines()
+        bad = [l for k, l in enumerate(lines) if ('Traceback' in l or 'process has died' in l)
+               and not any(x in ' '.join(lines[k:k + 25]) for x in ('KeyboardInterrupt', 'ExternalShutdownException'))]
         check(not bad, f'{os.path.basename(log)}: {bad[:3] if bad else "no tracebacks / dead processes"}')
     print('ALL PASSED' if ok else 'SOME CHECKS FAILED')
     sys.exit(0 if ok else 1)

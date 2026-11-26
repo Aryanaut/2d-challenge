@@ -1,0 +1,37 @@
+step_ahead_detector:
+  ros__parameters:
+    # Step up in front of the robot, from the depth image: the fallback trigger for the h-step gait (/step_up via the mission
+    # manager, mission.yaml step_up_depth) where the tile elevation rule misses a step (tile elevation wrong, late or never
+    # measured; a step inside a tile). exploration.launch.py step_depth:=false = not started. Tuned on
+    # fullrun_26_11_210206 / explorer_26_11_191117 (12..15 cm arena step); no detections in the bags without steps.
+    # Float parameters need a decimal point (0.0, not 0).
+    depth_topic: /camera/depth/image_raw
+    camera_info_topic: /camera/depth/camera_info
+    imu_topic: /imu/data
+    step_topic: /step_ahead
+    pause_topic: /ai_mode       # paused while the stairs mode climbs in AI mode
+    base_frame: base_link
+    depth_hfov_deg: 81.4        # only until camera_info arrives
+    depth_scale: 0.001          # 16UC1 millimetres -> metres
+    process_hz: 5.0             # at most this many frames a second (the relayed depth comes at ~3 Hz)
+    imu_max_age_s: 0.3          # older IMU = no detection (the body tilt is needed to level the points)
+    confirm_frames: 2           # a step counts once seen in this many frames in a row
+    stride: 4                   # use every 4th pixel
+    min_depth_m: 0.15
+    max_depth_m: 3.0
+    half_width_m: 0.20          # corridor ahead of the body: +-this beside base_link ...
+    strip_m: 0.10               # ... in strips this wide, each profiled along x on its own (an edge at an angle smears
+    min_strips: 2               #     over one wide profile); the step must show in at least this many strips
+    near_m: 0.30                # profile from this far ahead of base_link (the camera sees the floor from ~0.45 m)
+    far_m: 1.2                  # a step must start within this far ahead
+    bin_m: 0.05
+    min_bin_points: 6
+    max_bin_spread_m: 0.03      # 20..80 % height spread of a bin: more = riser face / clutter (skipped)
+    stand_height_m: 0.33        # floor under base_link when the nearest visible ground is itself raised (at the edge)
+    ref_band_m: 0.15            # floor = median of the nearest visible ground this deep
+    min_rise_m: 0.06            # step height (the tile rule uses step_up_min_rise_m 0.04; depth noise needs more) ...
+    max_rise_m: 0.35            # ... higher = a wall / obstacle
+    max_edge_gap_m: 0.20        # the last floor-level bin is at most this far before the top (a ramp has no jump)
+    min_top_m: 0.15             # the top is at least this deep ...
+    top_flat_m: 0.03            # ... and flat to within this
+    max_tilt_deg: 6.0           # body roll / pitch beyond this: no detection (on the step already)

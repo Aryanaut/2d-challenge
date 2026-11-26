@@ -10,6 +10,14 @@ Example:
   ros2 launch lite3_explorer exploration.launch.py use_rollers:=true     # cross roller tiles in the h-step gait
   ros2 launch lite3_explorer exploration.launch.py hstep_speed:=0.3      # Nav2 speed cap in the h-step gait (m/s)
   ros2 launch lite3_explorer exploration.launch.py step_pause:=false     # no balance pauses stepping up onto a tile
+  ros2 launch lite3_explorer exploration.launch.py step_depth:=false     # h-step only from tile elevations (no depth fallback)
+  ros2 launch lite3_explorer exploration.launch.py use_relay:=false      # every node subscribes to the robot topics itself
+
+Robot sensor topics: sensor_relay is the only subscriber to them across the link and republishes each under
+relay_prefix (/imu/data -> /local/imu/data ...); every node started here is remapped to the local copies. The robot's
+bridge sends one copy per subscriber in one loop, and every extra subscriber to the cloud / images used to drop the
+IMU from 200 Hz to 1-3 Hz. Anything started outside this launch (bag, perception, rqt, `ros2 topic hz`) should use the
+/local/... names too.
 """
 import os
 
@@ -24,6 +32,36 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 PKG = 'lite3_explorer'
 LLM_ARGS = ('server_url', 'group_id', 'image_topic', 'prompt_file')
+# robot topics sensor_relay forwards (lazily: only while a local copy has subscribers); cloud_topic / odom_topic are added
+RELAY_TOPICS = ['/imu/data', '/leg_odom2', '/livox/points', '/livox/imu',
+                '/camera/depth/image_raw', '/camera/depth/camera_info',
+                '/camera/color/image_raw', '/camera/color/image_raw/compressed', '/camera/color/camera_info']
+
+
+def _relay_topics(context):
+    if LaunchConfiguration('use_relay').perform(context).lower() != 'true':
+        return []
+    extra = [LaunchConfiguration(k).perform(context) for k in ('cloud_topic', 'odom_topic')]
+    return list(dict.fromkeys(RELAY_TOPICS + [t for t in extra if t.startswith('/')]))
+
+
+def _relay_prefix(context):
+    return '/' + LaunchConfiguration('relay_prefix').perform(context).strip('/')
+
+
+def _sensor_relay(context):
+    """The one cross-link subscriber to the robot sensor topics (outside the remap group, so it sees the real ones)."""
+    topics = _relay_topics(context)
+    if not topics:
+        return [LogInfo(msg='use_relay:=false: every node subscribes to the robot sensor topics itself')]
+    return [Node(package=PKG, executable='sensor_relay', name='sensor_relay', output='screen',
+                 parameters=[{'topics': topics, 'prefix': _relay_prefix(context)}])]
+
+
+def _sensor_remaps(context):
+    """Point every node after this (in the same group) at the relayed copies."""
+    prefix = _relay_prefix(context)
+    return [SetRemap(src=t, dst=prefix + t) for t in _relay_topics(context)]
 
 
 def _nav2(context):
@@ -109,6 +147,10 @@ def generate_launch_description():
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('use_relay', default_value='true',
+                              description='sensor_relay subscribes once to each robot sensor topic and republishes it under '
+                                          'relay_prefix; all nodes here use the copies (keeps the robot IMU at full rate)'),
+        DeclareLaunchArgument('relay_prefix', default_value='/local'),
         DeclareLaunchArgument('publish_odom_tf', default_value='true',
                               description='Broadcast odom->base_link from /leg_odom2'),
         DeclareLaunchArgument('odom_topic', default_value='/leg_odom2'),
@@ -145,6 +187,10 @@ def generate_launch_description():
                               description='Stop briefly (step_pause.yaml: 2 x 0.2 s) while Nav2 drives up onto a higher tile, '
                                           'so the robot can balance; false = Nav2 publishes /cmd_vel directly'),
         DeclareLaunchArgument('step_pause_params', default_value=cfg('step_pause.yaml')),
+        DeclareLaunchArgument('step_depth', default_value='true',
+                              description='Fallback h-step trigger: a step up ahead in the depth image (step_ahead_detector) '
+                                          'switches /step_up for the current target too, where the tile elevations miss it'),
+        DeclareLaunchArgument('step_ahead_params', default_value=cfg('step_ahead.yaml')),
         DeclareLaunchArgument('use_mission', default_value='true'),
         DeclareLaunchArgument('auto_start', default_value='',
                               description='true/false: leave idle by itself (empty = mission.yaml)'),
@@ -204,7 +250,9 @@ def generate_launch_description():
              condition=IfCondition(lc('publish_lidar_tf'))),
         Node(package='pointcloud_to_laserscan', executable='pointcloud_to_laserscan_node',
              name='cloud_to_scan', output='screen',
-             remappings=[('cloud_in', lc('cloud_topic')), ('scan', PythonExpression(["'/scan_raw' if '", lc('use_tilt_gate'), "'.lower() == 'true' else '/scan'"]))],
+             # node-specific remap: the group's /livox/points -> /local/... remap would not be applied on top of it
+             remappings=[('cloud_in', PythonExpression(["('/' + '", lc('relay_prefix'), "'.strip('/') if '", lc('use_relay'),
+                                                        "'.lower() == 'true' else '') + '", lc('cloud_topic'), "'"])), ('scan', PythonExpression(["'/scan_raw' if '", lc('use_tilt_gate'), "'.lower() == 'true' else '/scan'"]))],
              parameters=[{'target_frame': 'base_link', 'transform_tolerance': 0.05,
                           'min_height': lc('scan_min_height'), 'max_height': lc('scan_max_height'),
                           'angle_min': -3.14159, 'angle_max': 3.14159, 'angle_increment': 0.0087,
@@ -222,6 +270,9 @@ def generate_launch_description():
                                                'start_enabled': PythonExpression(["'", lc('use_stairs'), "'.lower() == 'true'"])}],
              condition=IfCondition(PythonExpression(["'", lc('use_stairs'), "'.lower() == 'true' or '",
                                                      lc('stairs_on_opening'), "'.lower() == 'true'"]))),
+        Node(package=PKG, executable='step_ahead_detector', name='step_ahead_detector', output='screen',
+             parameters=[lc('step_ahead_params'), {'use_sim_time': lc('use_sim_time')}],
+             condition=IfCondition(lc('step_depth'))),
         Node(package=PKG, executable='roller_detector', name='roller_detector', output='screen',
              parameters=[lc('roller_params'), {'use_sim_time': lc('use_sim_time'), 'cloud_topic': lc('cloud_topic')}],
              condition=IfCondition(lc('use_rollers'))),
@@ -252,4 +303,5 @@ def generate_launch_description():
         OpaqueFunction(function=_llm_client),
         OpaqueFunction(function=_mission_manager),
     ]
-    return LaunchDescription(args + nodes)
+    return LaunchDescription(args + [OpaqueFunction(function=_sensor_relay),
+                                     GroupAction([OpaqueFunction(function=_sensor_remaps), *nodes])])

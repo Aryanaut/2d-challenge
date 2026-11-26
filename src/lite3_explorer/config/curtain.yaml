@@ -8,6 +8,11 @@ curtain_detector:
     depth_hfov_deg: 81.4        # only until camera_info arrives
     depth_scale: 0.001          # 16UC1 millimetres -> metres
     global_frame: map
+    # map-frame z of the floor. map z = 0 is the BODY height (map->odom carries z -0.30..-0.32, odom->base_link
+    # +0.30..+0.32; the depth camera sees the floor at -0.33). With the old default 0.0 the lidar thresholds below sat
+    # 0.32 m too high: a whole 0.5 m wall counted as "floor level", and every wall with people / clutter standing behind it
+    # became a curtain (curtstair_26_11_213531: 74 spots along the wrong wall; 0 with -0.32).
+    floor_z: -0.32
     process_hz: 2.0             # LOW rate: depth frames processed per second
     stride: 4                   # use every 4th pixel
     run_rows: 6                 # rows (after the stride) of smooth curtain above the hem
@@ -52,3 +57,7 @@ curtain_detector:
                                   # 0.4-0.9 m, extend 0 -> never confirmed) and let the walls beyond the arena through; the
                                   # warmth test does its job now. 0.06 = the old setting
     colour_extend_tol_m: 0.15     # band cells count within this horizontal distance of the curtain in the same column
+    colour_open_cells: 1          # keep only solid patches (opening, 3x3 strided cells): OSB passes in speckles between
+                                  # the grain, 12-17 % of the image close up (curtstair_26_11_213531); 0 = off
+    colour_require_floor: true    # no floor in view = no reference for the brightness / warmth tests = no detection (a grey
+                                  # wall 0.3 m away passed against the fixed defaults, curtstair_26_11_213531)

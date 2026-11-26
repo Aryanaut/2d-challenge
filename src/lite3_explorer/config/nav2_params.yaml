@@ -42,7 +42,7 @@ controller_server:
       min_lookahead_dist: 0.4
       max_lookahead_dist: 1.0
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 0.6
+      rotate_to_heading_angular_vel: 0.4   # was 0.6: coasted 25-70 deg past the path heading (fullrun_26_11_210206)
       transform_tolerance: 0.3
       use_velocity_scaled_lookahead_dist: false
       min_approach_linear_velocity: 0.08
@@ -59,7 +59,7 @@ controller_server:
       allow_reversing: false
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.6
-      max_angular_accel: 1.5
+      max_angular_accel: 1.0
       max_robot_pose_search_dist: 10.0
       cost_scaling_dist: 0.4
       cost_scaling_gain: 1.0
@@ -75,13 +75,13 @@ controller_server:
       iteration_count: 1
       motion_model: "Omni"               # DiffDrive | Omni | Ackermann: Omni = holonomic, vy is sampled too
       # speed limits (m/s, rad/s); the velocity smoother below uses the same
-      vx_max: 0.4
+      vx_max: 0.25                       # was 0.4 # bag fullrun_26_11_210206: rug_hstep answers ~1 s late, then lurches past the command
       vx_min: -0.2
-      vy_max: 0.3
+      vy_max: 0.2                        # was 0.3 (same)
       wz_max: 0.3                        # low on purpose: lateral moves keep the heading (was 0.6)
       # sampling noise: how far the samples spread around the current best control
-      vx_std: 0.2
-      vy_std: 0.2
+      vx_std: 0.15
+      vy_std: 0.15
       wz_std: 0.1                        # samples barely rotate (was 0.4)
       temperature: 0.3
       gamma: 0.015
@@ -275,7 +275,7 @@ behavior_server:
     # turn (240 deg) ~12 s, inside the scanning mode's time_allowance_s (20 s).
     max_rotational_vel: 0.4
     min_rotational_vel: 0.20
-    rotational_acc_lim: 1.0
+    rotational_acc_lim: 0.6         # was 1.0: slows down earlier; the coast is subtracted from the request (spin_lead_deg)
 
 waypoint_follower:
   ros__parameters:
@@ -297,7 +297,7 @@ velocity_smoother:
     # Lite3 accepts vx, vy, wz on /cmd_vel. RPP only commands vx/wz; vy is for the recovery mode's RecoveryMPPI (Omni).
     max_velocity: [0.4, 0.3, 0.6]
     min_velocity: [-0.2, -0.3, -0.6]
-    max_accel: [0.6, 0.5, 1.5]
+    max_accel: [0.4, 0.3, 1.0]      # was [0.6, 0.5, 1.5]: softer starts, less lurch after the dog's lag
     max_decel: [-0.8, -0.5, -2.0]
     odom_topic: /odom
     odom_duration: 0.1

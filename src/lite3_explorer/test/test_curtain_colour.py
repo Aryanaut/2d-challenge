@@ -52,8 +52,31 @@ CURTAIN_25NOV = (129, 124, 114)
 def test_cream_curtain_close_up_is_found():
     # 0.5 m away the camera sees only up to ~0.8 m above the floor: no extend band needed (the 25 Nov bag's curtain was
     # 15-44 % of the image from 0.4-0.9 m away, extend 0)
-    d = detect(*scene(CURTAIN_25NOV, floor_rgb=FLOOR_25NOV, wall_x=0.5, wall_from=0.15))
+    # (this synthetic camera is LEVEL, so at 0.5 m it sees no floor at all; the robot's camera is pitched 20 deg down and
+    # sees the floor from ~0.3 m ahead. Hence require_floor off here; with no floor the default rejects it, see below.)
+    d = detect(*scene(CURTAIN_25NOV, floor_rgb=FLOOR_25NOV, wall_x=0.5, wall_from=0.15), require_floor=False)
     assert d is not None and d.fraction > 0.3
+
+
+def test_no_floor_in_view_is_not_a_curtain():
+    # bag curtstair_26_11_213531: a grey wall 0.3 m away filled the image; with no floor the brightness / warmth
+    # references fell back to fixed defaults and it passed
+    depth, rgb = scene(CURTAIN_25NOV, floor_rgb=FLOOR_25NOV, wall_x=0.5, wall_from=0.15)
+    assert detect(depth, rgb) is None
+
+
+def test_speckled_patches_are_not_a_curtain():
+    # bag curtstair_26_11_213531: ~20 % of the OSB cells passed every per-pixel test, scattered between the grain;
+    # close up that was 12-17 % of the image (> min_fraction). The opening keeps only solid patches.
+    depth, rgb = scene(CURTAIN_25NOV, floor_rgb=FLOOR_25NOV, wall_from=0.15)
+    on_wall = depth < 0.99 * CAM_H / np.maximum((np.arange(480)[:, None] - K[3]) / K[1], 1e-6)
+    rng = np.random.default_rng(1)
+    speckle = rng.random((480 // 4, 640 // 4)) < 0.35               # ~35 % of the strided cells look curtain-like ...
+    keep = np.roll(np.kron(speckle, np.ones((4, 4), bool)), (-2, -2), axis=(0, 1))   # blocks centred on the samples
+    rgb = rgb.copy()
+    rgb[on_wall & ~keep] = (129, 116, 81)                          # ... the rest is yellow wood
+    assert detect(depth, rgb, open_cells=0, texture_win=3) is not None   # what used to pass
+    assert detect(depth, rgb, texture_win=3) is None
 
 
 def test_grey_wall_as_bright_as_the_floor_is_not_a_curtain():

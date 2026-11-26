@@ -14,7 +14,7 @@ Output: /terrain_type (std_msgs/String, latched): "rugged", "non_rugged" or "unk
 /terrain_kind (JSON, latched): the terrain KIND of the floor around the robot (flat / uneven / slats / ...) from the
 configurable strategies in terrain_kinds.py (config/terrain_kinds.yaml). It knows nothing about tiles: whoever calls
 ~/classify (the explorer, when it looks at a tile) matches the answer to the place it was looking at via "seq".
-Optional (elevation.enabled): a ground reference plane is fitted from the lidar floor while the robot is assumed to stand
+On by default (elevation.enabled, false to turn off): a ground reference plane is fitted from the lidar floor while the robot is assumed to stand
 on flat floor at the start; /terrain_kind then also carries elevation_m (+ higher / - lower than that floor),
 elevation_class (higher / lower / level) and slope_deg of the patch (elevation.py).
 Details for tuning: ~/details (JSON string), ~/lidar_points and ~/depth_points
@@ -112,7 +112,7 @@ class TerrainClassifier(Node):
         self.color_msg, self.color_recv_s, self.color_seen = None, None, None
 
         # ---- elevation against a ground reference taken at the start (optional) ----
-        self.elev_enabled = p('elevation.enabled', False)
+        self.elev_enabled = p('elevation.enabled', True)
         self.elev_frame = p('elevation.frame', 'odom')           # odom: absolute | gravity: rotation only (see elevation.py)
         if self.elev_frame not in ('odom', 'gravity'):
             raise ValueError("elevation.frame must be 'odom' or 'gravity'")

@@ -65,6 +65,29 @@ class ColourParams:
     extend_max_m: float = 1.20
     min_extend_m2: float = 0.0          # upright surface area in that band, in the curtain's image columns (0.06 tried)
     extend_tol_m: float = 0.15          # ... within this horizontal distance of the curtain in the same column
+    # solid patches only: morphological opening of the mask with a (2r+1)^2 square of strided cells. The curtain passes
+    # in solid blobs, OSB in speckles between the grain (bag curtstair_26_11_213531: ~20 % of OSB cells passed every
+    # per-pixel test, close up that was 12-17 % of the image > min_fraction, and the OSB end wall was confirmed as the
+    # curtain; opened, OSB <= 7 % while the real curtain kept 10-12 %). 0 = off.
+    open_cells: int = 1
+    # the brightness and warmth tests are relative to the floor in the same image; with no floor in view they compare
+    # against fixed defaults and a grey wall 0.3 m away passed (curtstair_26_11_213531, 3 frames, the wrong wall
+    # confirmed). True = no floor in view -> no detection.
+    require_floor: bool = True
+
+
+def _open(mask: np.ndarray, r: int) -> np.ndarray:
+    """Binary opening (erode then dilate) with a (2r+1) x (2r+1) square, numpy only; outside the image counts as off."""
+    if r <= 0:
+        return mask
+    h, w = mask.shape
+
+    def windows(m):
+        p = np.pad(m, r, constant_values=False)
+        return [p[i:i + h, j:j + w] for i in range(2 * r + 1) for j in range(2 * r + 1)]
+
+    eroded = np.logical_and.reduce(windows(mask))
+    return np.logical_or.reduce(windows(eroded))
 
 
 @dataclass
@@ -169,6 +192,7 @@ def colour_mask(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequence[float], 
             & (T < p.max_texture) & (S < p.max_saturation) & (V > p.min_rel_brightness * floor_v))
     if p.min_rel_warmth is not None:
         mask &= warm - floor_warm >= p.min_rel_warmth
+    mask = _open(mask, int(p.open_cells))
     cell_area = (s * d / fx) * (s * d / fy)              # m^2 one cell covers, facing the camera
     area = float(cell_area[mask].sum())
 
@@ -185,7 +209,7 @@ def colour_mask(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequence[float], 
     nvalid = int(valid.sum())
     return {'mask': mask, 'points': P, 'valid': valid, 'area_m2': area, 'extend_m2': extend_area,
             'fraction': float(mask.sum()) / max(1, nvalid), 'floor_v': floor_v, 'uc': uc, 'vc': vc, 'depth': d,
-            'warm': warm, 'floor_warm': floor_warm, 'floor_px': floor_px}
+            'warm': warm, 'floor_warm': floor_warm, 'floor_px': floor_px, 'floor_seen': bool(floor_px.sum() > 50)}
 
 
 def detect_curtain_colour(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequence[float], k_colour: Sequence[float],
@@ -193,6 +217,8 @@ def detect_curtain_colour(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequenc
                           p: ColourParams = ColourParams()) -> Optional[ColourDetection]:
     """Curtain seen by the colour + depth cameras, or None (see the module doc)."""
     r = colour_mask(depth_m, rgb, k_depth, k_colour, depth_to_colour, up, p)
+    if p.require_floor and not r['floor_seen']:
+        return None
     if r['area_m2'] < p.min_area_m2 and r['fraction'] < p.min_fraction:
         return None
     if p.min_extend_m2 > 0 and r['extend_m2'] < p.min_extend_m2:

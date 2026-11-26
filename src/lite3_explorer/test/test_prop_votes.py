@@ -107,3 +107,42 @@ def test_partly_scanned_scene_needs_a_prop_sighting():
     assert pts and T.TileGrid(0.0, 0.0, 0.0).tile_of(pts[0][0], pts[0][1]) == tile
     t.add_prop_points(pts)                                      # one sighting is enough for a partly scanned one
     assert t.is_scene(tile)
+
+
+# ---- chosen-tile check: the target tile with ANY scene-prop sighting becomes a scene tile
+def _one_sighting(t, n=1, conf=0.6):
+    pts = PV.place([_det(conf=conf)], (0.5, 0.5, 0.0), _grid(), INFO, fx=462.6, cx=320.0, cam_x=0.25)
+    t.add_prop_points(pts * n)
+
+
+def test_chosen_tile_with_one_prop_sighting_becomes_a_scene_tile_without_the_vote():
+    t = _tracker(_grid(), on=False)                            # works with prop_votes off too
+    t.skip_scene = True
+    assert t.check_chosen_props((1, 0)) is None                # nothing seen on it: driven to as usual
+    _one_sighting(t)
+    assert not t.is_scene((1, 0))                              # one sighting: no vote ...
+    e = t.check_chosen_props((1, 0))
+    assert e and e['frames'] == 1                              # ... but chosen -> a scene tile, not drivable
+    assert t.is_scene((1, 0)) and t.tiles[(1, 0)].get('prop_chosen') and not t._drivable('1,0')
+    assert t.check_chosen_props((1, 0)) is None                # already a scene tile: not marked twice
+
+
+def test_chosen_prop_scene_is_reopened_by_a_traversable_answer_and_never_on_the_trail():
+    t = _tracker(_grid(), on=False)
+    _one_sighting(t)
+    assert t.check_chosen_props((1, 0))
+    t.mark_traversable((1, 0))                                 # the AI looked: no scene
+    assert not t.is_scene((1, 0))
+    assert t.check_chosen_props((1, 0)) is None                # and it is not marked again
+    t2 = _tracker(_grid(), on=False)
+    _one_sighting(t2)
+    t2.trail.append((1, 0))
+    assert t2.check_chosen_props((1, 0)) is None               # the robot stood on it: never a scene
+
+
+def test_chosen_check_thresholds():
+    t = _tracker(_grid(), on=False)
+    _one_sighting(t, n=2, conf=0.4)
+    assert t.check_chosen_props((1, 0), min_frames=3) is None
+    assert t.check_chosen_props((1, 0), min_frames=2, min_score=0.9) is None
+    assert t.check_chosen_props((1, 0), min_frames=2, min_score=0.8)

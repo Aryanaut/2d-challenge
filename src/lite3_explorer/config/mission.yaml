@@ -73,6 +73,12 @@ mission_manager:
       # stall reads as medical_kit, the toy kitchen as food); a sighting only says "a prop is on this tile".
       # medical_kit included: it fires mostly on scene props (and once on a black post with a red base: fullrun 26 Nov)
       prop_labels: [tool_bench, hand_tools, kitchen, utensils, market_stall, cart, food, cleaning_cart, medical_kit]
+      # chosen-tile check: the tile the exploration picks as its target is run against these scene-prop sightings; ANY on
+      # it -> a scene tile (the scene mode looks at it from beside), never driven into. Below the prop_votes limit, so
+      # unlike a prop-vote tile an AI 'traversable' answer reopens it. Raise min_frames if stray sightings close tiles.
+      chosen_prop_check: true
+      chosen_prop_min_frames: 1              # sightings on the chosen tile ...
+      chosen_prop_min_score: 0.0             # ... and their summed confidence
 
     # ---------------------------------------------------------------- mission manager
     mission:
@@ -202,6 +208,8 @@ mission_manager:
         tolerance_m: 0.10                    # done this close to the tile centre
         heading_kp: 1.5                      # wz P-controller holding the starting heading
         wz_max: 0.3
+        lead_s: 0.6                          # distance / heading taken this far ahead (the dog answers late and coasts on)
+        heading_latch_s: 0.8                 # hold the heading it has after this long (still coasting from Nav2 before that)
         block_cost: 100                      # fail when a global-costmap cell this costly (lethal: wall / virtual wall) ...
         lookahead_m: 0.30                    # ... lies under the BODY rectangle this far ahead on the way (cells already under it are ignored)
         body_length_m: 0.61                  # footprint swept along the way (the heading is held, so it keeps the starting yaw)
@@ -228,6 +236,7 @@ mission_manager:
         opening_min_turn_deg: 45            # the opening spin always runs; it may stop early (map no longer sparse) only after turning this far
         return_tolerance_deg: 3.0            # after the opening sweep, turn back to the starting heading (within this)
         time_allowance_s: 7.0
+        spin_lead_deg: 6.0                   # Nav2 Spin asks for this much less: the dog coasts 7-10 deg past (fullrun_26_11_210206)
         use_crawl: false                     # true: crawl gait while turning; false: scan turns (after the opening spin) keep the current gait
         settle_s: 2.0
         check_room: true                     # skip the turn where the body would hit the local costmap
@@ -272,6 +281,8 @@ mission_manager:
         backtracking_mode: backtracking      # target is left but tiles are unexplored, go back there and take the other way (else retry_wait)
         split_on_discovery: true             # a new tile found beside a tile visited earlier (shared side not a wall) makes that
                                              # tile a split again, so backtracking can come back for it
+        backtrack_to_nearest_unvisited: true # no split left but tiles are unvisited: the visited tile beside the nearest unvisited tile
+                                             # reachable along moves already made becomes the last split (each pair tried once per round)
         classify_target: true                # terrain-classify the target tile as soon as the robot points at it; floor not visible -> choose another tile
         classify_max_angle_deg: 20.0         # "points at it": heading within this angle of the tile
         retry_period_s: 3.0                 # nothing reachable but tiles are left: wait this long, then give every tile another chance
@@ -308,6 +319,7 @@ mission_manager:
         min_turn_rad_s: 0.02
         max_turn_rad_s: 0.3
         turn_gain: 0.5
+        turn_lead_s: 0.6                     # stop the in-place turn this long early (the dog coasts on; fullrun_26_11_210206)
         settle_s: 1.0                        # stand still facing it before the AI looks
         quickscan: true                      # take 3 pictures (body yaws left, centre, right: scenescan animation) instead of one
         animation: scenescan                 # animations.py, played by animation_player (its scenescan.* parameters)
@@ -357,8 +369,9 @@ mission_manager:
         align_cross_deg: 30.0                # ... or when the heading swept through the target (error changed sign) within this
         align_timeout_s: 15.0
         min_turn_rad_s: 0.2
-        max_turn_rad_s: 0.6
+        max_turn_rad_s: 0.4                  # was 0.6: in-place turns coasted 20-25 deg past the target (fullrun_26_11_210206)
         turn_gain: 1.0
+        turn_lead_s: 0.6                     # the dog turns on ~this long after wz drops: stop that much early (Mode.turn_towards)
         heading_gain: 1.0                    # wz that holds the heading while walking
         extra_m: 0.0                         # stop this much beyond the next tile's centre
         cross_timeout_s: 20.0
@@ -379,6 +392,8 @@ mission_manager:
         center_timeout_s: 30.0               # never climb from off-centre: not there by then = give up before AI mode (back to the previous mode)
         align_tol_deg: 5.0                   # square up to the staircase's side within this before AI mode goes on
         align_timeout_s: 15.0                # could not square up: give up (AI mode never turned on), back to exploring
+        max_turn_rad_s: 0.4
+        turn_lead_s: 0.6                     # stop the in-place turn this long early (the dog coasts on; fullrun_26_11_210206)
         speed_mps: 0.34                      # forward speed (vx) over the stairs
         heading_gain: 1.0                    # wz that holds the heading while climbing
         lateral_gain: 0.5                    # vy that keeps the robot on the line through the tile centres (0 = off)
@@ -420,6 +435,8 @@ mission_manager:
         approach_angle_deg: -90.0             # approach with the body this far off the roller plane (+ = turned left) while vx / vy walk the straight line through the tile centres ...
         approach_until_m: 0.0                # ... until the robot reaches the roller tile's edge line (progress past it, in m); then it squares up and crosses
         align_timeout_s: 15.0                # could not square up: give up (never crossed), back to exploring
+        max_turn_rad_s: 0.4
+        turn_lead_s: 0.6                     # stop the in-place turn this long early (the dog coasts on; fullrun_26_11_210206)
         speed_mps: 0.20                      # forward speed (vx) over the roller
         heading_gain: 1.0                    # wz that holds the heading while crossing
         lateral_gain: 0.5                    # vy that keeps the robot on the line through the tile centres (0 = off)
@@ -447,9 +464,11 @@ mission_manager:
         align_at_tiles: true                 # yaw setpoint per tile: at each tile centre turn in place to face the next tile, then drive that hop
         align_tol_deg: 5.0
         align_timeout_s: 15.0                # not facing it by then: drive on anyway
+        align_settle_s: 0.6                  # squared up: stand still this long before Nav2 drives the hop (it took over mid-coast)
         min_turn_rad_s: 0.2
-        max_turn_rad_s: 0.6
+        max_turn_rad_s: 0.4                  # was 0.6: in-place turns coasted 20-25 deg past the target (fullrun_26_11_210206)
         turn_gain: 1.0
+        turn_lead_s: 0.6                     # the dog turns on ~this long after wz drops: stop that much early (Mode.turn_towards)
         min_clearance_m: 0.25
         path_check_timeout_s: 10.0
         goal_timeout_s: 30.0

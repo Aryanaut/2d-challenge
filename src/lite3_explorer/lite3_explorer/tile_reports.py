@@ -36,6 +36,7 @@ class TileReportBook:
         self.reach_radius_m = reach_radius_m
         self.started = dt.datetime.now().isoformat(timespec='seconds')
         self.entries: Dict[str, dict] = {}
+        self.mission_log = None             # mission_log.MissionLog: detections, reporter results, their logs
 
     # ------------------------------------------------------------------ updates
     def reached(self, label: str, pose, source: str, sides: Optional[dict] = None) -> dict:
@@ -111,6 +112,8 @@ class TileReportBook:
             lines.append('')
         if to_visit:
             lines += ['## Still to visit', '', ', '.join(to_visit), '']
+        if self.mission_log is not None:
+            lines += self.mission_log.render()
         return '\n'.join(lines)
 
     def write(self, **render_args) -> str:

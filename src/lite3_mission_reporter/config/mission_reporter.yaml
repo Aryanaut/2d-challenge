@@ -25,7 +25,8 @@ mission_reporter:
     default_scene_type: ""
     # "scene:task_id:label" = answer the task as soon as the room is identified as that scene (no detection needed;
     # pos = the scene tile x 1.02). [""] = off.
-    scene_tasks: ["workshop:M01:hand_tools"]
+    # course B (practice 26 Nov): the survivor WITH a QR is in the cleaning room (M03 scene_type was right there)
+    scene_tasks: ["workshop:M01:hand_tools", "cleaning_room:M03:"]
     scene_task_hold_s: 45.0           # wait this long before sending it: another tile named the same scene meanwhile ->
                                       # the higher confidence wins (the AI can name a scene it sees beyond a wall)
     # sightings while the robot faces a scene tile (/scene/looking, + scene_look_grace_s) wait for that tile's answer
@@ -33,6 +34,13 @@ mission_reporter:
     scene_looking_topic: /scene/looking
     scene_look_grace_s: 3.0
     scene_held_timeout_s: 90.0
+    # the room of a survivor / object / hazard = the room named for the scene tile it STANDS ON (its map position on the
+    # mission's /tile_map grid, or a scene tile within object_room_margin_m of it), not the room named last (sim
+    # mission_check 26 Nov: a kitchen hazard seen right after the workshop was named went out as 'workshop').
+    # A scene tile not looked at yet: the sighting waits up to object_room_wait_s for its room. false = old behaviour
+    object_room_from_tile: true
+    object_room_margin_m: 0.35
+    object_room_wait_s: 600.0
     pending_max: 50                   # sightings queued while the room is unknown (oldest dropped); replayed once it is known
     require_scene: true               # never report with scene_type "": keep the task open until the room is known
 
@@ -69,7 +77,8 @@ mission_reporter:
     qr_camera: front
     qr_visible_topic: /qr/visible
     require_position: true            # don't answer a task with "pos": null (except qr); wait for a located sighting
-    swap_xy: true                     # report "pos" as [y, x] (map x and y flipped); false = [x, y]
+    swap_xy: false                    # true = report "pos" as [y, x] (map x and y flipped). Off: course B workshop
+                                      # tile 0,-1 went out as [-1.02, 0] and the server marked pos wrong; it is [0, -1.02]
     report_each_task_once: true       # a task is answered by its first matching event, then closed
     output_dir: "~/lite3_mission_results"   # results.jsonl + results.json are written here
     republish_hz: 0.0                 # >0 = re-send all results periodically (late subscribers)

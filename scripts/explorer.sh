@@ -32,8 +32,17 @@
 #   ./explorer.sh --reporter URLB    ... to http://192.168.10.141:8001/task_report_B   (A / B and --reporter=URLA work too)
 #   ./explorer.sh --images           with --bag: also record the depth and (compressed) colour camera images + camera_info, so the
 #                                    slats / curtain detection can be replayed offline (large; implied by --curtains)
-#   ./explorer.sh --bag [bagname]    also record a rosbag to bags/<bagname>_DD_MM_HHMMSS (default bagname: explorer)
+#   ./explorer.sh --bag [bagname]    also record a rosbag to bags/<bagname>_DD_MM_HHMMSS (default bagname: explorer);
+#                                    it always includes the mission reporter's topics + /rosout (filled when --reporter runs)
+#   ./explorer.sh --no-relay         no sensor_relay: every node (and the bag) subscribes to the robot topics itself (old behaviour)
 #   ./explorer.sh stop               Ctrl-C the launch, stop the bag, close the session
+#
+# Robot sensor topics (/imu/data, /leg_odom2, /livox/points, the cameras) all come from one robot process that sends one
+# copy per subscriber in a single loop: every extra subscriber to the cloud or an image used to drop the IMU from 200 Hz
+# to 1-3 Hz. sensor_relay (in the launch) is the only subscriber and republishes them as /local/<topic>; the launch, the
+# perception window and the bag all use those. So the bag records /local/imu/data etc.; replay under the robot names with
+#   ros2 bag play <bag> --remap /local/imu/data:=/imu/data /local/leg_odom2:=/leg_odom2 /local/livox/points:=/livox/points ...
+# For a rate check use `ros2 topic hz /local/imu/data` (or the relay's own log), never the robot topic.
 #   Ctrl-b d / closing the session   same as stop; every process started from the session is killed
 #
 # Settings (environment variables):
@@ -59,15 +68,17 @@ RVIZ_CONFIG="${RVIZ_CONFIG:-$HERE/explorer_debug.rviz}"
 BAG_DIR="$WS/bags"
 BAG_TOPICS="${BAG_TOPICS:-}"
 CLOUD_TOPIC="${CLOUD_TOPIC:-/livox/points}"     # raw lidar cloud, always recorded (terrain / floor analysis)
+RELAY=1
+SP=/local       # sensor prefix: robot sensor topics are read as $SP<topic> (sensor_relay); '' with --no-relay
 
 SOURCE="export EXPLORER_TAG=$SESSION; source $ROS_SETUP && source $WS/install/setup.bash"
 LATCHED="--qos-durability transient_local --qos-reliability reliable"
 
 # Everything needed to replay the exploration decisions: map, tiles, plans, goals, mode, commands, TF.
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
-/exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
+/exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers __SP__$CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /stairs/enable /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /robot_state /robot_state/text /imu/data /leg_odom2 /odom_rebase /scene/looking"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /stairs/enable /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /robot_state /robot_state/text __SP__/imu/data __SP__/leg_odom2 /odom_rebase /scene/looking"
 
 BAG=0
 BAG_NAME=""
@@ -96,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --reporter) REPORTER="${2:?--reporter needs URLA or URLB}"; shift ;;
         --reporter=*) REPORTER="${1#--reporter=}" ;;
         --bag=*) BAG=1; BAG_NAME="${1#--bag=}" ;;
+        --no-relay) RELAY=0; SP= ;;
         *) ARGS+=("$1") ;;
     esac
     shift
@@ -176,12 +188,16 @@ LAUNCH="ros2 launch lite3_explorer exploration.launch.py"
 [[ $OPENING_STAIRS == 0 ]] && LAUNCH+=" stairs_on_opening:=false"
 [[ $ROLLER == 1 ]] && LAUNCH+=" use_rollers:=true"
 [[ -n $ROLLER_ANGLE ]] && LAUNCH+=" roller_angle_deg:=$ROLLER_ANGLE"
+[[ $RELAY == 0 ]] && LAUNCH+=" use_relay:=false"
 [[ -n "$LAUNCH_ARGS" ]] && LAUNCH+=" $LAUNCH_ARGS"
 
 [[ $CURTAINS == 1 ]] && IMAGES=1     # the curtain detector (depth + colour) can only be replayed with the images
-# with --reporter the bag also records what the reporter and perception do (small topics, no images)
-[[ -n $REPORTER ]] && BAG_TOPICS="$BAG_TOPICS /mission/result /scene/result /robot/position /perception/event /perception/qr_text /qr/visible /qr/detections /perception/detections"
-[[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS /camera/depth/image_raw /camera/depth/camera_info /camera/color/image_raw/compressed /camera/color/camera_info"
+# every bag records the mission reporter: its output, all of its inputs, and /rosout for its log lines (held / pending /
+# POSTed); small topics, no images. Topics not published (no --reporter) are simply absent from the bag.
+REPORTER_TOPICS="/mission/result /mission/manual_report /mission/scene_type /scene/result /robot/position /perception/event /perception/llm_result /perception/qr_text /qr/visible /qr/detections /perception/detections /rosout"
+BAG_TOPICS="$BAG_TOPICS $REPORTER_TOPICS"
+[[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS $SP/camera/depth/image_raw $SP/camera/depth/camera_info $SP/camera/color/image_raw/compressed $SP/camera/color/camera_info"
+DEBUG_TOPICS="${DEBUG_TOPICS//__SP__/$SP}"
 if [[ $BAG == 1 ]]; then
     BAG_NAME="${BAG_NAME:-explorer}_$(date +%d_%m_%H%M%S)"     # name_DD_MM_HHMMSS
     BAG_NAME="${BAG_NAME//\//_}"          # a name, not a path: it always lands under bags/
@@ -292,7 +308,7 @@ if [[ -n $REPORTER ]]; then
     tmux new-window -t "$SESSION:" -n perception
     style_window "$SESSION:perception"
     run "$SESSION:perception.0" "PERCEPTION + QR SCANNER" \
-        "ros2 launch lite3_perception perception.launch.py with_qr:=true"
+        "ros2 launch lite3_perception perception.launch.py with_qr:=true sensor_prefix:=$SP"
     tmux new-window -t "$SESSION:" -n reporter
     style_window "$SESSION:reporter"
     run "$SESSION:reporter.0" "MISSION REPORTER (URL$REPORTER)" \

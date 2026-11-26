@@ -134,6 +134,10 @@ class TileTracker:
         self.prop_min_frames = 8
         self.prop_min_score = 4.0
         self.prop_points: List[tuple] = []             # (x, y, confidence, label, range_m) in the map frame
+        # chosen-tile check (check_chosen_props): tiles made scene tiles when they were picked as the target with ANY
+        # scene-prop sighting on them (below the prop_min_frames vote). Unlike a prop-vote tile, an AI 'traversable'
+        # answer reopens one (mark_traversable): a single false sighting must not wall off a corridor.
+        self.prop_chosen: set = set()
         self._map = None                              # (grid array, GridInfo)
         self._map_version = 0
         self._classified_version = -1
@@ -266,6 +270,11 @@ class TileTracker:
                 t = self.tiles.get(tile)
                 if t is not None and tile not in trail:
                     t['scene'], t['prop_scene'] = True, True
+        trail = set(self.trail)
+        for tile in self.prop_chosen - trail - self.traversable:      # picked as the target with props seen on it
+            t = self.tiles.get(tile)
+            if t is not None and t.get('status') not in ('staircase', 'roller', 'closed'):
+                t['scene'], t['prop_scene'], t['prop_chosen'] = True, True, True
         if len(self.stair_points) and self._assign_stairs():   # the map grew: the staircase may only now be found
             self.version += 1
         for tile in set(self.stairs) | self.stairs_crossed:
@@ -544,6 +553,21 @@ class TileTracker:
         """prop_votes on and the tile has enough scene-prop votes."""
         return bool(self.prop_votes) and tuple(tile) in self.prop_tiles()
 
+    def check_chosen_props(self, tile, min_frames: int = 1, min_score: float = 0.0) -> Optional[dict]:
+        """The exploration picked this tile as its target: scene props seen on it (at least min_frames sightings summing to
+        min_score) -> it becomes a scene tile (looked at, never entered). Returns its prop counts then, else None. Not for
+        a tile on the trail, one the AI said is traversable, a staircase / roller tile or one already a scene tile."""
+        tile = tuple(tile)
+        e = self.prop_counts().get(tile)
+        if (not e or e['frames'] < max(int(min_frames), 1) or e['score'] < float(min_score)
+                or tile in set(self.trail) or tile in self.traversable or tile in self.stairs
+                or tile in self.stairs_crossed or tile in self.rollers or self.is_scene(tile)):
+            return None
+        self.prop_chosen.add(tile)
+        self.invalidate()
+        self.update()
+        return e
+
     def add_prop_points(self, points, max_points: int = 20000) -> List[tuple]:
         """Add scene-prop map points; returns the tiles that just got enough votes (re-classifies when there are any)."""
         if not points:
@@ -572,6 +596,7 @@ class TileTracker:
         tile): it becomes an ordinary tile to explore and is never a scene tile again."""
         self.traversable.add(tuple(tile))
         self.described.discard(tuple(tile))
+        self.prop_chosen.discard(tuple(tile))
         self.invalidate()
         self.update()
 

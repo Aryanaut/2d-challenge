@@ -82,8 +82,14 @@ class OmniTraversal(Traversal):
     cell of at least block_cost lies under the body footprint within lookahead_m ahead on the way (a wall, not mere inflation), on timeout_s,
     or when the robot has not got closer by min_progress_m within stall_s.
 
+    Lag (bag fullrun_26_11_210206, rug_hstep): the dog answers /cmd_vel ~1 s late and then keeps going, so the
+    distance and the heading error are taken lead_s ahead (the last command applied for lead_s more, faded in over the
+    first lead_s), and the heading to hold is latched only after heading_latch_s (wz 0 until then): a recovery starts
+    right after Nav2 stopped, while the robot is still coasting round.
+
     Options (traversals.<name>.*): speed_mps, min_speed_mps, gain, tolerance_m, heading_kp, wz_max, block_cost,
-    lookahead_m, body_length_m, body_width_m, body_pad_m, require_costmap, timeout_s, stall_s, min_progress_m."""
+    lookahead_m, body_length_m, body_width_m, body_pad_m, require_costmap, timeout_s, stall_s, min_progress_m, lead_s,
+    heading_latch_s."""
 
     def __init__(self, ctx, name, cfg):
         super().__init__(ctx, name, cfg)
@@ -103,6 +109,8 @@ class OmniTraversal(Traversal):
         self.goal = (float(goal_xy[0]), float(goal_xy[1]))
         self.heading = pose[2] if len(pose) > 2 else 0.0
         self.started = self.ctx.now()
+        self.latched = self._c('heading_latch_s', 0.0) <= 0.0
+        self.last_cmd = (0.0, 0.0, 0.0)                # (vx, vy, wz) robot frame
         self.best, self.best_at = math.dist(pose[:2], self.goal), self.started
         self.result = TraversalResult(RUNNING)
         return True
@@ -156,7 +164,17 @@ class OmniTraversal(Traversal):
         now = self.ctx.now()
         if pose is None:
             return self.result
-        dx, dy = self.goal[0] - pose[0], self.goal[1] - pose[1]
+        yaw = pose[2] if len(pose) > 2 else 0.0
+        c, s = math.cos(yaw), math.sin(yaw)
+        if not self.latched:
+            if now - self.started < self._c('heading_latch_s', 0.0):
+                self.heading = yaw                      # still coasting from whatever drove before: hold what it ends on
+            else:
+                self.latched = True
+        lead = self._c('lead_s', 0.0) * min(1.0, (now - self.started) / max(self._c('lead_s', 0.0), 1e-3))
+        lvx, lvy, lwz = self.last_cmd
+        px, py = pose[0] + lead * (lvx * c - lvy * s), pose[1] + lead * (lvx * s + lvy * c)   # where it will coast to
+        dx, dy = self.goal[0] - px, self.goal[1] - py
         dist = math.hypot(dx, dy)
         if dist <= self._c('tolerance_m', 0.10):
             return self._end(SUCCEEDED)
@@ -170,12 +188,12 @@ class OmniTraversal(Traversal):
         if self._blocked(pose, ux, uy):
             return self._end(FAILED, 'wall in the global costmap on the way')
         v = max(self._c('min_speed_mps', 0.06), min(self._c('speed_mps', 0.2), self._c('gain', 0.8) * dist))
-        yaw = pose[2] if len(pose) > 2 else 0.0
-        c, s = math.cos(yaw), math.sin(yaw)
-        err = math.atan2(math.sin(self.heading - yaw), math.cos(self.heading - yaw))
+        err = math.atan2(math.sin(self.heading - yaw), math.cos(self.heading - yaw)) - lead * lwz
         wlim = self._c('wz_max', 0.3)
-        wz = max(-wlim, min(wlim, self._c('heading_kp', 1.5) * err))
-        self.ctx.drive(v * (ux * c + uy * s), wz, v * (-ux * s + uy * c))      # map -> robot frame
+        wz = max(-wlim, min(wlim, self._c('heading_kp', 1.5) * err)) if self.latched else 0.0
+        vx, vy = v * (ux * c + uy * s), v * (-ux * s + uy * c)                  # map -> robot frame
+        self.last_cmd = (vx, vy, wz)
+        self.ctx.drive(vx, wz, vy)
         return self.result
 
     def _end(self, state, reason=''):

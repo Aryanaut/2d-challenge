@@ -38,6 +38,8 @@ Turns what the robot finds into the organisers' result messages, **one per missi
 **Rules:**
 - Each mission is answered **once**. Later sightings log `no open matching task`.
 - The **same survivor** (within 1 m) can't answer both M03 and M05.
+- A survivor in the M03 room from `scene_tasks` (e.g. `cleaning_room:M03:`) is the one with the QR and is never M05.
+- A survivor held while its room was being identified gets its full `no_qr_wait_s` after it is released.
 - With `require_position: true`, a sighting without a map position doesn't use up a mission. It logs `no position ... task kept open` and waits for a sighting that has one.
 
 ## Install

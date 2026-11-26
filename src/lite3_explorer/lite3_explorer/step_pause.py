@@ -2,8 +2,13 @@
 
 While /step_up is true (the mission manager: the target tile is higher than the one the robot started from) and the IMU
 shows the nose tilting up (the front legs going up the step), the robot is stopped for pause_s at each of
-pause_offsets_s, counted from the moment the tilt was seen: e.g. [0.0, 0.7] = once as the front legs go up, once more
-as the rear legs follow. This gives the robot time to balance on the step. After those pauses no more are made until
+pause_offsets_s, counted in time spent driving forward since the tilt was seen: e.g. [0.0, 0.7] = once as the front
+legs go up, once more as the rear legs follow.
+
+Only forward driving counts (driving=True: Nav2 commands linear motion). Nav2 often turns in place at the edge of the
+step and the h-step gait pitches the nose up +9..13 deg while doing so; fullrun_26_11_210206 (54.5 s, 70.0 s) spent
+both pauses on that turn, and the climb itself (driving on at 0.38 m/s, nose +10..15 deg for 2 s) got none. So a tilt
+only becomes a climb while driving forward, and the clock for the later pauses stops while the robot is not. This gives the robot time to balance on the step. After those pauses no more are made until
 the robot has been level again for rearm_s (a second step on the way to the same tile), or /step_up goes off and on.
 
 step_pause_gate.py (the ROS node) sits between Nav2's velocity smoother and /cmd_vel and sends zero velocity while
@@ -31,6 +36,8 @@ class StepPause:
 
     def reset(self):
         self.climb_t0: Optional[float] = None   # time the climb tilt was confirmed
+        self.climb_s = 0.0                      # forward-driving time since then (offsets are counted in it)
+        self._last_t: Optional[float] = None
         self.next = 0                           # index of the next pause in offsets
         self.pause_until: Optional[float] = None
         self._tilt_since: Optional[float] = None
@@ -42,22 +49,27 @@ class StepPause:
 
     def update(self, t: float, step_up: bool, nose_up_deg: Optional[float], driving: bool = True) -> bool:
         """True = hold the robot still now. nose_up_deg None = no IMU (never pauses). driving False = Nav2 is not
-        commanding motion (no pause starts, one already running finishes)."""
+        commanding forward motion (turning in place, stopped): no climb is detected, no pause starts and the climb clock
+        stands still; a pause already running finishes."""
         self.started = None
         if not step_up:
             self.reset()
             return False
+        dt = 0.0 if self._last_t is None else max(0.0, t - self._last_t)
+        self._last_t = t
         if self.paused(t):
             return True
+        if self.climb_t0 is not None and driving:
+            self.climb_s += dt
         if nose_up_deg is None:
             self._tilt_since = self._level_since = None
             return False
         p = self.p
         if self.climb_t0 is None:
-            if nose_up_deg > p.climb_start_deg:
+            if nose_up_deg > p.climb_start_deg and driving:
                 self._tilt_since = t if self._tilt_since is None else self._tilt_since
                 if t - self._tilt_since >= p.tilt_hold_s:
-                    self.climb_t0, self.next, self._level_since = t, 0, None
+                    self.climb_t0, self.climb_s, self.next, self._level_since = t, 0.0, 0, None
             else:
                 self._tilt_since = None
         else:
@@ -69,11 +81,11 @@ class StepPause:
             else:
                 self._level_since = None
         if (self.climb_t0 is not None and driving and self.next < len(self.offsets)
-                and t - self.climb_t0 >= self.offsets[self.next]):
+                and self.climb_s >= self.offsets[self.next] - 1e-9):
             self.next += 1
             self.pause_until = t + p.pause_s
             self.started = (f'pause {self.next}/{len(self.offsets)} on the step up '
-                            f'({t - self.climb_t0:.1f} s into the climb, nose {nose_up_deg:+.0f} deg)')
+                            f'({self.climb_s:.1f} s of driving into the climb, nose {nose_up_deg:+.0f} deg)')
             return True
         return False
 

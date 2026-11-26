@@ -389,7 +389,9 @@ def test_timeout_after_the_stairs_counts_as_over_them_and_rebases():
 def test_late_imu_messages_never_hand_the_climb_to_the_frozen_map_pose():
     # bag multiterrain_25_11_115442: /imu/data at ~2 Hz; a stale tick fell through to the map-pose check, which (pose
     # frozen in AI mode) saw no progress for stall_s and called the robot stuck after it had crossed: no rebase
-    ctx, m, d, ai, r = build_imu()
+    # turn rate pinned: the stale ticks fall on whole seconds, and a slower square-up shifts them onto the climb's
+    # stall window (the test is about IMU gaps, not turning)
+    ctx, m, d, ai, r = build_imu({'modes.stairs.max_turn_rad_s': 0.6})
     live = r.imu
 
     def gappy():

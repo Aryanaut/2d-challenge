@@ -15,13 +15,17 @@ terrain_classifier:
     use_depth: true
     use_color: true               # the colour camera only feeds the slats lines (terrain_kinds.yaml)
     color:
-      image_topic: /camera/color/image_raw
+      # Raw colour is 900 KB per frame and every frame goes through the System Computer's domain bridge, the same
+      # thread that carries /imu/data: subscribing to it slowed the IMU. Only the compressed image is read now
+      # (the raw topic name below has no publisher). Revert: image_topic: /camera/color/image_raw, no compressed_topic.
+      image_topic: /camera/color/image_raw_unused
+      compressed_topic: /camera/color/image_raw/compressed
     publish_debug_clouds: true    # ~/lidar_points, ~/depth_points (intensity = height above ground plane)
     start_enabled: true
     trigger_mode: false           # true: classify only on ~/classify (once at startup too), then hold the label
     trigger_duration_s: 1.5       # trigger_mode: how long each triggered run lasts (>= confirm_frames / rate_hz)
 
-    # Optional: elevation of the floor against a ground reference taken at the start of the run (robot assumed flat there).
+    # On by default: elevation of the floor against a ground reference taken at the start of the run (robot assumed flat there).
     # /terrain_kind then carries elevation_m (+ higher / - lower than the start floor), elevation_class and slope_deg.
     # Needs kinds.enabled (default) and the odom -> base_link TF. ~/recalibrate_ground (Trigger) takes a new reference.
     elevation:

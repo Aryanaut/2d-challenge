@@ -33,6 +33,7 @@ import uuid
 
 import numpy as np
 import rclpy
+import rclpy.executors
 import yaml
 from rclpy.node import Node
 from rclpy.time import Time
@@ -198,7 +199,7 @@ def main(args=None):
     node = SimPerception()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

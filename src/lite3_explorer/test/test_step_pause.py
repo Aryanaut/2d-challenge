@@ -9,7 +9,8 @@ def run(nose_of_t, step_up=True, t_end=4.0, driving=True, **kw):
     sp = StepPause(StepPauseParams(**kw))
     pauses, start, t = [], None, 0.0
     while t < t_end:
-        held = sp.update(t, step_up(t) if callable(step_up) else step_up, nose_of_t(t), driving)
+        held = sp.update(t, step_up(t) if callable(step_up) else step_up, nose_of_t(t),
+                         driving(t) if callable(driving) else driving)
         if held and start is None:
             start = t
         if not held and start is not None:
@@ -30,7 +31,7 @@ def test_two_short_pauses_on_one_step_up():
     (a0, a1), (b0, b1) = p
     assert 1.0 <= a0 <= 1.2                                   # right after the tilt is confirmed
     assert abs((a1 - a0) - 0.2) < 0.03 and abs((b1 - b0) - 0.2) < 0.03
-    assert abs((b0 - a0) - 0.7) < 0.03
+    assert abs((b0 - a0) - (0.7 + 0.2)) < 0.03                 # 0.7 s of driving: the first pause is not counted
 
 
 def test_one_pause_when_configured():
@@ -56,6 +57,22 @@ def test_step_up_off_ends_a_pause_and_rearms():
     p = run(step, step_up=lambda t: t < 1.15, pause_s=1.0)
     assert len(p) == 1 and p[0][1] <= 1.16
 
+
+
+def test_a_tilt_while_turning_in_place_does_not_use_up_the_pauses():
+    """fullrun_26_11_210206: Nav2 turns in place at the step edge (nose +12 deg, no forward speed), then drives up the step
+    (nose +12 deg again). The pauses belong to the climb, not the turn."""
+    nose = lambda t: 12.0 if (0.5 <= t < 1.0 or 1.5 <= t < 2.5) else 2.0   # noqa: E731
+    p = run(nose, driving=lambda t: t >= 1.5, t_end=4.0)
+    assert len(p) == 2 and all(a >= 1.5 for a, _ in p)
+
+
+def test_pause_offsets_count_forward_driving_time_only():
+    # tilt confirmed at ~1.1 s, then Nav2 stops driving forward for a second: the second pause comes 0.7 s of DRIVING
+    # after the first, not 0.7 s of clock time
+    p = run(step, driving=lambda t: not (1.4 <= t < 2.4), t_end=4.0)
+    assert len(p) == 2
+    assert p[1][0] >= 2.4
 
 # ---------------------------------------------------------------- GaitWait: hold until the robot is in h-step
 from lite3_explorer.step_pause import GaitWait  # noqa: E402

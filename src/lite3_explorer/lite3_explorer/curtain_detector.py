@@ -93,7 +93,9 @@ class CurtainDetector(Node):
             extend_min_m=float(p('colour_extend_min_m', d.extend_min_m).value),
             extend_max_m=float(p('colour_extend_max_m', d.extend_max_m).value),
             min_extend_m2=float(p('colour_min_extend_m2', d.min_extend_m2).value),
-            extend_tol_m=float(p('colour_extend_tol_m', d.extend_tol_m).value))
+            extend_tol_m=float(p('colour_extend_tol_m', d.extend_tol_m).value),
+            open_cells=int(p('colour_open_cells', d.open_cells).value),
+            require_floor=bool(p('colour_require_floor', d.require_floor).value))
         self.colour_cell_m = self.curtain.cell_m
         self.colour_msg = None
         self.colour_k = None

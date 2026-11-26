@@ -9,6 +9,9 @@ mission_manager:
     traversals:
       route:
         backend: follow_waypoints          # the sim has no navigate_through_poses action, only follow_waypoints
+      omni:                                # the simulated robot has no command lag: no lead compensation
+        lead_s: 0.0
+        heading_latch_s: 0.0
     modes:
       idle:
         start_wait_s: 15.0
@@ -17,6 +20,11 @@ mission_manager:
         quickscan_on_edge: false           # no animation_player (pose / scene animations are not simulated)
         curtains: true                     # curtain mode on (launch arg use_curtains:=false turns it off)
         stairs: true                       # stairs mode on for 'M' tiles (launch arg use_stairs:=false turns it off)
+      scene: {turn_lead_s: 0.0}            # no command lag in the sim: in-place turns stop on the target itself
+      curtain: {turn_lead_s: 0.0}
+      roller: {turn_lead_s: 0.0}
+      backtracking: {turn_lead_s: 0.0}
       stairs:
+        turn_lead_s: 0.0
         climber: false                     # no stair_climber node in the simulator: the stairs mode crosses itself (the sim
                                            # world climbs the risers while AI mode is on)
