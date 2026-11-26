@@ -12,12 +12,13 @@ curtain_detector:
     stride: 4                   # use every 4th pixel
     run_rows: 6                 # rows (after the stride) of smooth curtain above the hem
     max_step_m: 0.03            # depth change between neighbouring rows on the curtain (it may slant, not jump)
-    min_jump_m: 0.25            # the floor behind the hem is at least this much farther
+    min_jump_m: 0.15            # the floor behind the hem is at least this much farther
     min_range_m: 0.30
     max_range_m: 3.5
     min_columns: 0.30           # fraction of the image width that must show the curtain
     cell_m: 0.05
-    confirm_hits: 3             # a spot of curtain counts after this many sightings
+    confirm_hits: 3             # a spot of curtain counts after this many sightings (frames) ...
+    min_view_sep_m: 0.0      # ... of which two were taken at least this far apart (0 = off): a robot standing still sees a wall's false detection every frame
     # 3D lidar pointcloud (no depth camera needed): the standard walls are 0.5-0.6 m tall, a curtain returns only floor-level
     # points (its hem) with the tall wall seen further on. Works when the camera sits too close / too low to see the bar.
     use_lidar: true
@@ -37,6 +38,17 @@ curtain_detector:
     colour_min_height_m: 0.12     # above the floor (the wooden ledge under the curtain is ~0.09 m)
     colour_max_texture: 0.012     # curtain ~0.005, OSB wood 0.016-0.033
     colour_max_saturation: 0.30   # curtain 0.04-0.22, OSB 0.25-0.37
-    colour_min_rel_brightness: 0.80   # vs the floor; grey wall ~0.6, curtain ~1.0
+    colour_min_rel_brightness: 0.80   # vs the floor; grey wall ~0.6 (24 Nov) but 0.85-1.1 under the 25 Nov lights, curtain ~1.0
+    colour_min_rel_warmth: 0.03       # per pixel (R - B)/255 above the floor's: the cream curtain +0.04..+0.09 (10th pct >= +0.027),
+                                      # grey walls median <= +0.024 (3 full runs, 25 Nov). This is what rejects the grey walls. -1 = off
     colour_min_area_m2: 0.15      # curtain area needed (far away)...
     colour_min_fraction: 0.10     # ...or this share of the image (close up)
+    # height check: the curtain hangs higher than the arena walls (0.5-0.6 m). The same upright surface must go on up
+    # into 0.6-1.2 m above the floor over at least colour_min_extend_m2 (curtain 0.095-0.134 m2 from 1-1.26 m away,
+    # grey walls <= 0.04 in the 25 Nov full runs). Needs ~1 m distance to see that high; 0 = off.
+    colour_extend_min_m: 0.60
+    colour_extend_max_m: 1.20
+    colour_min_extend_m2: 0.0     # 0 = off: it rejected the curtain close up (fullrun_25_11_233315: 15-44 % of the image from
+                                  # 0.4-0.9 m, extend 0 -> never confirmed) and let the walls beyond the arena through; the
+                                  # warmth test does its job now. 0.06 = the old setting
+    colour_extend_tol_m: 0.15     # band cells count within this horizontal distance of the curtain in the same column

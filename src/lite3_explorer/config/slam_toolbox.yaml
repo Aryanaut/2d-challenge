@@ -10,7 +10,8 @@ slam_toolbox:
     odom_frame: odom
     map_frame: map
     base_frame: base_link
-    scan_topic: /scan
+    scan_topic: /scan                     # launch use_scan_fill:=true sets /scan_slam (scan_fill: no-return rays ahead
+                                          # filled, so open floor is mapped free)
     mode: mapping
     use_sim_time: false
 
@@ -19,7 +20,7 @@ slam_toolbox:
     transform_publish_period: 0.02
     map_update_interval: 1.0
     resolution: 0.05
-    max_laser_range: 1.7
+    max_laser_range: 2.3
     minimum_time_interval: 0.2
     transform_timeout: 1.0                  # map->odom is stamped scan_time + this; SLAM lags of up to ~1 s no longer make Nav2 "extrapolate into the future" (stalled the controller at ~3 Hz)
     tf_buffer_duration: 30.0
@@ -33,30 +34,43 @@ slam_toolbox:
     # not trigger it in a bag replay), and the opening spin turns on the spot, so with 0.2 slam ignored every scan of
     # the spin (map frozen). With 0.02 the map updates.
     minimum_travel_distance: 0.02
-    minimum_travel_heading: 0.05
+    # Tight: integrate a scan every ~1 deg of turning (with minimum_time_interval 0.2 and the slow Spin, every scan of a
+    # scan turn), so each scan match starts from a small rotation and the map does not smear while turning on the spot.
+    minimum_travel_heading: 0.06
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5
-    loop_search_maximum_distance: 3.0
+    # Loop closure kept local and strict. fullrun_25_11_215528: 36 s after the AI-mode stair climb (odom rebased 1.65 m),
+    # a loop closure matched the scans beyond the stairs to the room before them ~2 m away (3.0 m candidate radius,
+    # 8 m search window, 0.35 / 0.45 responses), the optimiser pulled the new part back by (-1.8, +1.0) m and the map
+    # regenerated with it drawn over the old room. The arena is a few metres across and the leg odometry + IMU yaw
+    # drifts by tens of cm, not metres: candidates within 1.5 m, a +-1.5 m window, and a clearly better match needed.
+    loop_search_maximum_distance: 1.5
     do_loop_closing: true
     loop_match_minimum_chain_size: 10
     loop_match_maximum_variance_coarse: 3.0
-    loop_match_minimum_response_coarse: 0.35
-    loop_match_minimum_response_fine: 0.45
+    loop_match_minimum_response_coarse: 0.5
+    loop_match_minimum_response_fine: 0.6
 
     correlation_search_space_dimension: 0.5
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1
-    loop_search_space_dimension: 8.0
+    loop_search_space_dimension: 3.0        # was 8.0 (a +-4 m window let a 2 m false match through)
     loop_search_space_resolution: 0.05
     loop_search_space_smear_deviation: 0.03
 
     distance_variance_penalty: 0.5
-    angle_variance_penalty: 1.0
+    # Odom yaw comes from the IMU and does not drift, so a scan match that turns the robot away from it is penalised hard.
+    # Karto scales a match by max(1 - 0.2*dyaw^2/angle_variance_penalty, minimum_angle_penalty): with the old 1.0 / 0.9 a
+    # 20 deg turn cost only 3 %. Walking through the curtain (curtainshit_25_11_172158) the lidar saw ~120 beams, the
+    # half-blocked scans then matched the next room +21 deg / -0.6 m off, the walls past the curtain were mapped rotated
+    # and the tiles no longer lined up with them. With 0.05 / 0.3: 3 deg costs 1 %, 10 deg 12 %, 20 deg 70 % (floor);
+    # a bag replay of that run keeps map->odom within 1 deg and the second room square to the grid.
+    angle_variance_penalty: 0.05
     fine_search_angle_offset: 0.00349
     coarse_search_angle_offset: 0.349
     coarse_angle_resolution: 0.0349
-    minimum_angle_penalty: 0.9
+    minimum_angle_penalty: 0.3
     minimum_distance_penalty: 0.5
     use_response_expansion: true

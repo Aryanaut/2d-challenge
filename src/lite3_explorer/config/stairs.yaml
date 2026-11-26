@@ -11,6 +11,8 @@ stair_detector:
     global_frame: map           # its z axis must point up
     process_hz: 2.0             # LOW rate: depth frames processed per second
     pause_topic: /ai_mode       # paused while the robot climbs in AI mode
+    enable_topic: /stairs/enable  # latched Bool from the mission manager: on for the opening scan (whole mission with use_stairs)
+    start_enabled: true         # before the first /stairs/enable (the launch file sets it to use_stairs)
     stride: 4                   # use every 4th pixel
     min_range_m: 0.25           # horizontal distance from the camera
     max_range_m: 2.5

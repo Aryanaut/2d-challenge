@@ -6,8 +6,9 @@
                                     points while a standard wall (0.5-0.6 m) returns them up to its top (curtain_core.LidarCurtainMap)
   sub  <colour_topic>               front colour camera (use_colour, default off): a pale, smooth, upright surface above the floor,
                                     as bright as the floor = the fabric curtain (curtain_colour.py); needs the depth image too
-  pub  /curtain/points   std_msgs/String   JSON {"points": [[x, y, ux, uy], ...]} in the map frame (latched): confirmed
-                                           curtain spots and the unit direction the camera was looking at each
+  pub  /curtain/points   std_msgs/String   JSON {"points": [[x, y, ux, uy], ...], "camera": n} in the map frame (latched):
+                                           confirmed curtain spots and the unit direction the camera was looking at each;
+                                           the first n rows are camera spots (depth hem / colour), the rest lidar-only
   pub  /curtain/markers  MarkerArray       the remembered curtain, for RViz
   srv  ~/detect          std_srvs/Trigger  run the depth (+ colour) checks on the latest depth frame NOW (ignores process_hz) and
                                            reply with JSON in `message`: {found, methods, spots, nearest: {x, y, range_m,
@@ -29,7 +30,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 import sensor_msgs_py.point_cloud2 as pc2
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
@@ -63,7 +64,8 @@ class CurtainDetector(Node):
         self.top_height_m = float(p('curtain_top_height_m', 1.0).value)    # a wall whose top is this high is a curtain; 0 = off
         self.top_tol_m = float(p('curtain_top_tol_m', 0.15).value)
         self.floor_z = float(p('floor_z', 0.0).value)                     # map-frame z of the floor
-        self.curtain = cc.CurtainMap(cell_m=float(p('cell_m', 0.05).value), confirm_hits=int(p('confirm_hits', 3).value))
+        self.curtain = cc.CurtainMap(cell_m=float(p('cell_m', 0.05).value), confirm_hits=int(p('confirm_hits', 3).value),
+                                    min_view_sep_m=float(p('min_view_sep_m', 0.15).value))
         self.use_lidar = bool(p('use_lidar', True).value)
         self.cloud_topic = p('cloud_topic', '/livox/points').value
         self.lidar_hz = float(p('lidar_hz', 2.0).value)
@@ -85,13 +87,25 @@ class CurtainDetector(Node):
             max_texture=float(p('colour_max_texture', d.max_texture).value),
             max_saturation=float(p('colour_max_saturation', d.max_saturation).value),
             min_rel_brightness=float(p('colour_min_rel_brightness', d.min_rel_brightness).value),
+            min_rel_warmth=(lambda v: None if v < 0 else v)(float(p('colour_min_rel_warmth', d.min_rel_warmth).value)),
             min_area_m2=float(p('colour_min_area_m2', d.min_area_m2).value),
-            min_fraction=float(p('colour_min_fraction', d.min_fraction).value))
+            min_fraction=float(p('colour_min_fraction', d.min_fraction).value),
+            extend_min_m=float(p('colour_extend_min_m', d.extend_min_m).value),
+            extend_max_m=float(p('colour_extend_max_m', d.extend_max_m).value),
+            min_extend_m2=float(p('colour_min_extend_m2', d.min_extend_m2).value),
+            extend_tol_m=float(p('colour_extend_tol_m', d.extend_tol_m).value))
         self.colour_cell_m = self.curtain.cell_m
         self.colour_msg = None
         self.colour_k = None
         self.tf = Buffer()
-        self.tf_listener = TransformListener(self.tf, self)
+        # /tf on its OWN node and thread: on this node's executor /tf (~57 Hz) starves behind the depth / colour / cloud
+        # callbacks (~0.8 s of work a second). TransformListener(buf, self, spin_thread=True) does NOT avoid that: in
+        # humble it adds this whole node to a second executor, which runs the heavy callbacks too. Bag fullrun_25_11_215528:
+        # the buffer ran 5-14 s behind (curtain placed 35 deg off); fullrun_25_11_233315: up to 40 s behind, and as the
+        # map lookups below are made at the sensor's stamp (a stale buffer skips the frame instead of placing it with an
+        # old pose) every single frame of the run was skipped: the curtain was never looked for.
+        self.tf_node = rclpy.create_node('curtain_detector_tf', start_parameter_services=False)
+        self.tf_listener = TransformListener(self.tf, self.tf_node, spin_thread=True)
         self.intrinsics = None
         self.last = 0.0
         self.version, self.sent_version = 0, -1
@@ -106,6 +120,7 @@ class CurtainDetector(Node):
             self.create_subscription(CameraInfo, self.colour_info_topic, self._on_colour_info, 1)
         if self.use_lidar:
             self.create_subscription(PointCloud2, self.cloud_topic, self._on_cloud, qos_profile_sensor_data)
+        self.create_subscription(Empty, '/map_reset', self._on_map_reset, 10)
         self.depth_msg = None                                  # latest depth frame, for ~/detect
         self.create_service(Trigger, '~/detect', self._on_detect)
         self.create_timer(1.0, self._publish)
@@ -123,35 +138,45 @@ class CurtainDetector(Node):
         if msg.k[0] > 0:
             self.colour_k = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
 
-    def _colour_rgb(self):
-        """Latest colour image as HxWx3 RGB uint8, or None (missing / too old / unknown encoding)."""
+    def _map_tf(self, msg):
+        """global_frame <- msg's frame at the moment the sensor took it (raises when TF has no pose for then). The
+        depth frames are ~0.25 s and the lidar clouds ~0.9 s older than the newest TF, so the pose is normally there;
+        a lookup at Time() instead silently returned whatever pose the buffer had last, however old."""
+        return self.tf.lookup_transform(self.global_frame, msg.header.frame_id, Time.from_msg(msg.header.stamp),
+                                        Duration(seconds=0.2))
+
+    def _colour_rgb(self, ref_stamp):
+        """Latest colour image as HxWx3 RGB uint8, or (None, why) (missing / too far from the depth frame / unknown
+        encoding). Its age is taken against the depth frame being processed (ref_stamp), not the clock now: the frames
+        arrive 0.15-0.5 s old over the domain bridge and wait for processing, so 'now' rejected every one."""
         m = self.colour_msg
         if m is None:
-            return None
-        age = (self.get_clock().now() - Time.from_msg(m.header.stamp)).nanoseconds * 1e-9
+            return None, 'no colour image received'
+        age = abs((Time.from_msg(ref_stamp) - Time.from_msg(m.header.stamp)).nanoseconds) * 1e-9
         if age > self.colour_max_age:
-            return None
+            return None, f'colour image {age:.2f} s from the depth frame (colour_max_age_s {self.colour_max_age:g})'
         if isinstance(m, CompressedImage):
             import cv2                                         # only needed for the compressed topic
             bgr = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_COLOR)
-            return None if bgr is None else bgr[..., ::-1]
+            return (None, 'compressed colour image did not decode') if bgr is None else (bgr[..., ::-1], '')
         img = np.frombuffer(m.data, np.uint8).reshape(m.height, m.step)[:, :m.width * 3].reshape(m.height, m.width, 3)
         if m.encoding == 'rgb8':
-            return img
+            return img, ''
         if m.encoding == 'bgr8':
-            return img[..., ::-1]
-        return None
+            return img[..., ::-1], ''
+        return None, f'colour encoding {m.encoding} (rgb8 / bgr8 / compressed only)'
 
     def _colour_check(self, depth, msg, k):
         """Colour + depth curtain test (curtain_colour.py); adds the curtain to self.curtain."""
-        rgb = self._colour_rgb()
+        rgb, why = self._colour_rgb(msg.header.stamp)
         if rgb is None or self.colour_k is None:
-            self.get_logger().warn('colour check: no recent colour image / camera_info', throttle_duration_sec=10.0)
+            why = why or f'no camera_info on {self.colour_info_topic}'
+            self.get_logger().warn(f'colour check skipped: {why}', throttle_duration_sec=10.0)
             return False
         try:
             tc = self.tf.lookup_transform(self.colour_msg.header.frame_id, msg.header.frame_id, Time(),
                                           Duration(seconds=0.2))
-            tm = self.tf.lookup_transform(self.global_frame, msg.header.frame_id, Time(), Duration(seconds=0.2))
+            tm = self._map_tf(msg)
         except Exception as e:  # noqa: BLE001 - TF not ready yet
             self.get_logger().warn(f'colour check: no TF: {e}', throttle_duration_sec=5.0)
             return False
@@ -168,7 +193,8 @@ class CurtainDetector(Node):
         if self.curtain.add(pts, (tr.x, tr.y)):
             self.version += 1
             self.get_logger().info(f'curtain seen by the colour camera: {det.area_m2:.2f} m2 '
-                                   f'({100 * det.fraction:.0f} % of the image), {float(np.median(det.ranges)):.2f} m '
+                                   f'({100 * det.fraction:.0f} % of the image, {det.extend_m2:.2f} m2 above the walls), '
+                                   f'{float(np.median(det.ranges)):.2f} m '
                                    f'ahead; {len(self.curtain)} spots')
         return True
 
@@ -198,7 +224,7 @@ class CurtainDetector(Node):
         if det is None and top is None:
             return methods, pose
         try:
-            t = self.tf.lookup_transform(self.global_frame, msg.header.frame_id, Time(), Duration(seconds=0.2))
+            t = self._map_tf(msg)
         except Exception as e:  # noqa: BLE001 - TF not ready yet
             self.get_logger().warn(f'no TF {self.global_frame} <- {msg.header.frame_id}: {e}', throttle_duration_sec=5.0)
             return methods, pose
@@ -230,7 +256,7 @@ class CurtainDetector(Node):
             return
         self.lidar_last = now
         try:
-            t = self.tf.lookup_transform(self.global_frame, msg.header.frame_id, Time(), Duration(seconds=0.2))
+            t = self._map_tf(msg)
         except Exception as e:  # noqa: BLE001 - TF not ready yet
             self.get_logger().warn(f'no TF {self.global_frame} <- {msg.header.frame_id}: {e}', throttle_duration_sec=5.0)
             return
@@ -244,6 +270,19 @@ class CurtainDetector(Node):
             self.version += 1
             self.get_logger().info(f'curtain seen by the lidar (floor-level returns, no wall height): '
                                    f'{len(self.lidar)} spots')
+
+    def _on_map_reset(self, _msg):
+        """A new map (new map frame) starts after the stairs: the curtain spots seen so far are in the old one. (The
+        mission manager carries its own memory of the curtain into the new frame.)"""
+        c, lid = self.curtain, self.lidar
+        self.curtain = cc.CurtainMap(cell_m=c.cell_m, confirm_hits=c.confirm_hits, min_view_sep_m=c.min_view_sep_m)
+        self.lidar = cc.LidarCurtainMap(cell_m=lid.cell_m, low_max_m=lid.low_max, high_min_m=lid.high_min,
+                                        max_high_frac=lid.max_high_frac, min_low=lid.min_low,
+                                        min_high_behind=lid.min_high_behind, behind_m=lid.behind_m,
+                                        min_range_m=lid.min_range, max_range_m=lid.max_range, floor_z=lid.floor_z,
+                                        near_m=lid.near_cells * lid.cell_m)
+        self.version += 1
+        self.get_logger().info('new map: curtain spots forgotten.')
 
     def _on_detect(self, request, response):
         """~/detect: process the latest depth frame now, then report this frame's result and the confirmed curtain."""
@@ -279,16 +318,25 @@ class CurtainDetector(Node):
         if self.version == self.sent_version:
             return
         self.sent_version = self.version
-        pts = self._all_points()
-        self.points_pub.publish(String(data=json.dumps({'points': [[round(float(v), 3) for v in r] for r in pts]})))
-        m = Marker()
-        m.header.frame_id = self.global_frame
-        m.ns, m.id, m.type, m.action = 'curtain', 0, Marker.CUBE_LIST, Marker.ADD
-        m.pose.orientation.w = 1.0
-        m.scale.x, m.scale.y, m.scale.z = 0.06, 0.06, 0.6          # a curtain-high strip of magenta per confirmed spot
-        m.color.r, m.color.g, m.color.b, m.color.a = 0.9, 0.2, 0.9, 0.6
-        m.points = [Point(x=float(x), y=float(y), z=0.3) for x, y, _, _ in pts]
-        self.marker_pub.publish(MarkerArray(markers=[m]))
+        cam = self.curtain.confirmed()
+        lid = self.lidar.confirmed() if self.use_lidar else np.zeros((0, 4))
+        pts = np.vstack([cam, lid])
+        self.points_pub.publish(String(data=json.dumps({'points': [[round(float(v), 3) for v in r] for r in pts],
+                                                        'camera': int(len(cam))})))
+        markers = []
+        # a curtain-high strip per confirmed spot: magenta = camera (depth hem / colour), orange = lidar only
+        for i, (ns, rows, rgb) in enumerate((('curtain_camera', cam, (0.9, 0.2, 0.9)),
+                                             ('curtain_lidar', lid, (1.0, 0.55, 0.0)))):
+            m = Marker()
+            m.header.frame_id = self.global_frame
+            m.ns, m.id, m.type = ns, i, Marker.CUBE_LIST
+            m.action = Marker.ADD if len(rows) else Marker.DELETE
+            m.pose.orientation.w = 1.0
+            m.scale.x, m.scale.y, m.scale.z = 0.06, 0.06, 0.6
+            m.color.r, m.color.g, m.color.b, m.color.a = rgb[0], rgb[1], rgb[2], 0.6
+            m.points = [Point(x=float(r[0]), y=float(r[1]), z=0.3) for r in rows]
+            markers.append(m)
+        self.marker_pub.publish(MarkerArray(markers=markers))
 
 
 def main(args=None):
@@ -299,6 +347,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.tf_node.destroy_node()
         node.destroy_node()
         rclpy.try_shutdown()
 

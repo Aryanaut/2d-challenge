@@ -20,9 +20,11 @@ mission_reporter:
     #   ros2 topic pub --once /mission/scene_type std_msgs/String "{data: kitchen}"
     # Room name comes from your scene package. Set the topic it publishes on (std_msgs/String:
     # "kitchen", or JSON {"scene_type": "kitchen"}). The last message received is used for every report.
-    scene_topic: /mission/scene_type
+    scene_topic: /scene/result       # published (latched) by lite3_explorer mission_manager after each scene tile is looked at
     scene_from: topic                 # topic = only that topic decides; perception = use perception's guess first
     default_scene_type: ""
+    pending_max: 50                   # sightings queued while the room is unknown (oldest dropped); replayed once it is known
+    require_scene: true               # never report with scene_type "": keep the task open until the room is known
 
     # pos: taken from YOUR position package's topic. "" = use perception's position instead.
     # position_msg_type: string        (std_msgs/String: "[x, y]", "x,y", or JSON {"x":..,"y":..} / {"pos":[x,y]})

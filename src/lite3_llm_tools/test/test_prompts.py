@@ -25,7 +25,8 @@ def test_parse_tile_choice(desc, evidence, choice, sides):
 
 
 def test_every_task_has_a_prompt_file():
-    assert set(P.PROMPT_FILES) == {'describe_view', 'describe_tile', 'describe_scene', 'place_initial_tile', 'choose_tile', 'choose_frontier'}
+    assert set(P.PROMPT_FILES) == {'describe_view', 'describe_tile', 'describe_scene', 'describe_scene_refs', 'place_initial_tile',
+                                  'choose_tile', 'choose_frontier'}
     for task in P.PROMPT_FILES:
         assert pathlib.Path(P.prompt_path(task)).resolve().is_file()
     assert P.prompt_path('choose_tile', '/x/custom.txt') == '/x/custom.txt'

@@ -90,3 +90,22 @@ def test_override_wins_over_terrain_and_clearing_returns_the_terrain_gait():
     sw.mark_sent(cmd, 5.0)
     assert sw.set_override(None)
     assert sw.pending_command(10.0).gait == sw.flat_gait
+
+
+def test_frozen_keeps_the_current_gait_until_the_next_tile_or_terrain():
+    # recovery mode: the robot keeps the gait it already has, whatever its recovery targets / new terrain / step up say
+    s = TerrainGaitSwitcher(flat_delay_s=0.0, min_switch_interval_s=0.0)
+    s.update_terrain('non_rugged', 0.0)
+    cmd = s.pending_command(0.0)
+    s.mark_sent(cmd, 0.0)
+    assert s.gait == s.flat_gait
+    assert s.freeze(True)
+    s.arm()                                              # a recovery target
+    s.update_terrain('rugged', 1.0)                      # a new terrain while recovering
+    s.set_override('rug_hstep')                          # a step up
+    assert s.pending_command(2.0) is None and s.gait == s.flat_gait
+    assert s.freeze(False)
+    assert s.pending_command(3.0) is None                # not the moment the freeze ends ...
+    s.arm()                                              # ... only at the next tile
+    cmd = s.pending_command(4.0)
+    assert cmd is not None and cmd.gait == 'rug_hstep'

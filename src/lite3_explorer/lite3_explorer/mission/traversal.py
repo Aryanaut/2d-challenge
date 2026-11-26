@@ -79,11 +79,11 @@ class OmniTraversal(Traversal):
 
     The heading the robot has at start() is held (wz P-controller); the robot slides towards the goal in its own frame.
     Speed ramps down near the goal (gain * distance, between min_speed_mps and speed_mps). Fails when a global-costmap
-    cell of at least block_cost lies within lookahead_m ahead on the way (a wall, not mere inflation), on timeout_s,
+    cell of at least block_cost lies under the body footprint within lookahead_m ahead on the way (a wall, not mere inflation), on timeout_s,
     or when the robot has not got closer by min_progress_m within stall_s.
 
     Options (traversals.<name>.*): speed_mps, min_speed_mps, gain, tolerance_m, heading_kp, wz_max, block_cost,
-    lookahead_m, timeout_s, stall_s, min_progress_m."""
+    lookahead_m, body_length_m, body_width_m, body_pad_m, require_costmap, timeout_s, stall_s, min_progress_m."""
 
     def __init__(self, ctx, name, cfg):
         super().__init__(ctx, name, cfg)
@@ -107,19 +107,45 @@ class OmniTraversal(Traversal):
         self.result = TraversalResult(RUNNING)
         return True
 
+    def _footprint_hits(self, grid, info, x, y, yaw, block):
+        """Set of costmap cells >= block under the body rectangle (body_length_m x body_width_m, padded) at (x, y, yaw)."""
+        from lite3_explorer.costmap_escape import cost_at
+        pad = self._c('body_pad_m', 0.03)
+        hl = self._c('body_length_m', 0.61) / 2 + pad
+        hw = self._c('body_width_m', 0.37) / 2 + pad
+        step = max(info.resolution, 0.02)
+        c, s = math.cos(yaw), math.sin(yaw)
+        hits = set()
+        nu, nv = int(2 * hl / step) + 1, int(2 * hw / step) + 1
+        for i in range(nu + 1):
+            u = -hl + 2 * hl * i / nu
+            for j in range(nv + 1):
+                v = -hw + 2 * hw * j / nv
+                px, py = x + u * c - v * s, y + u * s + v * c
+                cost = cost_at(grid, info, px, py)
+                if cost is not None and cost >= block:
+                    hits.add(info.world_to_cell(px, py))
+        return hits
+
     def _blocked(self, pose, ux, uy):
+        """True when the BODY (not just its centre) would touch a wall cell within lookahead_m along (ux, uy).
+
+        The heading is held, so the rectangle keeps the starting yaw. Cells already under the body now are ignored
+        (a recovery starts inside the obstacle zone; it must be able to slide out). A missing / stale global costmap
+        blocks (fail closed) unless require_costmap is false."""
         snap = self.ctx.costmap_snapshot() if hasattr(self.ctx, 'costmap_snapshot') else None
         if snap is None:
-            return False
-        from lite3_explorer.costmap_escape import cost_at
+            return bool(self.cfg.get('require_costmap', False)) and hasattr(self.ctx, 'costmap_snapshot')
         grid, info = snap
         block = self._c('block_cost', 100)
         ahead = min(self._c('lookahead_m', 0.30), math.dist(pose[:2], self.goal))
         steps = max(1, int(ahead / max(info.resolution, 0.02)))
+        yaw = self.heading if self.heading is not None else (pose[2] if len(pose) > 2 else 0.0)
+        already = self._footprint_hits(grid, info, pose[0], pose[1], yaw, block)
         for k in range(1, steps + 1):
             d = ahead * k / steps
-            c = cost_at(grid, info, pose[0] + ux * d, pose[1] + uy * d)
-            if c is not None and c >= block:
+            hits = self._footprint_hits(grid, info, pose[0] + ux * d, pose[1] + uy * d, yaw, block)
+            if hits - already:
                 return True
         return False
 

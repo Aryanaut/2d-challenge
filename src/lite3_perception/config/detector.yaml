@@ -54,6 +54,11 @@ object_detector:
     qr_report: false                              # QR codes are identified (survivor with/without QR) but NOT reported
     qr_assoc_s: 3.0                               # QR in view within this many seconds of the survivor = "has QR"
     qr_text_topic: /perception/qr_text            # every newly decoded QR string, exactly as decoded
+    qr_source: scanner                            # scanner = qr_scanner node (started by perception.launch.py)
+                                                  # builtin = old cv2 decoder in this node; both = both
+    qr_visible_topic: /qr/visible
+    qr_detections_topic: /qr/detections
+    qr_camera: front                              # only this qr_scanner camera counts for "QR beside survivor"
 
     publish_observations: true                    # send reports to lite3_mission_reporter
     observation_topic: /mission_reporter/observation

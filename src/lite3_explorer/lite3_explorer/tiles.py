@@ -1,9 +1,9 @@
 """1 m x 1 m tile system over the SLAM map (no ROS).
 
 The grid is anchored by the initial tile (chosen with the AI at start-up) and may be
-rotated to line up with the maze walls. Tile (0, 0) is the initial tile. The grid is oriented by the
-robot's initial heading: j grows forward (tiles in front of the initial tile are positive) and i grows
-to the right (tiles to its right are positive); behind / to the left are negative.
+rotated to line up with the maze walls. Tile (0, 0) is the initial tile. The grid yaw is the wall angle
+in [0, 90) deg of the map frame (along the map axes when no walls are found): i grows along the grid's +x,
+j along its +y. The robot's heading does not turn the grid; it only picks the start tile's back wall.
 
 Tile status
   visited   the robot's centre has been inside the tile (part of the trail)
@@ -134,6 +134,53 @@ def find_wall(along: np.ndarray, across: np.ndarray, *, d_min: float, d_max: flo
     return None if found is None else float(np.median(along[np.abs(along - found[0]) <= band_m]))
 
 
+def align_to_walls(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, robot_xy: Sequence[float], *,
+                   radius_m: float = 2.0, max_shift_m: float = 0.15, max_rot_deg: float = 6.0,
+                   min_quality: float = 1.5, occupied_threshold: int = 65) -> Optional[dict]:
+    """A small correction of the tile grid so the edges of `tile` (the one the robot stands in) lie on the walls seen
+    around the robot. Turn: the wall angle (estimate_wall_angle) nearest the grid's own, within max_rot_deg. Edges: per
+    axis the walls of the robot's own tile (start_tile_walls; two opposite walls are averaged) pull that tile edge onto
+    them, within max_shift_m (further off: not a wall of this tile, the axis is left alone). The grid turns about the tile's
+    south-west corner. Returns {'grid': TileGrid, 'rot_deg', 'shift_u', 'shift_v', 'walls', 'quality'} or None (no
+    walls / nothing worth correcting)."""
+    rx, ry = float(robot_xy[0]), float(robot_xy[1])
+    pts = _occupied_points(grid, info, (rx, ry), radius_m, occupied_threshold)
+    est = estimate_wall_angle(pts)
+    if est is None or est[1] < min_quality:
+        return None
+    half_turn = math.pi / 2
+    d_yaw = wrap(est[0] - tg.yaw + math.pi / 4) % half_turn - math.pi / 4      # nearest wall angle, in [-45, 45) deg
+    if abs(d_yaw) > math.radians(max_rot_deg):
+        d_yaw = 0.0                                                            # walls are not this grid's: keep the turn
+    yaw = tg.yaw + d_yaw
+    c, s = math.cos(yaw), math.sin(yaw)
+    walls = start_tile_walls(pts, (rx, ry), yaw, tg.size)
+    sw = tg.corners(tile)[0]
+    low = [c * sw[0] + s * sw[1], -s * sw[0] + c * sw[1]]                      # the tile's SW corner in the new frame
+    old = list(low)
+    r = (c * rx + s * ry, -s * rx + c * ry)
+    shifts = []
+    for ax, axis in enumerate(('u', 'v')):
+        implied = [r[ax] + walls[k] - tg.size if k[0] == '+' else r[ax] - walls[k]
+                   for k in ('+' + axis, '-' + axis) if k in walls]
+        shift = 0.0
+        if implied:
+            want = sum(implied) / len(implied)
+            if abs(want - low[ax]) <= max_shift_m:
+                shift = want - low[ax]
+                low[ax] = want
+        shifts.append(shift)
+    if abs(d_yaw) < math.radians(0.2) and max(abs(shifts[0]), abs(shifts[1])) < 0.01:
+        return None
+    ou, ov = low[0] - tile[0] * tg.size, low[1] - tile[1] * tg.size            # grid origin in the new frame
+    new = TileGrid(c * ou - s * ov, s * ou + c * ov, yaw, tg.size)
+    if tuple(new.tile_of(rx, ry)) != tuple(tile):
+        return None                                                            # would put the robot on another tile
+    return {'grid': new, 'rot_deg': round(math.degrees(d_yaw), 2), 'shift_u': round(shifts[0], 3),
+            'shift_v': round(shifts[1], 3), 'walls': {k: round(d, 3) for k, d in walls.items()},
+            'quality': round(est[1], 2)}
+
+
 def start_tile_walls(pts: np.ndarray, robot_xy: Sequence[float], yaw: float, size: float) -> dict:
     """Walls of the robot's own tile in the grid frame turned by yaw: {'+u', '-u', '+v', '-v'} -> distance from the
     robot (m) or missing. Searched from a quarter to 0.7 of a tile away (a robot standing near the tile centre)."""
@@ -165,20 +212,14 @@ def initial_candidates(grid: np.ndarray, info: GridInfo, robot_pose: Sequence[fl
         half = size / 2.0
         return TileGrid(rx - c * half + s * half, ry - s * half - c * half, yaw, size)
 
-    def oriented(yaw):
-        """The same wall-aligned grid turned by a multiple of 90 deg so that +j points along the robot's initial
-        heading (tiles in front are positive) and +i to its right (tiles on the right are positive)."""
-        if heading is None:
-            return yaw
-        want = heading - math.pi / 2.0
-        return want + round(wrap(yaw - want) / (math.pi / 2.0)) * (math.pi / 2.0)
-
+    # The grid yaw is the wall angle itself, never mixed with the heading. (An earlier "+j along the heading" step
+    # returned heading - 90 deg snapped to quarter turns, which threw the wall angle away: in bag
+    # stairs69_25_11_105440 the walls were at 22 deg and the grid at 31.3 deg.)
     cands = []
     pts = _occupied_points(grid, info, (rx, ry), radius_m, occupied_threshold)
     est = estimate_wall_angle(pts)
     if est is not None:
         yaw, quality = est
-        yaw = oriented(yaw)
         c, s = math.cos(yaw), math.sin(yaw)
         walls = start_tile_walls(pts, (rx, ry), yaw, size)
         back = None
@@ -208,7 +249,6 @@ def initial_candidates(grid: np.ndarray, info: GridInfo, robot_pose: Sequence[fl
             cands.append({'grid': centre, 'kind': 'centred on the robot, turned to match the walls'})
     if est is None or abs(math.degrees(est[0]) % 90) > 3:
         cands.append({'grid': centred(0.0), 'kind': 'centred on the robot, along the map axes'})
-        cands[-1]['grid'] = centred(oriented(0.0))
     for letter, cand in zip('ABCD', cands):
         cand['id'] = letter
         cand['sides'] = tile_sides(grid, info, cand['grid'], (0, 0), occupied_threshold=occupied_threshold)
@@ -216,9 +256,11 @@ def initial_candidates(grid: np.ndarray, info: GridInfo, robot_pose: Sequence[fl
 
 
 # ----------------------------------------------------------- classification
-def tile_sides(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, *, free_threshold: int = 25,
-               occupied_threshold: int = 65, samples: int = 20, wall_fraction: float = 0.4) -> Dict[str, str]:
-    """wall / open / unknown for each side, sampling the map along the edge (±1 cell)."""
+def side_shares(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, *, free_threshold: int = 25,
+                occupied_threshold: int = 65, samples: int = 20) -> Dict[str, Tuple[float, float]]:
+    """(wall share, free share) of each side: the share of points along the edge with mapped wall within ±1 cell, and
+    the share whose ±1 cell window is all free. A maze wall reads ~1.0 wall; clutter on an edge (furniture legs, a box)
+    reads partly (bag endconditiontest_25_11_201356, tile 2,0 outside the maze: 0.55-0.65)."""
     result = {}
     for side in SIDES:
         (x0, y0), (x1, y1) = tg.edge(tile, side)
@@ -232,13 +274,27 @@ def tile_sides(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, *, fr
                 occ += 1
             elif ((win >= 0) & (win <= free_threshold)).all():
                 free += 1
-        if occ >= wall_fraction * samples:
+        result[side] = (round(occ / samples, 2), round(free / samples, 2))
+    return result
+
+
+def sides_from_shares(shares: Dict[str, Tuple[float, float]], wall_fraction: float = 0.4) -> Dict[str, str]:
+    result = {}
+    for side, (occ, free) in shares.items():
+        if occ >= wall_fraction:
             result[side] = 'wall'
-        elif free >= 0.5 * samples:
+        elif free >= 0.5:
             result[side] = 'open'
         else:
             result[side] = 'unknown'
     return result
+
+
+def tile_sides(grid: np.ndarray, info: GridInfo, tg: TileGrid, tile: Tile, *, free_threshold: int = 25,
+               occupied_threshold: int = 65, samples: int = 20, wall_fraction: float = 0.4) -> Dict[str, str]:
+    """wall / open / unknown for each side, sampling the map along the edge (±1 cell)."""
+    return sides_from_shares(side_shares(grid, info, tg, tile, free_threshold=free_threshold,
+                                         occupied_threshold=occupied_threshold, samples=samples), wall_fraction)
 
 
 def edge_key(tg: TileGrid, tile: Tile, side: str) -> tuple:
@@ -256,9 +312,25 @@ def side_towards(a: Tile, b: Tile) -> Optional[str]:
 
 
 def edge_coverage(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, occupied_threshold: int = 65,
-                  samples: int = 20) -> List[Tuple[tuple, Tuple[Tuple[float, float], Tuple[float, float]], float]]:
-    """Every tile edge (each shared edge once) as (key, world segment, share of it that lies on mapped wall)."""
+                  samples: int = 20, band_m: float = 0.0
+                  ) -> List[Tuple[tuple, Tuple[Tuple[float, float], Tuple[float, float]], float]]:
+    """Every tile edge (each shared edge once) as (key, world segment, share of it that lies on mapped wall).
+
+    A sample point along the edge is on wall when a mapped wall cell lies within ±1 cell of it or, with band_m > 0,
+    within ±1 cell of any point up to band_m across the edge (either side). The grid is often a few cm off the maze
+    walls (only the tiles the robot enters are aligned): bag fullrun_25_11_225456, tile 0,-1 W, wall 8-15 cm inside
+    the tile, 25% on the ±1 cell line -> never a virtual wall; 70% with a 0.15 m band."""
     out, seen = [], set()
+    h, w = grid.shape
+    occ_map = grid >= occupied_threshold
+    dil = occ_map.copy()                          # wall within ±1 cell (the 3x3 window around a sample)
+    dil[1:, :] |= occ_map[:-1, :]
+    dil[:-1, :] |= occ_map[1:, :]
+    row = dil.copy()
+    dil[:, 1:] |= row[:, :-1]
+    dil[:, :-1] |= row[:, 1:]
+    f = (np.arange(samples) + 0.5) / samples
+    offsets = (np.arange(-band_m, band_m + 1e-9, info.resolution) if band_m > 0 else np.zeros(1))
     for tile, t in tiles.items():
         if t.get('status') == 'unknown':
             continue
@@ -268,13 +340,16 @@ def edge_coverage(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, occu
             if key in seen:
                 continue
             seen.add(key)
-            occ = 0
-            for f in (np.arange(samples) + 0.5) / samples:
-                r, c = info.world_to_cell(x0 + f * (x1 - x0), y0 + f * (y1 - y0))
-                win = grid[max(0, r - 1):r + 2, max(0, c - 1):c + 2]
-                if win.size and (win >= occupied_threshold).any():
-                    occ += 1
-            out.append((key, ((x0, y0), (x1, y1)), occ / samples))
+            length = math.hypot(x1 - x0, y1 - y0) or 1.0
+            nx, ny = -(y1 - y0) / length, (x1 - x0) / length          # across the edge
+            px = x0 + f[:, None] * (x1 - x0) + offsets[None, :] * nx  # samples x offsets
+            py = y0 + f[:, None] * (y1 - y0) + offsets[None, :] * ny
+            r = np.floor((py - info.origin_y) / info.resolution).astype(np.int64)
+            c = np.floor((px - info.origin_x) / info.resolution).astype(np.int64)
+            inside = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+            hit = np.zeros(r.shape, bool)
+            hit[inside] = dil[r[inside], c[inside]]
+            out.append((key, ((x0, y0), (x1, y1)), float(hit.any(axis=1).sum()) / samples))
     return out
 
 
@@ -287,7 +362,8 @@ def wall_edges(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles, *, min_fra
 
 def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, free_threshold: int = 25,
                    occupied_threshold: int = 65, min_free: float = 0.15, min_known: float = 0.70,
-                   scene_min_known: float = 0.85, scene_max_free: float = 0.80) -> Dict[Tile, dict]:
+                   scene_min_known: float = 0.85, scene_max_free: float = 0.80,
+                   scene_margin_m: float = 0.10) -> Dict[Tile, dict]:
     """Status and coverage for every tile that has any mapped cell (plus every visited tile).
 
     A tile is defined (to_visit / blocked) only once at least min_known of its area has been
@@ -297,7 +373,11 @@ def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, f
     'scene' marks a SCENE tile: (almost) completely scanned (known >= scene_min_known) and less than scene_max_free of
     its SCANNED area traversable (free / known). Relative to the scanned area, not the whole tile: a cluttered tile always
     has corners hidden behind its own clutter until the robot stands on it, so an absolute free share with a ~0.95 scan
-    gate flagged it too late (after it was entered). It is a flag only: the status (and so the tile selection) is unchanged."""
+    gate flagged it too late (after it was entered). It is a flag only: the status (and so the tile selection) is unchanged.
+    The free/known ratio of the scene test ('scene_free') is taken over the tile's INTERIOR only, scene_margin_m in from
+    every edge: maze walls lie on the tile edges, and with the grid a few cm off them (bag curtaintest_25_11_132200: grid
+    centred on the robot, ~8 cm from the walls) the walls of a dead-end fall inside it and read as clutter (empty tile
+    2,0: free/known 0.85 on the whole tile -> flagged, 0.98 inside the margin). A scene's props stand inside the tile."""
     h, w = grid.shape
     cols, rows = np.meshgrid(np.arange(w), np.arange(h))
     xs = info.origin_x + (cols + 0.5) * info.resolution
@@ -323,16 +403,22 @@ def classify_tiles(grid: np.ndarray, info: GridInfo, tg: TileGrid, visited, *, f
     occ_c = count(grid >= occupied_threshold)
     edge_c = count(unmapped_edge_cells(grid, free_threshold))
     known_c = count(known)
+    m = min(max(0.0, scene_margin_m / tg.size), 0.45)            # the scene test's inset, as a share of a tile side
+    fu, fv = u / tg.size - ti, v / tg.size - tj
+    interior = (fu >= m) & (fu < 1.0 - m) & (fv >= m) & (fv < 1.0 - m)
+    in_known_c = count(known & interior)
+    in_free_c = count((grid >= 0) & (grid <= free_threshold) & interior)
 
     visited = set(map(tuple, visited))
     tiles = {}
     for k in np.nonzero(known_c)[0]:
         tile = (int(k // nj + i0), int(k % nj + j0))
         tot = max(1, int(total[k]))
+        scene_free = in_free_c[k] / in_known_c[k] if in_known_c[k] else 1.0   # free/known inside the margin
         info_t = {'free': round(free_c[k] / tot, 2), 'occupied': round(occ_c[k] / tot, 2),
                   'known': round(known_c[k] / tot, 2), 'unmapped_edge': bool(edge_c[k] > 0),
-                  'scene': bool(known_c[k] / tot >= scene_min_known
-                                 and free_c[k] / known_c[k] < scene_max_free)}
+                  'scene_free': round(scene_free, 2),
+                  'scene': bool(known_c[k] / tot >= scene_min_known and scene_free < scene_max_free)}
         if tile in visited:
             status = 'visited'
         elif info_t['known'] < min_known:
@@ -392,6 +478,173 @@ def connected_steps(tiles: Dict[Tile, dict], start: Tile) -> Dict[Tile, Tuple[in
                 seen[b] = (steps + 1, path + [b])
                 queue.append(b)
     return seen
+
+
+# ------------------------------------------------------- ending tile (end condition ending_tile)
+_WALKABLE = ('visited', 'to_visit', 'unreachable')
+_AXES = (('E', 'W', ('N', 'S')), ('N', 'S', ('E', 'W')))   # (forward, backward, the two long sides)
+
+
+def wall_count(tiles: Dict[Tile, dict], tile: Tile) -> int:
+    sides = tiles.get(tile, {}).get('sides', {})
+    return sum(1 for s in SIDES if sides.get(s) == 'wall')
+
+
+def _step(tile: Tile, side: str) -> Tile:
+    di, dj, _ = _STEPS[side]
+    return (tile[0] + di, tile[1] + dj)
+
+
+def _joined(tiles: Dict[Tile, dict], a: Tile, side: str) -> bool:
+    """No wall on the side a shares with its neighbour (from either tile)."""
+    b = _step(a, side)
+    back = _STEPS[side][2]
+    return tiles.get(a, {}).get('sides', {}).get(side) != 'wall' and \
+        tiles.get(b, {}).get('sides', {}).get(back) != 'wall'
+
+
+def hallways(tiles: Dict[Tile, dict], min_tiles: int = 4) -> List[List[Tile]]:
+    """Straight one-tile-wide hallways: runs of at least min_tiles walkable tiles in a row (along i or j), each with a
+    mapped wall on both long sides, consecutive tiles joined by a side that is not a wall. Each run is maximal."""
+    out = []
+    for fwd, back, lateral in _AXES:
+        def ok(t):
+            d = tiles.get(t)
+            return d is not None and d['status'] in _WALKABLE and \
+                all(d.get('sides', {}).get(s) == 'wall' for s in lateral)
+        for t in sorted(tiles):
+            if not ok(t):
+                continue
+            prev = _step(t, back)
+            if ok(prev) and _joined(tiles, prev, fwd):
+                continue                                   # not the start of a run
+            run = [t]
+            while ok(_step(run[-1], fwd)) and _joined(tiles, run[-1], fwd):
+                run.append(_step(run[-1], fwd))
+            if len(run) >= min_tiles:
+                out.append(run)
+    return out
+
+
+def open_tiles(tiles: Dict[Tile, dict], solid_wall_share: Optional[float] = None) -> List[Tile]:
+    """Walkable tiles with no wall on any edge, every side mapped (an unknown side does not count).
+    solid_wall_share None: every side reads 'open'. Else no side is a SOLID wall (mapped wall along at least this share
+    of the edge, tile 'wall_share'): clutter partly on an edge (outside the maze) is no maze wall."""
+    out = []
+    for t, d in sorted(tiles.items()):
+        sides = d.get('sides', {})
+        if d['status'] not in _WALKABLE or len(sides) < 4 or 'unknown' in sides.values():
+            continue
+        if solid_wall_share is None:
+            ok = all(v == 'open' for v in sides.values())
+        else:
+            share = d.get('wall_share') or {s: (1.0 if v == 'wall' else 0.0) for s, v in sides.items()}
+            ok = all(share.get(s, 0.0) < solid_wall_share for s in SIDES)
+        if ok:
+            out.append(t)
+    return out
+
+
+def looks_open(d: dict, solid_wall_share: Optional[float] = 0.4, min_seen_share: float = 0.5) -> bool:
+    """A tile the lidar shows with no wall: no edge with mapped wall along solid_wall_share of it or more (0.4 = the wall
+    / open classification of tile_sides: any edge read as a wall, maze wall or clutter, rules the tile out; an open edge
+    reads <= ~0.25 from the wall ends at its corners), and every
+    edge mapped (wall + free) along at least min_seen_share of it, so an edge the scan has not reached does not pass as
+    open. Needs the tracker's wall_share / free_share (a tile still 'unknown' has none).
+    solid_wall_share None: every side must read 'open' instead."""
+    occ, free = d.get('wall_share'), d.get('free_share')
+    if d.get('status') not in _WALKABLE or not occ or not free:
+        return False
+    if solid_wall_share is None:
+        return all(d.get('sides', {}).get(s) == 'open' for s in SIDES)
+    return all(occ.get(s, 0.0) < solid_wall_share and occ.get(s, 0.0) + free.get(s, 0.0) >= min_seen_share
+               for s in SIDES)
+
+
+def next_open_tile(tiles: Dict[Tile, dict], current: Tile, *, solid_wall_share: Optional[float] = 0.4,
+                   min_seen_share: float = 0.5, exclude=()) -> Optional[Tile]:
+    """The tile next to `current`, through an open side of it, that the scan shows with no walls (looks_open): the
+    outside of the maze seen from its last tile. None when the current tile looks open itself (the robot is already
+    outside) or no neighbour does. Tiles in `exclude` (walked already) are skipped."""
+    d = tiles.get(tuple(current))
+    if d is None or looks_open(d, solid_wall_share, min_seen_share):
+        return None
+    for side in SIDES:
+        if d.get('sides', {}).get(side) != 'open':
+            continue
+        n = _step(tuple(current), side)
+        if n not in exclude and n in tiles and looks_open(tiles[n], solid_wall_share, min_seen_share):
+            return n
+    return None
+
+
+def find_ending_tile(tiles: Dict[Tile, dict], trail: Sequence[Tile], *, min_hallway_tiles: int = 4,
+                     triggers: Sequence[str] = ('hallway', 'open_tile'), walls: int = 2,
+                     entered_only: bool = False, preceding: bool = True,
+                     solid_wall_share: Optional[float] = None, min_seen_share: float = 0.5) -> Optional[dict]:
+    """The ENDING tile: a hallway of at least min_hallway_tiles tiles and/or a tile with no walls (the TRIGGER) was
+    found; the ending tile is the tile preceding it on the robot's route that has exactly `walls` walls on its edges
+    (and is not part of a trigger itself).
+
+    The route is the trail (the tiles the robot walked, in order). A trigger the robot has not walked into yet is
+    reached by the shortest walkable route from the current tile, appended to the trail. Triggers on the trail are tried
+    in the order the robot met them; one with no such tile before it (e.g. the start tile) is skipped.
+    entered_only: only triggers on the trail count (the robot stood in them, so the lidar saw all their edges), never one
+    seen from a distance. preceding False: the trigger tile itself is the ending tile.
+    Trigger next_tile (checked first): the scan from the CURRENT tile (the trail's last) shows the tile next to it with
+    no walls (next_open_tile): the current tile is the ending tile and the robot never enters the outside.
+    The INITIAL tile (the trail's first) is never the ending tile.
+    Returns {'tile', 'trigger_tile', 'trigger'} or None."""
+    start = tuple(trail[0]) if trail else None
+    if 'next_tile' in triggers and trail and tuple(trail[-1]) != start:
+        cur = tuple(trail[-1])
+        n = next_open_tile(tiles, cur, solid_wall_share=solid_wall_share, min_seen_share=min_seen_share,
+                           exclude={tuple(t) for t in trail})
+        if n is not None:
+            return {'tile': cur, 'trigger_tile': n, 'trigger': f'the scan shows next tile {tile_label(n)} with no walls'}
+    feature: Dict[Tile, str] = {}
+    if 'hallway' in triggers:
+        for run in hallways(tiles, min_hallway_tiles):
+            for t in run:
+                feature.setdefault(t, f'hallway of {len(run)} tiles {tile_label(run[0])}..{tile_label(run[-1])}')
+    if 'open_tile' in triggers:
+        for t in open_tiles(tiles, solid_wall_share):
+            feature.setdefault(t, f'tile {tile_label(t)} has no walls')
+    if not feature:
+        return None
+    route = []
+    for t in trail:
+        t = tuple(t)
+        if not route or route[-1] != t:
+            route.append(t)
+
+    def before(route, hit):
+        if not preceding:
+            if route[hit] == start:
+                return None
+            return {'tile': route[hit], 'trigger_tile': route[hit], 'trigger': feature[route[hit]]}
+        for k in range(hit - 1, -1, -1):
+            t = route[k]
+            if t != start and t not in feature and wall_count(tiles, t) == walls:
+                return {'tile': t, 'trigger_tile': route[hit], 'trigger': feature[route[hit]]}
+        return None
+
+    for hit, t in enumerate(route):
+        if t in feature:
+            found = before(route, hit)
+            if found is not None:
+                return found
+    if not route or entered_only:
+        return None
+    on_trail = set(route)
+    reach = [(steps, path) for t, (steps, path) in connected_steps(tiles, route[-1]).items()
+             if t in feature and t not in on_trail]
+    if not reach:
+        return None
+    _, path = min(reach, key=lambda r: (r[0], r[1][-1]))
+    ext = route + path[1:]
+    hit = next(k for k in range(len(route), len(ext)) if ext[k] in feature)
+    return before(ext, hit)
 
 
 def nearest_connected_targets(grid: np.ndarray, info: GridInfo, tg: TileGrid, tiles: Dict[Tile, dict],

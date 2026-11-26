@@ -99,6 +99,9 @@ class MissionReporter(Node):
         self.require_pos = p("require_position", True).value
         self.same_survivor_r = float(p("same_survivor_radius_m", 1.0).value)
         self.hold_unknown = p("hold_unknown_scene_survivors", True).value
+        self.require_scene = p("require_scene", True).value
+        self.pending_max = int(p("pending_max", 50).value)
+        self.pending = []                        # sightings / QR texts waiting for the room to become known
         self.survivors = []                      # (task_id, [x, y]) already reported
         self.qr_positions = []                   # where QR codes were seen ([x, y])
         self.qr_near_r = float(p("qr_near_survivor_m", 1.5).value)
@@ -116,7 +119,9 @@ class MissionReporter(Node):
         self.pub = self.create_publisher(String, "/mission/result", qos)
         self.scene_from = p("scene_from", "topic").value           # "topic" = only the scene topic decides
         scene_topic = p("scene_topic", "/mission/scene_type").value
-        self.create_subscription(String, scene_topic, self.on_scene, 10)
+        # latched like the publisher (mission_manager /scene/result), so a room published before we started is still received
+        scene_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(String, scene_topic, self.on_scene, scene_qos)
         self.get_logger().info(f"scene from {scene_topic} (scene_from={self.scene_from})")
         self.create_subscription(String, "/mission/manual_report", self.on_manual, 10)
         # pos: taken from your position package's topic (same idea as the scene topic)
@@ -153,6 +158,29 @@ class MissionReporter(Node):
         if txt and txt != self.scene:
             self.scene = txt
             self.get_logger().info(f"scene_type -> '{self.scene}'")
+        self._flush_pending()
+
+    def _queue(self, item):
+        """Called with self.lock held: keep a sighting until the room is known (oldest dropped past pending_max)."""
+        self.pending.append(item)
+        if len(self.pending) > self.pending_max:
+            self.pending.pop(0)
+        self.get_logger().warn(f"room unknown - {len(self.pending)} sighting(s) queued until it is known",
+                               throttle_duration_sec=5.0)
+
+    def _flush_pending(self):
+        """The room is known now: answer the queued sightings, oldest first (each still needs an open matching task)."""
+        if not self.scene:
+            return
+        with self.lock:
+            items, self.pending = self.pending, []
+        if items:
+            self.get_logger().info(f"room known ('{self.scene}'): replaying {len(items)} queued sighting(s)")
+        for kind, a in items:
+            if kind == "qr":
+                self._answer_qr(a)
+            else:
+                self.process(*a)
 
     def _subscribe_position(self, topic, kind):
         """kind: string | point_stamped | pose_stamped | pose_cov | odometry | point | pose"""
@@ -204,6 +232,8 @@ class MissionReporter(Node):
 
     def _pos(self, ev):
         """Position for a report: your position topic if set, otherwise perception's."""
+        if ev.get("_pos_at_sighting") is not None:
+            return list(ev["_pos_at_sighting"])           # queued sighting: where the robot WAS, not where it is now
         if self.pos_topic:
             return list(self.topic_pos) if self.topic_pos is not None else None
         return event_position(ev)
@@ -219,14 +249,21 @@ class MissionReporter(Node):
                 pass
         if not txt.strip():
             return
+        self._answer_qr(txt)
+
+    def _answer_qr(self, txt):
         with self.lock:
             task = next((t for t in self.tasks if t["type"] == "qr" and not (self.once and t["done"])), None)
             if task is None:
                 self.get_logger().info(f"QR '{txt}': qr task already answered, not reported",
                                        throttle_duration_sec=5.0)
                 return
+            scene_out = task["scene"] or self.scene
+            if self.require_scene and not self._norm(scene_out):
+                self._queue(("qr", txt))
+                return
             task["done"] = True
-            res = build_result(self.group_id, task["id"], "qr", task["scene"] or self.scene, "", None, txt)
+            res = build_result(self.group_id, task["id"], "qr", scene_out, "", None, txt)
             self._emit(res)
 
     def on_event(self, msg):
@@ -300,6 +337,11 @@ class MissionReporter(Node):
                              and (not t["label"] or t["label"] == label)), None)
             if task is None:
                 self.get_logger().info(f"event {ttype}/{label}: no open matching task, not reported")
+                return
+            if self.require_scene and not self._norm(task["scene"] or scene_now):
+                ev_q = dict(ev)
+                ev_q["_pos_at_sighting"] = self._pos(ev)       # freeze the position now; the replay may be much later
+                self._queue(("event", (ev_q, label, confirmed, room)))
                 return
             task["done"] = True
             if ttype == "qr":

@@ -6,7 +6,9 @@ time. Each tick the machine
   2. runs the STUCK supervisor for watched modes: stuck (no motion / in the global costmap obstacle zone) while
      unexplored tiles remain -> the recovery mode (drive to the nearest tile centre),
   3. ticks the current mode, which may return a Transition to another mode.
-Checkpoint end conditions (all tiles explored) are evaluated by modes at their decision points via check_end().
+Checkpoint end conditions (all tiles explored) are evaluated by modes at their decision points via check_end() /
+end_hop(). A condition with a goal (ending_tile: drive to the ending tile's centre) makes end_hop() hand over to the
+mode that goes there.
 
 The context object (`ctx`, the ROS node in production, a fake in tests) gives modes everything they need:
   now() log(level, msg) pose() -> [x, y, yaw] | None      tiles (TileTracker)
@@ -17,13 +19,14 @@ The context object (`ctx`, the ROS node in production, a fake in tests) gives mo
   costmap_cost_at_robot() -> int | None   clear_costmaps()
   animation_play(name) -> bool  animation_state() -> 'pending' | 'running' | 'done'  animation_cancel()
   set_target(label, goal_xy, route)       event(kind, **data)   on_mode_change(mode, phase)   on_complete(reason)
-  curtain_points() -> Nx4 (x, y, ux, uy) | None    (only with curtains: true)
+  curtain_points() -> Nx4 (x, y, ux, uy) or Nx5 (+ 1 camera / 0 lidar-only spot) | None    (only with curtains: true)
   drive(vx, wz, vy=0.0)  stop()  costmap_snapshot() -> (grid, GridInfo) | None      (curtain, stairs and mppi modes)
   ai_mode(on, cmd_code) -> bool   robot AI mode on / off via /simple_cmd; False = no robot listening   (stairs mode)
-  stair_climber_ai_on(on)  stair_climber: AI mode is already on (the mission entered it)                   (stairs mode, climber)
+  robot_state() -> (basic, gait, policy, motion) | None   /robot_state (0x0901 report); optional   (stairs mode: AI on / off
+                           is sent again until the robot reports it)
   rebase_odom(x, y, yaw)   the robot is here (global frame) after the AI-mode climb: odom is re-anchored   (stairs mode)
   (staircase tiles come in through tiles.set_stair_points(); the mission manager feeds it /stairs/points)
-  hstep(on)   hold the h-step gait (/step_up) while the roller mode crosses a roller            (roller mode)
+  hstep(on)   hold the h-step gait (/step_up) while crossing a roller / curtain    (roller, curtain modes)
   (roller tiles come in through tiles.set_roller_points(); the mission manager feeds it /roller/points)
 """
 from __future__ import annotations
@@ -31,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+from lite3_explorer import tiles as T
 from lite3_explorer.mission.config import mode_cfg
 from lite3_explorer.mission.end_conditions import MissionSnapshot, build_end_condition
 from lite3_explorer.mission.stuck import StuckDetector
@@ -115,15 +119,17 @@ class ModeMachine:
             needed.add(self.recovery_mode)
         for mode in self.modes.values():
             needed.update(t for t in mode.targets() if t)
+        self.end = build_end_condition(cfg['end_condition'])
+        needed.update(c.mode for c in self.end.conditions if getattr(c, 'mode', None))   # e.g. ending_tile -> ending
         missing = sorted(needed - set(self.modes))
         if missing:
             raise ValueError(f'mode(s) {missing} are referenced but not in mission.modes {list(self.modes)}')
-        self.end = build_end_condition(cfg['end_condition'])
         self._explorations = {}
         for mode in self.modes.values():          # fail at start-up on a bad exploration profile, not mid-mission
             for name in getattr(mode, 'exploration_profiles', []):
                 self.exploration(name)
         self.scenes_done = set()           # scene tiles already looked at (never twice)
+        self.scene_calls = {}              # scene tile label -> (pose, AI call): described in the background (scene mode)
         self.curtains_tried = set()        # tiles behind a curtain that was already walked into (never twice)
         self.stairs_tried = set()          # staircase tiles the stairs mode already went for (never twice)
         self.scanned_tile = None           # tile the last scan finished on (the end condition waits for a scan on the last tile)
@@ -133,9 +139,26 @@ class ModeMachine:
         self.started_at: Optional[float] = None
         self.finished_reason: Optional[str] = None
         self.recoveries = 0                       # consecutive recoveries without reaching a new tile
+        self.ending_failures = 0                  # ending mode: attempts at the ending tile's centre that failed
+        self._ending_announced = None
+        self.ending_driven = None                 # ending tile the ending mode drove to (centred on) already
         self._visited_seen = 0
         self.transitions = []
         self.quickscanned = set()                 # tile labels already quickscanned on their edge
+
+    def reset_for_new_map(self):
+        """A new map (and tile grid) starts: everything remembered by tile label belongs to the old grid."""
+        self.scenes_done, self.curtains_tried, self.stairs_tried = set(), set(), set()
+        if self.scene_calls:
+            self.ctx.log('warn', f'New map: dropping {len(self.scene_calls)} scene description(s) still pending '
+                                 f'({", ".join(sorted(self.scene_calls))}): their tile labels belong to the old grid.')
+        self.scene_calls = {}
+        self.rollers_tried, self.quickscanned = set(), set()
+        self.scanned_tile = None
+        self.recoveries = 0
+        self.ending_failures, self._ending_announced, self.ending_driven = 0, None, None
+        self.end.reset()
+        self._visited_seen = 0
 
     # ------------------------------------------------------------- lifecycle
     def start(self):
@@ -163,8 +186,29 @@ class ModeMachine:
         self._switch(Transition(name, reason, kwargs))
         return True, f'switched to {name}'
 
+    # ------------------------------------------------------------- background scene descriptions
+    def describe_in_background(self, label, pose, call):
+        """Scene mode took its pictures and does not wait for the AI: record the answer when it comes (poll_scene_calls)."""
+        self.scene_calls[label] = (pose, call)
+        self.ctx.event('scene_background', tile=label, pending=sorted(self.scene_calls))
+
+    def poll_scene_calls(self):
+        for label, (pose, call) in list(self.scene_calls.items()):
+            if not call.done:
+                continue
+            del self.scene_calls[label]
+            if not call.ok:
+                self.ctx.log('warn', f'Scene tile {label}: AI description failed in the background ({call.failure()}).')
+            self.ctx.record_scene(label, pose, call)
+            self.ctx.event('scene_described', tile=label, ok=bool(call.ok), background=True)
+            if self.current is not None and self.current.type_name == 'complete' \
+                    and tuple(int(v) for v in label.split(',')) in self.ctx.tiles.traversable:
+                self.ctx.log('warn', f'Scene tile {label}: the AI called it traversable after the mission finished; '
+                                     f'it is not explored.')
+
     # ------------------------------------------------------------- the loop
     def tick(self):
+        self.poll_scene_calls()
         mode = self.current
         now = self.ctx.now()
         tiles = self.ctx.tiles
@@ -172,7 +216,7 @@ class ModeMachine:
             self._visited_seen = tiles.visited_count()
             self.recoveries = 0
         if mode.type_name not in ('idle', 'complete') and self.started_at is not None:
-            reason = self.end.check(self.snapshot(), checkpoint=False)
+            reason = self._unless_centring(self.end.check(self.snapshot(), checkpoint=False))
             if reason:
                 return self._finish(reason)
         if self.stuck is not None and mode.name in self.stuck_watch:
@@ -192,6 +236,13 @@ class ModeMachine:
             # inside the costmap obstacle zone Nav2 cannot plan out: move the robot out directly (x / y velocity)
             self._switch(Transition(nudge, f'stuck: {why}'))
             return
+        explorer = self._first_of_type('exploring')
+        if self.ctx.tiles.stairs_forced and explorer is not None and mode.type_name in ('exploring', 'backtracking'):
+            # going for a forced staircase: no recovery, backtrack to the tile in front of it again from here
+            hop = self.modes[explorer].stairs_backtrack(f'stuck: {why}')
+            if hop is not None:
+                self._switch(hop)
+                return
         if self.ctx.tiles.unexplored():
             exclude = [mode.target_label] if mode.target_label else []
             self._switch(Transition(self.recovery_mode, f'stuck: {why}', {'exclude': exclude}))
@@ -209,12 +260,60 @@ class ModeMachine:
         if not tiles.ready or not getattr(self.ctx, 'opening_done', True):
             return MissionSnapshot({}, 0, elapsed_s=elapsed, tiles_ready=False)
         tiles.update()
-        return MissionSnapshot(tiles.counts(), tiles.visited_count(), sorted(set(tiles.unexplored()) | set(tiles.curtains_left())),
-                               sorted(tiles.unreachable), elapsed, map=tiles.map)
+        return MissionSnapshot(tiles.counts(), tiles.visited_count(),
+                               sorted(set(tiles.unexplored()) | set(tiles.curtains_left()) | set(self.stairs_left())),
+                               sorted(tiles.unreachable), elapsed, map=tiles.map, tiles=tiles.tiles,
+                               trail=list(tiles.trail), pose=self.ctx.pose(), grid=tiles.grid)
+
+    def stairs_left(self):
+        """The staircase, while it is still to be climbed (found, not crossed, not tried yet, an exploring mode climbs
+        stairs): the mission is not over before it is (the tiles beyond it are closed until then)."""
+        tiles = self.ctx.tiles
+        stair = tiles.staircase_tile
+        if stair is None or tiles.stairs_crossed or tuple(stair) in self.stairs_tried:
+            return []
+        if not any(m.type_name == 'exploring' and m.cfg.get('stairs', False) for m in self.modes.values()):
+            return []
+        return [T.tile_label(stair)]
 
     def check_end(self) -> Optional[str]:
         """Checkpoint: evaluate every end condition. Returns the reason to finish, or None."""
         return self.end.check(self.snapshot(), checkpoint=True)
+
+    def end_hop(self) -> Optional[Transition]:
+        """Checkpoint: the transition the end conditions ask for. To complete_mode when they are met; else, when a
+        condition first needs the robot somewhere (ending_tile: the ending tile's centre), to the mode that drives there;
+        else None (keep exploring)."""
+        reason = self._unless_centring(self.check_end())
+        goal = self.end.goal()
+        if reason:
+            return Transition(self.complete_mode, reason)
+        if goal is None or goal['mode'] not in self.modes:
+            return None
+        if self._ending_announced != goal['tile']:
+            self._ending_announced = goal['tile']
+            self.ctx.log('info', goal['reason'])
+            self.ctx.event('ending_tile', tile=T.tile_label(goal['tile']), reason=goal['reason'])
+        return Transition(goal['mode'], goal['reason'], {'tile': goal['tile']})
+
+    def _unless_centring(self, reason: Optional[str]) -> Optional[str]:
+        """None instead of a condition's own 'met' while its goal mode has not driven to the goal tile yet: the ending
+        tile counts as reached within reach_radius_m, but the ending mode still centres the robot on it first. Other
+        conditions (time_limit, ...) finish at once."""
+        goal = self.end.goal()
+        if (reason and goal is not None and goal['mode'] in self.modes and self.ending_driven != goal['tile']
+                and reason.startswith(goal.get('condition', '') + ':')):
+            return None
+        return reason
+
+    def goal_hop(self) -> Optional[Transition]:
+        """Checkpoint, before anything else a mode would do here (scenes, stairs, rollers): once a condition has a goal
+        (ending_tile: the robot has left the maze) it takes precedence. None while no condition has one."""
+        if self.end.goal() is None:
+            self.check_end()                       # may find one now
+            if self.end.goal() is None:
+                return None
+        return self.end_hop()
 
     def _finish(self, reason):
         self._switch(Transition(self.complete_mode, reason))
@@ -258,6 +357,7 @@ class ModeMachine:
         from lite3_explorer.mission.exploration import build_exploration
         if name not in self._explorations:
             self._explorations[name] = build_exploration(self.ctx, name, self.cfg.get('explorations', {}))
+            self._explorations[name].machine = self
         return self._explorations[name]
 
     def _first_of_type(self, type_name):

@@ -249,6 +249,8 @@ def test_roller_beside_the_tile_is_crossed_in_hstep_then_marked_explored():
     assert tiles.trail.index((1, 0)) < tiles.trail.index((2, 0))
     assert tiles.tiles[(1, 0)]['status'] == 'visited'                           # explored
     assert all(label != '1,0' for _, label in ctx.drives if _ != 'cmd')        # never a Nav2 target
+    assert tiles.known_route((3, 0), (0, 0)) is None                            # the initial tile is closed once left
+    tiles.initial_tile = None                                                   # (were it open:)
     assert tiles.known_route((3, 0), (0, 0)) == [(3, 0), (2, 0), (0, 0)]       # back over the roller: one hop ...
     assert tiles.roller_between((2, 0), (0, 0)) == (1, 0)                       # ... that the roller mode crosses
     assert any(k == 'roller_crossed' for k, _ in ctx.events)

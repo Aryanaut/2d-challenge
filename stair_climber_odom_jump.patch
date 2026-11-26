@@ -1,0 +1,526 @@
+--- a/src/lite3_stair_climber/stair_climber/state_machine.py
++++ b/src/lite3_stair_climber/stair_climber/state_machine.py
+@@ -190,6 +190,11 @@
+     stuck_window: float = 5.0
+     stuck_min_progress: float = 0.03
+     sensor_timeout: float = 0.5         # IMU/odom older than this -> abort
++    # Odometry jumps (24 Nov, stairs_ai3): ~2 s after Enter AI /leg_odom2 restarts in a new frame (x 4.03 -> 0.59), and
++    # at Exit AI it jumps back. A pose step bigger than this between two ticks is a frame change, not motion: the
++    # heading / distance references are moved with it, so the jump never becomes a steering command.
++    odom_jump_m: float = 0.4
++    odom_jump_deg: float = 15.0
+ 
+ 
+ @dataclass
+@@ -286,6 +291,8 @@
+         self.abort_reason = ''
+         self.transitions = []          # [(t, from, to, why)] for logging/tests
+         self._forced_abort = None
++        self._last_odom = None         # (x, y, yaw) of the previous tick, for jump detection
++        self.odom_jumps = []           # [(t, dx, dy, dyaw_deg)] absorbed frame changes
+ 
+     # ------------------------------------------------------------------ API
+ 
+@@ -297,9 +304,11 @@
+         p = self.p
+ 
+         if not o.enabled:
++            self._last_odom = None
+             if self.state != State.IDLE:
+                 self._go(State.IDLE, o, 'disabled')
+             return Command(State.IDLE, note='disabled')
++        self._absorb_odom_jump(o)
+ 
+         if self.state == State.IDLE:
+             self._go(State.SEARCH, o, 'enabled')
+@@ -317,7 +326,26 @@
+         return cmd
+ 
+     # -------------------------------------------------------------- helpers
++
++    def _absorb_odom_jump(self, o):
++        """Odometry restarted in another frame (Enter / Exit AI): carry the references over to the new frame."""
++        last, self._last_odom = self._last_odom, (o.x, o.y, o.yaw)
++        if last is None:
++            return
++        dyaw = _wrap(o.yaw - last[2])
++        if (math.hypot(o.x - last[0], o.y - last[1]) <= self.p.odom_jump_m
++                and abs(math.degrees(dyaw)) <= self.p.odom_jump_deg):
++            return
++        c, cs, sn = self.c, math.cos(dyaw), math.sin(dyaw)
+ 
++        def carry(pt):                  # same place relative to the robot, in the new frame
++            dx, dy = pt[0] - last[0], pt[1] - last[1]
++            return (o.x + cs * dx - sn * dy, o.y + sn * dx + cs * dy)
++        c.yaw_ref = _wrap(c.yaw_ref + dyaw)
++        c.state_xy, c.start_xy = carry(c.state_xy), carry(c.start_xy)
++        c.progress_hist = []
++        self.odom_jumps.append((o.t, o.x - last[0], o.y - last[1], math.degrees(dyaw)))
++
+     def _go(self, new: State, o: Observation, why: str):
+         self.transitions.append((o.t, self.state, new, why))
+         self.state = new
+@@ -485,6 +513,10 @@
+             self.c.start_z = o.z
+             self.c.align_dist = s.distance
+             nxt = State.WALK_TO_AI_ZONE if p.use_ai_gait else State.SWITCH_TO_STAIR_GAIT
++            if p.use_ai_gait and o.ai_on_already:
++                # the mission already turned AI on (inside the 1 m cell): no odometry-measured walk, no Enter AI;
++                # CROSS_AI walks forward on IMU + time like after a normal Enter AI
++                nxt = State.CROSS_AI
+             self._go(nxt, o, f'aligned at {s.distance:.2f} m')
+             return self._stop('aligned')
+         def cmd(err, tol, k, vmin, vmax):
+--- a/src/lite3_stair_climber/stair_climber/stair_climber_node.py
++++ b/src/lite3_stair_climber/stair_climber/stair_climber_node.py
+@@ -180,6 +180,7 @@
+         # the mission manager puts the robot in AI mode itself (before enabling this node) and says so here (latched):
+         # no Move Mode on enable (it would leave AI mode) and no second Enter AI
+         self.ai_on_already = False
++        self._jumps_logged = 0
+         self.create_subscription(Bool, '/stair_climber/ai_on', self.on_ai_on,
+                                  QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                             durability=DurabilityPolicy.TRANSIENT_LOCAL))
+@@ -342,6 +343,11 @@
+             ai_on_already=self.ai_on_already,
+         )
+         cmd = self.sm.update(obs)
++        if len(self.sm.odom_jumps) > self._jumps_logged:
++            jt, jx, jy, jyaw = self.sm.odom_jumps[-1]
++            self._jumps_logged = len(self.sm.odom_jumps)
++            self.get_logger().warn(f'odometry jumped ({jx:+.2f}, {jy:+.2f}) m, {jyaw:+.1f} deg '
++                                   f'(new odom frame, e.g. Enter/Exit AI): references moved with it')
+ 
+         if cmd.state != self.last_state:
+             why = self.sm.transitions[-1][3] if self.sm.transitions else ''
+--- a/src/lite3_stair_climber/test/test_state_machine.py
++++ b/src/lite3_stair_climber/test/test_state_machine.py
+@@ -48,6 +48,8 @@
+         self.gaits = []
+         self.vlm_requests = 0
+         self.view = (0.3, 1.6)         # distances at which the lidar can see the first step
++        self.wall_x = None             # world x of a wall after the stairs (None = no wall)
++        self.fake_wall = None          # f(x) -> a false wall reading (posts on the way up), or None
+ 
+     def detection(self):
+         d = EDGE - self.x
+@@ -62,8 +64,13 @@
+         if round(self.t / DT) % 4 == 0:
+             self.seq += 1
+         roll = math.radians(30) if self.roll_at is not None and self.x > self.roll_at else 0.0
++        wall = math.inf
++        if self.wall_x is not None and 0.35 <= self.wall_x - self.x <= 2.0:
++            wall = self.wall_x - self.x
++        if self.fake_wall is not None and self.fake_wall(self.x) is not None:
++            wall = self.fake_wall(self.x)
+         obs = Observation(t=self.t, roll=roll, pitch=-math.radians(nose_up), x=self.x, z=z,
+-                          stair=self.detection(), stair_seq=self.seq, vlm=self.vlm)
++                          stair=self.detection(), stair_seq=self.seq, vlm=self.vlm, wall_dist=wall)
+         cmd = self.sm.update(obs)
+         if cmd.gait_code:
+             self.gaits.append(cmd.gait_code)
+@@ -187,8 +194,9 @@
+     sim = Sim(params())
+     cmd = sim.run()
+     assert cmd.state == State.DONE, (sim.sm.transitions, sim.sm.abort_reason)
+-    assert State.TOP_PLATFORM not in states_visited(sim)
+-    assert State.DESCEND in states_visited(sim)
++    # The crest check fires as the nose drops, then TOP_PLATFORM sees nose-down at once.
++    v = states_visited(sim)
++    assert v.index(State.CLIMB_UP) < v.index(State.DESCEND) < v.index(State.DONE)
+ 
+ 
+ def test_blind_zone_long_approach():
+@@ -206,3 +214,290 @@
+         assert cmd.state == State.DONE, (sim.sm.transitions, sim.sm.abort_reason)
+     finally:
+         me.EDGE = old
++
++
++def test_recorded_run_profile_with_gait_sequence(monkeypatch):
++    """Pitch profile shaped like the manual run of 12 Nov (stairs_run2):
++    nose-up ~35 deg on the steps, ~10 deg once the front legs are on the top,
++    nose-down ~35 deg going down. Odom z did NOT follow the climb, so it is flat.
++    Gaits: H-Step up, flat across the top, Grip down; stop-and-go throughout."""
++    import test_state_machine as me
++    H_STEP, GRIP = 0x21010407, 0x21010402
++
++    def recorded(x):
++        a = EDGE - 0.1
++        if x < a:
++            return 0.0, 0.0
++        if x < a + 0.15:
++            return 12.0, 0.0
++        if x < a + 0.9:
++            return 35.0, 0.0
++        if x < a + 1.0:
++            return 10.0, 0.0
++        if x < a + 1.6:
++            return -35.0, 0.0
++        if x < a + 1.7:
++            return -13.0, 0.0
++        return 0.0, 0.0
++
++    monkeypatch.setattr(me, 'world', recorded)
++    sim = Sim(params(stair_gait_code=H_STEP, top_gait_code=FLAT, descend_gait_code=GRIP,
++                     use_odom_height=False, pulse_move_s=2.0, pulse_pause_s=1.0,
++                     climb_speed=0.06, descend_speed=0.05, platform_speed=0.05,
++                     climb_timeout=60.0, descend_timeout=60.0, stuck_window=12.0,
++                     max_pitch_deg=48.0))
++    cmd = sim.run(seconds=300)
++    assert cmd.state == State.DONE, (sim.sm.transitions, sim.sm.abort_reason)
++    assert states_visited(sim) == [
++        State.SEARCH, State.ALIGN, State.SWITCH_TO_STAIR_GAIT, State.APPROACH,
++        State.CLIMB_UP, State.SWITCH_TO_TOP_GAIT, State.TOP_PLATFORM,
++        State.SWITCH_TO_DESCEND_GAIT, State.DESCEND, State.CLEAR_BOTTOM,
++        State.SWITCH_TO_FLAT_GAIT, State.DONE]
++    assert sim.gaits == [H_STEP, FLAT, GRIP, FLAT]
++
++
++def test_false_crest_goes_back_to_climbing(monkeypatch):
++    """Front feet get up (25 deg), slip back (10 deg for a while) -> false crest ->
++    flat gait. When the nose goes steeply up again it must return to H-Step."""
++    import test_state_machine as me
++    H_STEP, GRIP = 0x21010407, 0x21010402
++
++    def slippy(x):
++        a = EDGE - 0.1
++        for lim, nose in ((0.0, 0.0), (0.1, 12.0), (0.2, 25.0), (0.32, 10.0), (0.9, 35.0),
++                          (1.0, 10.0), (1.6, -35.0), (1.7, -13.0)):
++            if x < a + lim:
++                return nose, 0.0
++        return 0.0, 0.0
++
++    monkeypatch.setattr(me, 'world', slippy)
++    sim = Sim(params(stair_gait_code=H_STEP, top_gait_code=FLAT, descend_gait_code=GRIP,
++                     use_odom_height=False, pulse_move_s=2.0, pulse_pause_s=1.0,
++                     climb_speed=0.06, descend_speed=0.05, platform_speed=0.05,
++                     climb_timeout=60.0, descend_timeout=60.0, stuck_window=12.0,
++                     max_pitch_deg=48.0))
++    cmd = sim.run(seconds=400)
++    assert cmd.state == State.DONE, (sim.sm.transitions, sim.sm.abort_reason)
++    assert sim.gaits == [H_STEP, FLAT, H_STEP, FLAT, GRIP, FLAT]
++
++
++# ------------------------------------------------------------- AI-gait path
++
++AI_ENTER, AI_EXIT = 0x21010528, 0x2101052B
++
++
++def test_ai_gait_crossing():
++    # the fake world's platform is 0.8 m long (arena: 18 cm), so disable the long-flat fallback
++    sim = Sim(params(use_ai_gait=True, align_standoff=1.5, ai_flat_any_s=100.0))
++    raw = []
++    orig = sim.sm.update
++
++    def spy(o):
++        c = orig(o)
++        if c.gait_code:
++            raw.append((c.gait_code, c.raw_code, sim.x))
++        return c
++    sim.sm.update = spy
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    assert states_visited(sim) == [
++        State.SEARCH, State.ALIGN, State.WALK_TO_AI_ZONE, State.ENTER_AI, State.CROSS_AI,
++        State.EXIT_AI, State.SWITCH_TO_FLAT_GAIT, State.DONE]
++    assert [(c, r) for c, r, _ in raw] == [(AI_ENTER, True), (AI_EXIT, True), (FLAT, False)]
++    # 1-cell rule: Enter AI within 1 m before the first step...
++    enter_x, exit_x = raw[0][2], raw[1][2]
++    assert 0.0 < EDGE - enter_x < 1.0
++    # ...and Exit AI within 1 m after the end of the stairs (fake stairs end at EDGE+2.2)
++    assert 0.0 < exit_x - (EDGE + 2.2) < 1.0
++    assert STAIR not in sim.gaits
++
++
++def test_ai_gait_never_climbing_aborts():
++    sim = Sim(params(use_ai_gait=True, align_standoff=1.5))
++    sim.sm.p.climb_start_pitch_deg = 90.0      # pitch never "climbing"
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.ABORT
++    assert 'no tilt' in sim.sm.abort_reason
++
++
++def test_ai_gait_ignores_odometry_and_handles_level_body(monkeypatch):
++    """AI gait might keep the body almost level (only ~10 deg up, never nose-down),
++    and odometry might not update. It must still finish and Exit AI."""
++    import test_state_machine as T
++    monkeypatch.setattr(T, 'world', lambda x: ((10.0 if EDGE - 0.2 < x < EDGE + 2.0 else 0.0), 0.0))
++    sim = Sim(params(use_ai_gait=True, align_standoff=1.5))
++    real_update = sim.sm.update
++    frozen = {}
++
++    def update(o):
++        # odometry frozen from the moment AI mode starts
++        if sim.sm.state in (State.CROSS_AI, State.EXIT_AI):
++            o.x = frozen.setdefault('x', o.x)
++        return real_update(o)
++    sim.sm.update = update
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    assert State.EXIT_AI in states_visited(sim)
++
++
++def test_ai_slows_down_after_nose_down():
++    sim = Sim(params(use_ai_gait=True, align_standoff=1.5, ai_flat_any_s=100.0,
++                     ai_speed=0.3, ai_down_speed=0.1))
++    speeds = {}
++    orig = sim.sm.update
++
++    def spy(o):
++        c = orig(o)
++        if c.state == State.CROSS_AI and c.vx > 0:
++            speeds.setdefault(sim.sm.c.seen_down, set()).add(round(c.vx, 2))
++        return c
++    sim.sm.update = spy
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE
++    assert 0.3 in speeds[False] and speeds[True] == {0.1}
++
++
++# ---------------------------------------------------------------- wall after the stairs (24 Nov)
++STAIRS_END = EDGE + 2.2      # the fake stairs end here
++
++
++def ai_params(**kw):
++    base = dict(use_ai_gait=True, align_standoff=1.5, ai_flat_any_s=100.0, ai_clear_time=3.0,
++                ai_down_speed=0.2)
++    base.update(kw)
++    return params(**base)
++
++
++def test_wall_after_the_stairs_stops_the_robot_before_it():
++    sim = Sim(ai_params())
++    sim.wall_x = STAIRS_END + 0.5             # arena wall 0.5 m after the last step (stairs_run2)
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    why = [w for _, a, b, w in sim.sm.transitions if b == State.EXIT_AI][0]
++    assert 'wall' in why
++    assert sim.wall_x - sim.x >= 0.45          # stopped 0.45-0.6 m from the wall (base_link), not on it
++
++
++def test_without_the_wall_check_it_walks_into_the_wall():
++    sim = Sim(ai_params(wall_stop=False))
++    sim.wall_x = STAIRS_END + 0.5
++    sim.run(seconds=200)
++    assert sim.wall_x - sim.x < 0.35           # the old behaviour: the clear walk ends at the wall
++
++
++def test_wall_readings_on_the_way_up_are_ignored():
++    sim = Sim(ai_params(ai_clear_time=0.5))
++    sim.fake_wall = lambda x: 0.4 if EDGE - 0.2 <= x < EDGE + 0.6 else None   # handrail post / the stairs
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    assert all('wall' not in w for *_, w in sim.sm.transitions)
++
++
++def test_wall_while_still_going_down_holds_until_level():
++    sim = Sim(ai_params())
++    sim.fake_wall = lambda x: 0.4 if x >= EDGE + 1.6 else None   # very close, seen mid-descent
++    held = []
++    orig = sim.sm.update
++
++    def spy(o):
++        c = orig(o)
++        if 'still going down' in c.note:
++            held.append(c.vx)
++        return c
++    sim.sm.update = spy
++    for _ in range(int(120 / DT)):
++        sim.step()
++        if len(held) >= 60:                          # 3 s of holding
++            break
++    assert held and all(v == 0.0 for v in held)     # stopped on the steps, did not walk on
++    assert sim.sm.state == State.CROSS_AI           # and did not leave AI mode while nose-down
++
++
++def test_wall_seen_on_the_last_step_keeps_stepping_down_then_exits():
++    sim = Sim(ai_params())
++    sim.wall_x = STAIRS_END + 0.55             # seen at 0.6 m while the body is still nose-down
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    assert 'wall' in [w for _, a, b, w in sim.sm.transitions if b == State.EXIT_AI][0]
++    assert sim.x >= STAIRS_END and sim.wall_x - sim.x >= 0.45
++
++
++# ---------------------------------------------------------------- odometry jumps + AI already on (24 Nov)
++def _frame_jump_spy(sim, after_state, delay, jump_xy=(-3.4, -0.2), jump_yaw_deg=90.0):
++    """From `delay` s after entering after_state, odometry is reported in a new frame (stairs_ai3: ~2 s after
++    Enter AI, x 4.03 -> 0.59). Returns the list the CROSS_AI wz commands are collected in."""
++    orig = sim.sm.update
++    st = {'t0': None}
++    wz = []
++    a = math.radians(jump_yaw_deg)
++
++    def spy(o):
++        if sim.sm.state == after_state and st['t0'] is None:
++            st['t0'] = o.t
++        if st['t0'] is not None and o.t - st['t0'] >= delay:
++            x, y = o.x, o.y
++            o.x = jump_xy[0] + math.cos(a) * x - math.sin(a) * y
++            o.y = jump_xy[1] + math.sin(a) * x + math.cos(a) * y
++            o.yaw = o.yaw + a
++        c = orig(o)
++        if c.state == State.CROSS_AI:
++            wz.append(c.wz)
++        return c
++    sim.sm.update = spy
++    return wz
++
++
++def test_odometry_frame_jump_at_enter_ai_does_not_steer():
++    sim = Sim(ai_params(ai_max_wz=0.25))
++    wz = _frame_jump_spy(sim, State.ENTER_AI, 2.0)
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    assert len(sim.sm.odom_jumps) == 1
++    assert wz and max(abs(w) for w in wz) < 0.01     # without the fix: 0.25 rad/s the whole crossing
++
++
++def test_odometry_frame_jump_during_the_walk_keeps_the_distance():
++    sim = Sim(ai_params())
++    _frame_jump_spy(sim, State.WALK_TO_AI_ZONE, 0.5, jump_yaw_deg=30.0)
++    enter_x = []
++    orig = sim.sm.update
++
++    def spy(o):
++        c = orig(o)
++        if c.state == State.ENTER_AI and not enter_x:
++            enter_x.append(sim.x)
++        return c
++    sim.sm.update = spy
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    assert abs((EDGE - enter_x[0]) - 0.6) < 0.05     # still entered AI 0.6 m before the first step
++
++
++def test_ai_already_on_goes_from_align_straight_to_cross_ai():
++    sim = Sim(ai_params())
++    orig = sim.sm.update
++
++    def spy(o):
++        o.ai_on_already = True
++        return orig(o)
++    sim.sm.update = spy
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, sim.sm.transitions
++    v = states_visited(sim)
++    assert State.WALK_TO_AI_ZONE not in v and State.ENTER_AI not in v
++    assert v.index(State.ALIGN) + 1 == v.index(State.CROSS_AI)
++    assert AI_ENTER not in sim.gaits and AI_EXIT in sim.gaits
++
++
++def test_ai_already_on_with_frozen_odometry_still_crosses():
++    sim = Sim(ai_params())
++    orig = sim.sm.update
++    frozen = {}
++
++    def spy(o):
++        o.ai_on_already = True
++        o.x, o.y, o.yaw = frozen.setdefault('pose', (o.x, o.y, o.yaw))   # odometry never moves
++        return orig(o)
++    sim.sm.update = spy
++    cmd = sim.run(seconds=200)
++    assert cmd.state == State.DONE, (sim.sm.transitions, sim.sm.abort_reason)
+--- a/src/lite3_stair_climber/test/test_stair_detector.py
++++ b/src/lite3_stair_climber/test/test_stair_detector.py
+@@ -163,3 +163,99 @@
+     assert obs.detected, obs.reason
+     assert abs(obs.distance - 1.2) < 0.05
+     assert abs(obs.step_height - 0.195) < 0.03, obs.step_height
++
++
++# ---------------------------------------------------------------------------
++# Close-range mode: floor + first step hidden in the lidar blind zone
++# ---------------------------------------------------------------------------
++
++CLOSE = DetectorParams(roi_x_min=1.2, roi_x_max=2.6, max_step_height=0.24, close_range=True)
++
++
++def blind(pts, lidar_h=0.515, beam_deg=21.6):
++    """Drop what the lidar cannot see: anything below its lowest beam."""
++    h = pts[:, 2] - FLOOR_Z
++    return pts[h >= lidar_h - pts[:, 0] * math.tan(math.radians(beam_deg))]
++
++
++def test_close_stairs_detected_without_floor():
++    pts = blind(arena_stairs(edge_x=0.6))
++    assert not detect_stairs(pts, FLOOR_Z, DetectorParams(max_step_height=0.24)).detected
++    obs = detect_stairs(pts, FLOOR_Z, CLOSE)
++    assert obs.detected and obs.close, obs.reason
++    assert abs(obs.distance - 0.6) < 0.15        # nearest visible face minus the offset
++    assert abs(math.degrees(obs.edge_yaw)) < 2.0
++    assert abs(obs.center_y) < 0.06
++
++
++def _rotate(pts, yaw_deg, cx):
++    th = math.radians(yaw_deg)
++    R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
++    out = pts.copy()
++    out[:, :2] = (pts[:, :2] - [cx, 0]) @ R.T + [cx, 0]
++    return out
++
++
++def test_close_stairs_angle_and_offset():
++    pts = arena_stairs(edge_x=0.65)
++    pts[:, 1] += 0.12
++    pts = blind(_rotate(pts, 8.0, 0.8))
++    obs = detect_stairs(pts, FLOOR_Z, CLOSE)
++    assert obs.detected, obs.reason
++    assert abs(math.degrees(obs.edge_yaw) - 8.0) < 2.5, math.degrees(obs.edge_yaw)
++    assert abs(obs.center_y - 0.12) < 0.08
++
++
++def test_close_wall_rejected():
++    z, y = _grid(0.0, 1.5, -0.8, 0.8)
++    wall = np.column_stack([np.full_like(z, 0.8), y, z + FLOOR_Z])
++    obs = detect_stairs(blind(wall), FLOOR_Z, CLOSE)
++    assert not obs.detected
++
++
++def test_close_single_box_rejected():
++    obs = detect_stairs(blind(stairs(edge_x=0.7, step_h=0.3, tread=0.6, n=1, width=0.9)),
++                        FLOOR_Z, CLOSE)
++    assert not obs.detected
++    assert 'second step' in obs.reason
++
++
++def test_close_mode_off_by_default():
++    assert not detect_stairs(blind(arena_stairs(edge_x=0.6)), FLOOR_Z,
++                             DetectorParams(max_step_height=0.24)).detected
++
++
++# ---------------------------------------------------------------- front_wall_distance (24 Nov)
++def _box3(x0, x1, y0, y1, z0, z1, n=30):
++    import numpy as np
++    xs, ys, zs = np.meshgrid(np.linspace(x0, x1, n), np.linspace(y0, y1, n), np.linspace(z0, z1, 4))
++    return np.stack([xs.ravel(), ys.ravel(), zs.ravel()], axis=1)
++
++
++def test_wall_ahead_is_found():
++    from stair_climber.stair_detector import front_wall_distance
++    wall = _box3(0.8, 0.82, -0.5, 0.5, -0.39, 0.6)
++    assert abs(front_wall_distance(wall) - 0.8) < 0.03
++
++
++def test_stairs_are_not_a_wall():
++    import math
++    import numpy as np
++    from stair_climber.stair_detector import front_wall_distance
++    # arena stairs seen from the floor: top tread 0.51 m above the floor = 0.12 m above base_link
++    steps = np.vstack([_box3(0.6, 0.75, -0.5, 0.5, -0.39 + 0.195, -0.39 + 0.195),
++                       _box3(0.75, 0.9, -0.5, 0.5, -0.39 + 0.395, -0.39 + 0.395),
++                       _box3(0.9, 1.1, -0.5, 0.5, -0.39 + 0.51, -0.39 + 0.51)])
++    assert math.isinf(front_wall_distance(steps))
++
++
++def test_ceiling_behind_the_robot_is_not_a_wall():
++    import math
++    import numpy as np
++    from stair_climber.stair_detector import front_wall_distance
++    # nose-down on the stairs: ceiling points behind / above the robot level into 'ahead'
++    pts = _box3(0.4, 0.8, -0.2, 0.2, 0.3, 0.6)
++    body_x = np.full(len(pts), -0.8)
++    assert math.isinf(front_wall_distance(pts, body_x=body_x))
++    high = _box3(0.5, 0.8, -0.2, 0.2, 1.5, 2.0)
++    assert math.isinf(front_wall_distance(high))

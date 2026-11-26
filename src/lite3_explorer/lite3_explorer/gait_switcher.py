@@ -8,14 +8,21 @@ transfer_interfaces/MotionSimpleCMD {cmd_code, type: 0} on /simple_cmd, the same
 message the lite3_<gait> shell aliases send with `ros2 topic pub --once`.
 /step_up (Bool, from the mission manager): true while the robot drives to a tile that is higher than the one it stands on
 (terrain classifier elevation option): the step_up_gait (rug_hstep) is used instead of the terrain gait.
+/gait_freeze (Bool, latched, from the mission manager): true while the recovery mode runs; the robot keeps the gait it
+already has (no command is sent for its new targets, a new terrain or /step_up) until it is released.
 Switching rules (flat delay, minimum interval) live in terrain_gait.py. The gait only changes when the robot starts
 for a new tile (/mission_manager/next_target names a tile) or when a new terrain is classified (/terrain_type changes);
 a finished spin / animation brings the terrain gait back. While the robot is in AI mode (/ai_mode true: the mission
 manager's stairs mode climbs a staircase) no gait is sent at all: a gait command would take it out of AI mode.
+Speed per gait: hstep_speed_limit (m/s, default 0.38; 0 = no cap) for rug_hstep, and gait_speed_limits ("gait:m/s",
+e.g. flat_medium:0.4) for any other gait, cap Nav2's linear speed while that gait is in use,
+as a nav2_msgs/SpeedLimit (absolute) on speed_limit_topic (the controller server's, default /speed_limit); any other
+gait lifts the cap (speed_limit 0). Modes that publish /cmd_vel themselves (curtain, roller, stairs) use their own speeds.
 """
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from nav2_msgs.msg import SpeedLimit
 from std_msgs.msg import Bool, String
 from transfer_interfaces.msg import MotionSimpleCMD
 
@@ -56,11 +63,27 @@ class GaitSwitcher(Node):
         self.animating = False                            # no gait commands while a robot animation runs
         self.pre_animation_gait = None                    # the gait in use when the animation started: sent again after
         self.create_subscription(Bool, '/animation_active', self._on_animation, 10)
+        # /gait_freeze (mission manager, recovery mode): keep the gait the robot already has, no commands at all
+        self.create_subscription(Bool, p('freeze_topic', '/gait_freeze'), self._on_freeze, latched)
         self.ai_mode = False                              # no gait commands while the robot is in AI mode (stairs)
         self.create_subscription(Bool, '/ai_mode', self._on_ai_mode, latched)
+        # Nav2 speed cap per gait ("gait:m/s"); gaits not listed: no cap
+        self.speed_limits = {}
+        for item in p('gait_speed_limits', ['']) or []:
+            if item and ':' in item:
+                gait, mps = item.rsplit(':', 1)
+                self.speed_limits[gait.strip()] = float(mps)
+        # h-step gait speed cap (m/s; 0 = no cap): overrides a rug_hstep entry in gait_speed_limits
+        hstep_mps = float(p('hstep_speed_limit', 0.38))
+        if hstep_mps > 0:
+            self.speed_limits['rug_hstep'] = hstep_mps
+        else:
+            self.speed_limits.pop('rug_hstep', None)
+        self.speed_pub = self.create_publisher(SpeedLimit, p('speed_limit_topic', '/speed_limit'), 10)
+        self._limit_sent = None                           # (limit, subscriber count) last published
         self.create_timer(0.2, self._tick)
         self.get_logger().info(f'gait switcher: non_rugged -> {self.switcher.flat_gait}, '
-                               f'rugged -> {self.switcher.rugged_gait}')
+                               f'rugged -> {self.switcher.rugged_gait}; Nav2 speed limits {self.speed_limits or "none"}')
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -75,6 +98,13 @@ class GaitSwitcher(Node):
     def _on_target(self, msg):
         if msg.data.startswith('tile '):          # '(none)' = no target
             self.switcher.arm()
+
+    def _on_freeze(self, msg):
+        if self.switcher.freeze(bool(msg.data)):
+            self.get_logger().info(f'gait frozen at {self.switcher.gait or "-"} (recovery)' if msg.data
+                                   else 'gait freeze released: terrain / target rules again')
+            # a switch still being repeated is the gait the robot has now: its repeats go on (see _tick)
+            self._publish_gait('frozen: recovery' if msg.data else f'terrain {self.switcher.terrain}')
 
     def _on_step_up(self, msg):
         if self.switcher.set_override(self.step_up_gait if msg.data else None):
@@ -145,8 +175,24 @@ class GaitSwitcher(Node):
             self.cmd_pub.publish(out)
             self._burst = (out, left - 1, now)
 
+    def _update_speed_limit(self):
+        """Publish the speed cap of the gait in use when it changed (or the controller server just subscribed)."""
+        limit = float(self.speed_limits.get(self.switcher.gait, 0.0))
+        subs = self.speed_pub.get_subscription_count()
+        if subs == 0 or self._limit_sent == (limit, subs):
+            return
+        msg = SpeedLimit()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.percentage, msg.speed_limit = False, limit
+        self.speed_pub.publish(msg)
+        if self._limit_sent is None or self._limit_sent[0] != limit:
+            self.get_logger().info(f'Nav2 speed limit: {f"{limit:.2f} m/s" if limit > 0 else "none"} '
+                                   f'(gait {self.switcher.gait or "-"})')
+        self._limit_sent = (limit, subs)
+
     def _tick(self):
         now = self._now()
+        self._update_speed_limit()
         if self.ai_mode:
             return
         if self._burst is not None:

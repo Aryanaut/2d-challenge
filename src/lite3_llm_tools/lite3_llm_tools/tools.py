@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 from lite3_llm_tools import prompts as P
+from lite3_llm_tools import scene_refs
 from lite3_llm_tools.gridmap import GridInfo
 from lite3_llm_tools.image_utils import fit_within
 from lite3_llm_tools.map_render import render_initial_tile_panels, render_map
@@ -52,6 +53,8 @@ class Settings:
     max_captures: int = 64
     max_upload_w: int = 1024               # the server rejects larger images (HTTP 413 image_dimensions_exceeded)
     max_upload_h: int = 768
+    scene_references_dir: str = ''         # describe_scene: reference photos <scene_type>_<n>.jpg ('' = the 8 fixed types)
+    scene_min_confidence: float = 0.0      # describe_scene with references: a scene answer below this -> traversable
 
 
 def _png(img, max_w: int = 0, max_h: int = 0) -> bytes:
@@ -80,6 +83,13 @@ class LlmTools:
                                         'run_' + time.strftime('%Y%m%d_%H%M%S'))
         self.queries = 0
         self.last_error = ''
+        # describe_scene with reference photos: the live frame goes up in a collage with them, and only their scene
+        # types can be answered (anything else -> traversable)
+        self.scene_refs = scene_refs.load_references(self.s.scene_references_dir) if self.s.scene_references_dir else []
+        self.scene_types = scene_refs.scene_types(self.scene_refs) if self.scene_refs else list(P.SCENE_TYPES)
+        if self.scene_refs:
+            self.templates['describe_scene_refs'] = P.build_scene_reference_prompt(
+                self.templates['describe_scene_refs'], self.scene_types)
 
     # ------------------------------------------------------------------ plumbing
     def handle(self, request: dict) -> dict:
@@ -165,13 +175,47 @@ class LlmTools:
         prompt = request.get('prompt') or 'describe_tile'          # 'describe_scene': classify a scene tile (scene_report.txt)
         if prompt not in ('describe_tile', 'describe_scene'):
             raise TaskError(f'describe_tile: unknown prompt {prompt!r}')
-        view = self._describe_one(folder, {'name': name}, capture, task=prompt, context=request.get('context', ''))
+        task, collage = prompt, None
+        if prompt == 'describe_scene' and self.scene_refs and capture is not None:
+            task, capture, collage = 'describe_scene_refs', *self._scene_collage(folder, name, capture)
+        view = self._describe_one(folder, {'name': name}, capture, task=task, context=request.get('context', ''))
         if 'error' in view:
             raise PerceptionError(view['error'])
         out = {'tile': request.get('tile'), **{k: v for k, v in view.items() if k != 'name'}}
+        if collage:
+            out['collage'] = collage
         if prompt == 'describe_scene':
-            out['scene_type'] = P.parse_scene_type(out.get('scene_description', '')) or 'traversable'
+            out.update(self._scene_gate(out))
         return out
+
+    def _scene_collage(self, folder: str, name: str, capture: dict):
+        """The capture with its JPEG swapped for the live frame + reference collage (also saved, for checking)."""
+        live = cv2.imdecode(np.frombuffer(capture['jpeg'], np.uint8), cv2.IMREAD_COLOR)
+        if live is None:
+            raise TaskError(f'describe_scene: cannot decode the captured frame {name}')
+        img = scene_refs.build_collage(live, self.scene_refs, self.s.max_upload_w, self.s.max_upload_h)
+        ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            raise TaskError('collage JPEG encoding failed')
+        collage = name + '_collage.jpg'
+        self._write(os.path.join(folder, collage), buf.tobytes())
+        return {**capture, 'jpeg': buf.tobytes()}, collage
+
+    def _scene_gate(self, answer: dict) -> dict:
+        """scene_type from the answer: only a reference scene type (or one of the 8 without references), else
+        traversable. 'scene_gate' says why an answer was turned into traversable."""
+        desc = answer.get('scene_description', '')
+        allowed = self.scene_types if self.scene_refs else None
+        st = P.parse_scene_type(desc, allowed)
+        if st is None:
+            said = P.parse_scene_type(desc)
+            return {'scene_type': 'traversable',
+                    'scene_gate': f'{said} has no reference photo' if said else 'answer names no scene type'}
+        conf = float(answer.get('confidence') or 0.0)
+        if st != 'traversable' and self.scene_refs and conf < self.s.scene_min_confidence:
+            return {'scene_type': 'traversable',
+                    'scene_gate': f'{st} at confidence {conf:.2f} < {self.s.scene_min_confidence:.2f}'}
+        return {'scene_type': st}
 
     def _describe_one(self, folder: str, view: dict, capture: Optional[dict], task: str = 'describe_view',
                       context: str = '') -> dict:

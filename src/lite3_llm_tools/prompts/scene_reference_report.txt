@@ -1,0 +1,56 @@
+Analyze the attached image for this mission.
+
+THE IMAGE IS A COLLAGE:
+- The large panel at the top left, with a green border and the label LIVE, is
+  the robot's front camera right now. This is the tile you must classify.
+- The small panels, each labelled "REF <scene type>", are REFERENCE photos of
+  the scenes that are actually built on this course. They are the only scenes
+  that exist. Several references can show the same scene from other angles.
+
+COMPETITION CONTEXT:
+The LIVE photo comes from the front camera of a legged robot dog inside an
+indoor robotics competition maze. The camera is mounted low on the robot's
+body, so nearby wall panels and objects can fill most of the view. The maze is
+built from wall panels; the lab room around it (windows, white walls, screens,
+desks, equipment, people) may be visible above the panels. The scenes are built
+from toys and props, so match the REFERENCE photos, not real-world appliances.
+
+MISSION: The robot has stopped on one tile of a 1 m x 1 m tile grid and is
+facing a neighbouring tile that the lidar map says is mostly NOT traversable.
+That tile may be a SCENE. The SCENE TILE CONTEXT, LIDAR lines at the end of
+this message give the tile name and the lidar distances.
+
+The scene types are exactly these: $scene_types
+
+Answer a scene type ONLY if the LIVE panel shows the same set as one of the
+REFERENCE panels: the same furniture or props (shape, colour, layout), possibly
+seen from another angle, from closer or further away, or only partly in frame.
+If the LIVE panel does not match any reference, answer "traversable". This is
+the right answer when, for example:
+- you only see a plain wall panel, a dark panel, a screen, a curtain or the
+  wall of the neighbouring tile;
+- you see only an empty floor, terrain sections (blocks, ramps, beams, stairs)
+  or the open lab room;
+- the view is too dark, empty or blocked to compare with the references;
+- you see objects that do not appear in any reference photo.
+Never describe the REFERENCE panels themselves: describe only the LIVE panel.
+
+Return exactly one JSON object containing exactly these four keys:
+"scene_description", "relevant_to_mission", "evidence", "confidence".
+
+Definitions:
+- scene_description: one short sentence that STARTS with exactly one of these
+  words, followed by a colon: $scene_words. Then say what is visible in the
+  LIVE panel and which reference it matches (for example
+  "kitchen: white toy kitchen with red knobs, as in the kitchen references" or
+  "traversable: only a dark wall panel on the right of an open tile").
+- relevant_to_mission: true if the LIVE panel matches a reference; false if
+  the answer is "traversable".
+- evidence: an array of at most three short strings describing the objects in
+  the LIVE panel that support your answer. Do not infer hidden objects.
+- confidence: a number from 0.0 to 1.0 expressing your confidence that the
+  first word of scene_description is correct.
+
+Output valid JSON only. Do not include additional keys, Markdown, code fences,
+explanations, or text outside the JSON. Use JSON booleans and numeric confidence.
+Do not include trailing commas. Do not invent robot localisation coordinates.

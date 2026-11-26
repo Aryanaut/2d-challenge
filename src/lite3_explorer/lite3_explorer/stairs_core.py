@@ -274,18 +274,40 @@ class StairMap:
 
 
 # ------------------------------------------------------------------------------------------ on the tile grid
-def stair_tiles(grid, points, min_points: int = 4, edge_margin_m: float = 0.10) -> Dict[tuple, dict]:
+def stair_tiles(grid, points, min_points: int = 4, edge_margin_m: float = 0.10, traversable=(),
+                shift_max_m: float = 0.35, min_facing: float = 0.5) -> Dict[tuple, dict]:
     """Tiles holding at least min_points confirmed stair cells: {tile: {'points': n, 'ascent': (ux, uy)}}. Cells within
     edge_margin_m of a tile's edge do not count: the tile grid is snapped to the walls only to a few cm, and a
-    staircase filling its tile would otherwise spill a row of cells into the tile beside it."""
+    staircase filling its tile would otherwise spill a row of cells into the tile beside it.
+
+    `traversable` tiles (walked on, or scanned open floor) are never staircases: a staircase only stands at the edge of
+    a traversable tile. A stair cell inside one is the foot of the steps seen across that edge (a grid that is off the
+    walls puts it there): it is given to the neighbour beyond the edge the steps climb through (ascent within
+    acos(min_facing) of the edge's outward normal), if it lies within shift_max_m of that edge; else it is dropped.
+    Bag curtaintest_25_11_135748: 13 of 23 cells 0-0.26 m inside open tile 0,2, ascent out of its W edge -> the
+    staircase is tile -1,2."""
     pts = np.asarray(points, float).reshape(-1, 4)
     if grid is None or len(pts) == 0:
         return {}
+    traversable = set(map(tuple, traversable))
+    c, s = math.cos(grid.yaw), math.sin(grid.yaw)
     acc: Dict[tuple, List[float]] = {}
     for x, y, ux, uy in pts:
-        if grid.edge_distance(x, y) < edge_margin_m:
-            continue
         tile = tuple(grid.tile_of(x, y))
+        if tile in traversable:
+            u, v = grid.to_local(x, y)
+            fu, fv = float(u) / grid.size - tile[0], float(v) / grid.size - tile[1]   # 0..1 inside the tile
+            best = None
+            for side, (di, dj) in SIDE_STEPS.items():
+                facing = ux * (c * di - s * dj) + uy * (s * di + c * dj)          # ascent . outward normal
+                dist = grid.size * ((1.0 - fu) if di > 0 else fu if di < 0 else (1.0 - fv) if dj > 0 else fv)
+                if facing >= min_facing and dist <= shift_max_m and (best is None or facing > best[0]):
+                    best = (facing, (tile[0] + di, tile[1] + dj))
+            if best is None or best[1] in traversable:
+                continue
+            tile = best[1]
+        elif grid.edge_distance(x, y) < edge_margin_m:
+            continue
         e = acc.setdefault(tile, [0, 0.0, 0.0])
         e[0] += 1
         e[1] += ux
@@ -328,3 +350,40 @@ def stair_crossing(grid, tile, stairs: Dict[tuple, dict], skip=(), min_facing: f
                      through_m=(len(row) + 0.5) * grid.size)
             best = e
     return best
+
+
+def beyond_reference(grid, row: Sequence[tuple], stairs: Dict[tuple, dict],
+                     fallback_dir: Optional[Sequence[float]] = None) -> dict:
+    """The tile beyond the staircase, in the staircase's own direction: the reference odometry is rebased to after a climb.
+
+    The tile grid may sit a few degrees off the staircase, so the grid tile beyond it (stair_crossing()'s 'beyond') is
+    not where a climb along the steps ends. This tile is not on the grid: it is a size x size square turned to the
+    ascent direction (the stair detector's, averaged over the crossed staircase tiles `row`, weighted by their points;
+    fallback_dir, e.g. the crossing's edge normal, when there is none), its centre one tile past the staircase along
+    it: from the middle of the staircase tiles, (len(row) / 2 + 0.5) tiles up the ascent.
+    Returns {'centre_xy', 'yaw', 'ascent', 'corners' (sw, se, ne, nw: back-right, front-right, front-left, back-left),
+    'size', 'stairs' (row), 'grid_tile' (the grid tile holding the centre)}."""
+    row = [tuple(t) for t in row]
+    size = grid.size
+    sx = sy = 0.0
+    for t in row:
+        d = stairs.get(t)
+        if d:
+            sx += d['points'] * d['ascent'][0]
+            sy += d['points'] * d['ascent'][1]
+    n = math.hypot(sx, sy)
+    if n < 1e-9:
+        if fallback_dir is None:
+            raise ValueError('beyond_reference: no ascent direction for the staircase and no fallback')
+        sx, sy = fallback_dir
+        n = math.hypot(sx, sy)
+    ux, uy = sx / n, sy / n
+    centres = [grid.center(t) for t in row]
+    mx = sum(c[0] for c in centres) / len(centres)
+    my = sum(c[1] for c in centres) / len(centres)
+    ahead = (len(row) / 2.0 + 0.5) * size
+    cx, cy = mx + ux * ahead, my + uy * ahead
+    h = size / 2.0
+    corners = [(cx + ux * a - uy * b, cy + uy * a + ux * b) for a, b in ((-h, -h), (h, -h), (h, h), (-h, h))]
+    return {'centre_xy': (cx, cy), 'yaw': math.atan2(uy, ux), 'ascent': (ux, uy), 'corners': corners, 'size': size,
+            'stairs': row, 'grid_tile': grid.tile_of(cx, cy)}

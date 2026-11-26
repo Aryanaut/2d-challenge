@@ -8,6 +8,7 @@ Example:
   ros2 launch lite3_explorer exploration.launch.py use_curtains:=true    # walk through curtains on tile edges
   ros2 launch lite3_explorer exploration.launch.py use_stairs:=true      # climb over staircases in AI mode
   ros2 launch lite3_explorer exploration.launch.py use_rollers:=true     # cross roller tiles in the h-step gait
+  ros2 launch lite3_explorer exploration.launch.py hstep_speed:=0.3      # Nav2 speed cap in the h-step gait (m/s)
 """
 import os
 
@@ -18,6 +19,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 PKG = 'lite3_explorer'
 LLM_ARGS = ('server_url', 'group_id', 'image_topic', 'prompt_file')
@@ -70,6 +72,8 @@ def _mission_manager(context):
         params.append({'modes.exploring.curtains': True})
     if LaunchConfiguration('use_stairs').perform(context).lower() == 'true':
         params.append({'modes.exploring.stairs': True})
+    params.append({'modes.scanning.opening_stairs':
+                   LaunchConfiguration('stairs_on_opening').perform(context).lower() == 'true'})
     if LaunchConfiguration('use_rollers').perform(context).lower() == 'true':
         params.append({'modes.exploring.rollers': True})
     angle = LaunchConfiguration('roller_angle_deg').perform(context)
@@ -114,12 +118,17 @@ def generate_launch_description():
                               description='Drop scans while the robot / lidar IMU is tilted away from its start reference '
                                           '(stairs): /scan_raw -> tilt_gate -> /scan'),
         DeclareLaunchArgument('tilt_params', default_value=cfg('tilt_gate.yaml')),
+        DeclareLaunchArgument('use_scan_fill', default_value='false',   # not yet checked on a replay
+                              description='slam_toolbox maps /scan_slam: /scan with no-return rays ahead filled just below '
+                                          'range_max, so open floor (outside the maze) is cleared free (scan_fill.py)'),
         DeclareLaunchArgument('use_slam', default_value='true'),
         DeclareLaunchArgument('use_nav2', default_value='true'),
         DeclareLaunchArgument('use_terrain', default_value='true'),
         DeclareLaunchArgument('terrain_on_tile_entry', default_value='true',
                               description='true: classify the terrain only when entering a new tile'),
         DeclareLaunchArgument('use_gait', default_value='true'),
+        DeclareLaunchArgument('hstep_speed', default_value='0.38',
+                              description='Nav2 linear speed cap (m/s) while the h-step gait (rug_hstep) is in use; 0 = no cap'),
         DeclareLaunchArgument('use_mission', default_value='true'),
         DeclareLaunchArgument('auto_start', default_value='',
                               description='true/false: leave idle by itself (empty = mission.yaml)'),
@@ -134,12 +143,17 @@ def generate_launch_description():
                               description='Optional: detect hanging curtains in the depth image (low rate); one along the '
                                           "current tile's edge is squared up to and walked through with vx commands"),
         DeclareLaunchArgument('curtain_params', default_value=cfg('curtain.yaml')),
-        DeclareLaunchArgument('use_elevation', default_value='false',
-                              description='true: the terrain classifier fits a ground-plane reference at start and the mission '
-                                          'prefers the tile with the least elevation change (mission prefer_flat_tiles)'),
+        DeclareLaunchArgument('use_elevation', default_value='',
+                              description='true/false overrides terrain.yaml elevation.enabled (empty: the yaml decides). On: '
+                                          'the terrain classifier fits a ground-plane reference at start, the mission prefers '
+                                          'the tile with the least elevation change (prefer_flat_tiles) and holds the h-step '
+                                          'gait (/step_up) when driving to a higher tile'),
         DeclareLaunchArgument('use_stairs', default_value='false',
                               description='Optional: detect staircases in the depth image (low rate); one on a tile '
                                           'beside the current tile is climbed over in the robot AI mode, then walled off'),
+        DeclareLaunchArgument('stairs_on_opening', default_value='true',
+                              description='Run the stair detector during the opening scan; a staircase beside the start '
+                                          'tile is climbed (stairs mode) right after it, even without use_stairs'),
         DeclareLaunchArgument('stairs_params', default_value=cfg('stairs.yaml')),
         DeclareLaunchArgument('use_rollers', default_value='false',
                               description='Optional: detect roller tiles (depth camera, confirmed by the 3D lidar; low rate); '
@@ -186,9 +200,12 @@ def generate_launch_description():
         Node(package=PKG, executable='curtain_detector', name='curtain_detector', output='screen',
              parameters=[lc('curtain_params'), {'use_sim_time': lc('use_sim_time')}],
              condition=IfCondition(lc('use_curtains'))),
+        # use_stairs: detecting the whole mission; else only while the mission enables it (/stairs/enable: opening scan)
         Node(package=PKG, executable='stair_detector', name='stair_detector', output='screen',
-             parameters=[lc('stairs_params'), {'use_sim_time': lc('use_sim_time')}],
-             condition=IfCondition(lc('use_stairs'))),
+             parameters=[lc('stairs_params'), {'use_sim_time': lc('use_sim_time'),
+                                               'start_enabled': PythonExpression(["'", lc('use_stairs'), "'.lower() == 'true'"])}],
+             condition=IfCondition(PythonExpression(["'", lc('use_stairs'), "'.lower() == 'true' or '",
+                                                     lc('stairs_on_opening'), "'.lower() == 'true'"]))),
         Node(package=PKG, executable='roller_detector', name='roller_detector', output='screen',
              parameters=[lc('roller_params'), {'use_sim_time': lc('use_sim_time'), 'cloud_topic': lc('cloud_topic')}],
              condition=IfCondition(lc('use_rollers'))),
@@ -199,14 +216,21 @@ def generate_launch_description():
                               'trigger_mode': lc('terrain_on_tile_entry'),
                               'elevation': lc('use_elevation')}.items(),
             condition=IfCondition(lc('use_terrain'))),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(
-                get_package_share_directory('slam_toolbox'), 'launch', 'online_async_launch.py')),
-            launch_arguments={'slam_params_file': lc('slam_params'), 'use_sim_time': lc('use_sim_time')}.items(),
-            condition=IfCondition(lc('use_slam'))),
+        # respawn: modes.stairs.new_map clears the map by stopping slam_toolbox (Humble has no reset service)
+        Node(package=PKG, executable='scan_fill', name='scan_fill', output='screen',
+             parameters=[{'use_sim_time': lc('use_sim_time')}],
+             condition=IfCondition(PythonExpression(["'", lc('use_scan_fill'), "'.lower() == 'true' and '",
+                                                     lc('use_slam'), "'.lower() == 'true'"]))),
+        Node(package='slam_toolbox', executable='async_slam_toolbox_node', name='slam_toolbox', output='screen',
+             parameters=[lc('slam_params'), {'use_sim_time': lc('use_sim_time'),
+                                             'scan_topic': PythonExpression(["'/scan_slam' if '", lc('use_scan_fill'),
+                                                                             "'.lower() == 'true' else '/scan'"])}],
+             respawn=True, respawn_delay=0.5,
+             condition=IfCondition(lc('use_slam'))),
         OpaqueFunction(function=_nav2),
         Node(package=PKG, executable='gait_switcher', name='gait_switcher', output='screen',
-             parameters=[{'flat_gait': 'flat_slow', 'rugged_gait': 'rug_hstep'}],
+             parameters=[{'flat_gait': 'flat_slow', 'rugged_gait': 'rug_hstep',
+                          'hstep_speed_limit': ParameterValue(lc('hstep_speed'), value_type=float)}],
              condition=IfCondition(lc('use_gait'))),
         Node(package=PKG, executable='animation_player', name='animation_player', output='screen'),
         OpaqueFunction(function=_llm_client),

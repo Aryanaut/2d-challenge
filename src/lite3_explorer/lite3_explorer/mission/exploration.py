@@ -26,6 +26,7 @@ import math
 from typing import Dict, List, Optional, Type
 
 from lite3_explorer import frontiers as F
+from lite3_explorer import stairs_core as SC
 from lite3_explorer import tiles as T
 
 EXPLORATION_TYPES: Dict[str, Type['Exploration']] = {}
@@ -49,8 +50,10 @@ class Exploration:
 
     def __init__(self, ctx, name: str, cfg: dict):
         self.ctx, self.name, self.cfg = ctx, name, dict(cfg or {})
+        self.machine = None                 # the ModeMachine (set when it builds the strategy)
 
     avoid: frozenset = frozenset()      # tile labels whose goal just failed (set by the exploring mode)
+    via_rejected: tuple = ()            # labels the last select() dropped: Nav2 has a path, but through other tiles
 
     def candidates(self, pose) -> List[dict]:
         raise NotImplementedError
@@ -134,14 +137,22 @@ class TileExploration(Exploration):
             if others:
                 raw = others
         raw = raw + self._scene_viewpoints(pose, clearance, {t['tile'] for t in raw})
-        raw = self._neighbours_only(raw)
+        stairs_only = False
+        if not raw or tiles.stairs_forced:
+            # stairs_forced: the rest of this side was given up on (ExploringMode._force_stairs): the tile in front of
+            # the staircase is the only target, wherever it is (no neighbours-only / adjacency filtering)
+            approach = self._stairs_approach(pose, clearance)
+            if approach or not raw:
+                raw, stairs_only = approach, bool(approach)
+        if not stairs_only:
+            raw = self._neighbours_only(raw)
         visited, current = set(tiles.trail), tiles.current
         max_level = int(self.cfg.get('max_adjacency', T.ADJ_WALL))
         within, beyond = [], []
         for t in raw:
             tile = tuple(int(v) for v in t['tile'].split(','))
             level = T.adjacency_level(tiles.tiles, tile, visited, current)
-            (within if level <= max_level else beyond).append(
+            (within if stairs_only or level <= max_level else beyond).append(
                 dict(t, label=t['tile'], kind='tile', adjacency=level, adjacency_note=T.ADJACENCY_NAMES[level]))
         out = within
         if not within and beyond and self.cfg.get('fallback_any', True):
@@ -185,6 +196,36 @@ class TileExploration(Exploration):
                             'scene': label, 'steps': 0, 'path': [], 'has_frontier': False})
         return out
 
+    def _stairs_approach(self, pose, clearance):
+        """Everything on this side is done (tiles.stairs_ready) and the staircase is still to climb: the explored tile in
+        front of it (the one stairs_core.stair_crossing climbs from) becomes the target. Arriving there, the exploring
+        mode's decision hands over to the stairs mode."""
+        tiles, machine = self.ctx.tiles, self.machine
+        if machine is None or not machine.stairs_left() or not tiles.stairs_ready():
+            return []
+        stair = tuple(tiles.staircase_tile)
+        here = tuple(tiles.current) if tiles.current else None
+        out = []
+        ok = ('visited', 'to_visit', 'unreachable') if tiles.stairs_forced else ('visited', 'to_visit')
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            v = (stair[0] + di, stair[1] + dj)
+            if v == here or tiles.tiles.get(v, {}).get('status') not in ok or tiles.is_closed(v):
+                continue
+            if SC.stair_crossing(tiles.grid, v, tiles.stairs, skip=machine.stairs_tried | tiles.stairs_crossed,
+                                 min_facing=float(self.cfg.get('stair_min_facing', 0.5))) is None:
+                continue
+            goal = tiles.goal_point(v, clearance)
+            if goal is None:
+                continue
+            cx, cy = tiles.grid.center(v)
+            out.append({'tile': T.tile_label(v), 'goal_xy': goal, 'centre_xy': [round(cx, 3), round(cy, 3)],
+                        'distance_m': round(math.dist(goal, pose[:2]), 2), 'clearance_m': clearance,
+                        'stairs': T.tile_label(stair), 'steps': 0, 'path': [], 'has_frontier': False})
+        if out:
+            self.ctx.log('info', f'Everything on this side is explored: going to tile {out[0]["tile"]} in front of the '
+                                 f'staircase {T.tile_label(stair)}.')
+        return out
+
     def _neighbours_only(self, raw):
         """Keep the tiles that share a side with the current tile; mark the unexplored rest irrelevant."""
         tiles = self.ctx.tiles
@@ -210,6 +251,7 @@ class TileExploration(Exploration):
 
     def select(self, checked, pose):
         tiles = self.ctx.tiles
+        self.via_rejected = ()
         reachable = super().select(checked, pose)
         if reachable:
             limit = int(self.cfg.get('eliminate_after', 2))
@@ -235,16 +277,17 @@ class TileExploration(Exploration):
             for t in reachable:
                 goal = tuple(int(v) for v in t['tile'].split(','))
                 crossed = T.tiles_crossed(tiles.grid, t['path_xy'], tol) - here - {goal}
-                if t.get('scene'):
-                    crossed = set()          # going back to look at a scene tile: through explored tiles is fine
+                if t.get('scene') or t.get('stairs'):
+                    crossed = set()          # going back to look at a scene tile / to the stairs: through explored tiles is fine
                 (via if crossed else direct).append((t, crossed))
             if via:
                 self.ctx.log('info', 'Not chosen (path runs through other tiles): ' + ', '.join(
                     f'{t["tile"]} via {"/".join(T.tile_label(c) for c in sorted(cr))}' for t, cr in via))
                 self.ctx.event('via_other_tiles', tiles=[t['tile'] for t, _ in via])
+                self.via_rejected = tuple(t['tile'] for t, _ in via)
             reachable = [t for t, _ in direct]
         if reachable and self.cfg.get('direct_path_only', True) and tiles.grid is not None and tiles.current:
-            direct = [t for t in reachable if t.get('scene') or T.direct_path_through_shared_side(
+            direct = [t for t in reachable if t.get('scene') or t.get('stairs') or T.direct_path_through_shared_side(
                 tiles.grid, tiles.current, tuple(int(v) for v in t['tile'].split(',')), t['path_xy'])]
             if direct:
                 reachable = direct
@@ -307,6 +350,8 @@ class FrontierExploration(Exploration):
         for i, cl in enumerate(usable[:int(c.get('candidate_limit', 8))]):
             gx, gy = cl.goal_xy
             tile = self.ctx.tiles.tile_of(gx, gy)
+            if tile is not None and self.ctx.tiles.is_closed(tile):
+                continue                                  # below the climbed staircase: closed
             out.append({'kind': 'frontier', 'label': f'frontier#{i + 1}', 'tile': T.tile_label(tile) if tile else None,
                         'goal_xy': [round(gx, 3), round(gy, 3)], 'centroid_xy': list(cl.centroid_xy),
                         'clearance_m': round(float(cl.extra.get('clearance_m', 0.0)), 2),

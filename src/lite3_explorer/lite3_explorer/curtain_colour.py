@@ -7,8 +7,10 @@ cannot tell it from a wall when there is no gap under it. The camera can, with a
     high       0.12-1.2 m above the floor (not the ledge / the floor / skirting rails)
     smooth     almost no texture in the colour image (OSB wood grain is 3-6x rougher)
     pale       low colour saturation (OSB is yellow, S 0.25-0.37; the curtain S 0.04-0.22)
-    bright     at least 0.8x as bright as the floor IN THE SAME IMAGE (the grey arena walls are ~0.6x; the camera's
-               auto exposure changes absolute brightness from frame to frame, the ratio stays)
+    warm       R - B at least min_rel_warmth above the floor's IN THE SAME IMAGE (cream fabric; the grey walls are not)
+    bright     at least 0.8x as bright as the floor IN THE SAME IMAGE (the grey arena walls were ~0.6x on 24 Nov but
+               0.85-1.1x under the 25 Nov lights; the camera's auto exposure changes absolute brightness from frame to
+               frame, the ratio stays)
 
 and enough of such pixels: min_area_m2 square metres (far away) or min_fraction of the image (close up).
 Colour alone is NOT enough: the floor and the white roller have the same colour as the curtain.
@@ -40,6 +42,12 @@ class ColourParams:
     max_texture: float = 0.012          # local brightness std-dev (0..1); curtain ~0.005, OSB 0.016-0.033
     max_saturation: float = 0.30        # curtain 0.04-0.22, OSB 0.25-0.37
     min_rel_brightness: float = 0.80    # vs the floor's median brightness in the same image; grey wall ~0.6
+    # warm: (R - B) / 255 at least this much above the floor's, per pixel, in the same image. The cream curtain is
+    # warmer than the floor, the grey wall panels are not (bags fullrun_25_11_231517 / 232027 / 233315: the grey walls
+    # passed every other test above, at 20-55 % of the image; their median R-B - floor's <= +0.024, the curtain's
+    # +0.039..+0.086 and its 10th percentile >= +0.027). Relative to the floor so an auto white balance shift moves
+    # both. None = off.
+    min_rel_warmth: Optional[float] = 0.03
     floor_tol_m: float = 0.04           # floor pixels used for the brightness reference
     default_floor_v: float = 0.50       # brightness reference when no floor is in view
     fallback_camera_height_m: float = 0.46   # standing Lite3 (base 0.39 m + camera 0.074 m); only if no floor in view
@@ -47,6 +55,16 @@ class ColourParams:
     min_area_m2: float = 0.15           # curtain-like area needed (stray patches on the wall / wood were < 0.02)...
     min_fraction: float = 0.15          # ...OR this share of the image (close up only a strip of curtain is in view:
                                         #    0.6 m -> 0.08 m^2 but 32 %; stray patches were < 1 %)
+    # taller than the arena walls (0.5-0.6 m): the SAME upright surface must go on up into extend_min_m..extend_max_m
+    # above the floor (bags fullrun_25_11_215528 / 214831: curtain 0.095-0.134 m^2 there from 1.0-1.26 m away; grey
+    # walls and the kitchen <= 0.040). Close up (< ~0.9 m) the camera cannot see that high, so only a curtain seen
+    # from a distance counts; close-up wall-like hits no longer do. min_extend_m2 = 0: off (default: the warmth test
+    # rejects the grey walls, and this one rejected the curtain close up: bag fullrun_25_11_233315, 15-44 % of the
+    # image from 0.4-0.9 m, extend 0 -> never confirmed).
+    extend_min_m: float = 0.60
+    extend_max_m: float = 1.20
+    min_extend_m2: float = 0.0          # upright surface area in that band, in the curtain's image columns (0.06 tried)
+    extend_tol_m: float = 0.15          # ... within this horizontal distance of the curtain in the same column
 
 
 @dataclass
@@ -56,6 +74,7 @@ class ColourDetection:
     fraction: float                     # share of the valid depth pixels that look like curtain
     floor_v: float                      # brightness reference used (median floor brightness)
     ranges: np.ndarray                  # depth of each point, metres
+    extend_m2: float = 0.0              # the same surface's upright area extend_min_m..extend_max_m above the floor
 
 
 def _box(img: np.ndarray, k: int) -> np.ndarray:
@@ -142,14 +161,31 @@ def colour_mask(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequence[float], 
 
     floor_px = flat & inimg & (np.abs(hgt) < p.floor_tol_m)
     floor_v = float(np.median(V[floor_px])) if floor_px.sum() > 50 else p.default_floor_v
+    f = np.asarray(rgb)[vcc, ucc].astype(np.float32) / 255.0
+    warm = f[..., 0] - f[..., 2]                          # R - B of each cell's colour pixel
+    floor_warm = float(np.median(warm[floor_px])) if floor_px.sum() > 50 else 0.0
 
     mask = (good_n & inimg & (cosu < p.upright_max) & (hgt > p.min_height_m) & (hgt < p.max_height_m)
             & (T < p.max_texture) & (S < p.max_saturation) & (V > p.min_rel_brightness * floor_v))
+    if p.min_rel_warmth is not None:
+        mask &= warm - floor_warm >= p.min_rel_warmth
     cell_area = (s * d / fx) * (s * d / fy)              # m^2 one cell covers, facing the camera
     area = float(cell_area[mask].sum())
+
+    # does the curtain's surface go on up above the walls? upright cells in the height band, in a column that has
+    # curtain cells, at the same horizontal distance as that column's curtain cells
+    horiz = np.linalg.norm(P - height[..., None] * up, axis=-1)
+    band = good_n & (cosu < p.upright_max) & (hgt >= p.extend_min_m) & (hgt <= p.extend_max_m)
+    col_d = np.full(w, np.nan)
+    cols = np.where(mask.any(0))[0]
+    for c in cols:
+        col_d[c] = np.median(horiz[mask[:, c], c])
+    near = np.abs(horiz - col_d[None, :]) <= p.extend_tol_m        # nan columns compare False
+    extend_area = float(cell_area[band & near].sum())
     nvalid = int(valid.sum())
-    return {'mask': mask, 'points': P, 'valid': valid, 'area_m2': area,
-            'fraction': float(mask.sum()) / max(1, nvalid), 'floor_v': floor_v, 'uc': uc, 'vc': vc, 'depth': d}
+    return {'mask': mask, 'points': P, 'valid': valid, 'area_m2': area, 'extend_m2': extend_area,
+            'fraction': float(mask.sum()) / max(1, nvalid), 'floor_v': floor_v, 'uc': uc, 'vc': vc, 'depth': d,
+            'warm': warm, 'floor_warm': floor_warm, 'floor_px': floor_px}
 
 
 def detect_curtain_colour(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequence[float], k_colour: Sequence[float],
@@ -159,9 +195,11 @@ def detect_curtain_colour(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequenc
     r = colour_mask(depth_m, rgb, k_depth, k_colour, depth_to_colour, up, p)
     if r['area_m2'] < p.min_area_m2 and r['fraction'] < p.min_fraction:
         return None
+    if p.min_extend_m2 > 0 and r['extend_m2'] < p.min_extend_m2:
+        return None                                      # no taller than a wall: not the curtain
     m = r['mask']
     return ColourDetection(points=r['points'][m], area_m2=r['area_m2'], fraction=r['fraction'],
-                           floor_v=r['floor_v'], ranges=r['depth'][m])
+                           floor_v=r['floor_v'], ranges=r['depth'][m], extend_m2=r['extend_m2'])
 
 
 def one_per_cell(points_xy: np.ndarray, cell_m: float) -> np.ndarray:

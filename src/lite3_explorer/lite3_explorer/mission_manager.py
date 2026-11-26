@@ -31,23 +31,28 @@ Interfaces
   pub  /tile_map                std_msgs/String   JSON: grid, trail, every tile's status and sides (latched)
   pub  /tile_report             std_msgs/String   JSON: one tile report entry (latched, depth 100)
   pub  ~/tile_markers, ~/markers  visualization_msgs/MarkerArray   tiles, trail, target / tile descriptions
+  pub  ~/curtain_markers         visualization_msgs/MarkerArray   the curtain wall (one tile edge) in yellow, for the whole run
   pub  /spin_crawl, /spin_flat  std_msgs/Bool     gait holds for gait_switcher while turning
+  pub  /gait_freeze             std_msgs/Bool     (latched) true in recovery mode: gait_switcher keeps the current gait
   sub  /curtain/points, /stairs/points   std_msgs/String   curtain / stair detectors (use_curtains, use_stairs)
   sub  /roller/points           std_msgs/String   roller detector (use_rollers): roller tiles
   pub  /roller_mode             std_msgs/Bool     (latched) true while the roller mode holds the h-step gait (roller_detector pauses)
   pub  /cmd_vel                 geometry_msgs/Twist   direct velocity (curtain, stairs, roller and mppi modes)
   pub  /simple_cmd              transfer_interfaces/MotionSimpleCMD   robot AI mode on / off (stairs mode)
+  sub  /robot_state             std_msgs/Int32MultiArray  [basic, gait, policy, motion] (lite3_explorer robot_state_bridge):
+                                                  AI on / off is sent again until the robot reports it
   pub  /odom_rebase             geometry_msgs/PoseStamped  where the robot is after the AI-mode climb (odom_tf_bridge re-anchors odom)
   pub  /ai_mode                 std_msgs/Bool     (latched) true while AI mode is on: gait_switcher and stair_detector pause
-  pub  /stair_climber/enable    std_msgs/Bool     stairs mode with climber: true: hand the climb to stair_climber
-  sub  /stair_climber/state     std_msgs/String   ... and watch it (DONE = crossed, ABORT = failed)
-  act  spin, compute_path_to_pose, navigate_to_pose, follow_waypoints   (Nav2 clients)
+  pub  /stairs/enable           std_msgs/Bool     (latched) stair_detector on / off: on for the opening scan
+                                                  (modes.scanning.opening_stairs), all the time with use_stairs
+  act  spin, compute_path_to_pose, navigate_to_pose, navigate_through_poses (follow_waypoints)   (Nav2 clients)
   srv  /global_costmap/clear_entirely_global_costmap, /local_costmap/clear_entirely_local_costmap  (recovery)
 """
 import datetime as dt
 import json
 import math
 import os
+import subprocess
 import time
 from turtle import st
 from unittest import result
@@ -58,7 +63,7 @@ from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 
 from action_msgs.msg import GoalStatus
@@ -69,13 +74,14 @@ from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import ComputePathToPose, Spin
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import Imu, LaserScan, PointCloud2
 from sensor_msgs_py import point_cloud2
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Empty, Int32MultiArray, String
 from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
+from lite3_explorer import curtain_core as CC
 from lite3_explorer import map_grid as G
 from lite3_explorer import roller_core as RC
 from lite3_explorer import tiles as T
@@ -91,7 +97,8 @@ from lite3_explorer.tile_tracker import TileTracker
 SIDE_NAMES = {'N': 'north', 'E': 'east', 'S': 'south', 'W': 'west'}
 TILE_COLOURS = {'visited': (0.2, 0.5, 1.0, 0.45), 'to_visit': (0.1, 0.8, 0.2, 0.35),
                 'blocked': (0.8, 0.1, 0.1, 0.25), 'unreachable': (0.6, 0.0, 0.6, 0.35),
-                'staircase': (1.0, 0.85, 0.0, 0.6), 'roller': (0.95, 0.95, 0.95, 0.6)}
+                'staircase': (1.0, 0.85, 0.0, 0.6), 'roller': (0.95, 0.95, 0.95, 0.6),
+                'closed': (0.25, 0.25, 0.25, 0.6)}           # below the climbed staircase (j < its j): never again
 
 
 # ------------------------------------------------------------------------------- Nav2 helpers
@@ -263,9 +270,22 @@ class MissionManager(Node):
                                  on_reached=self._on_tile_reached,
                                  min_known=float(tcfg.get('min_known', 0.5)),
                                  scene_min_known=float(tcfg.get('scene_min_known', 0.85)),
-                                 scene_max_free=float(tcfg.get('scene_max_free', 0.80)))
+                                 scene_max_free=float(tcfg.get('scene_max_free', 0.80)),
+                                 scene_margin_m=float(tcfg.get('scene_margin_m', 0.10)))
+        self.tiles.align_on_entry = bool(tcfg.get('align_on_entry', True))
+        self.tiles.align_max_shift_m = float(tcfg.get('align_max_shift_m', 0.15))
+        self.tiles.align_max_rot_deg = float(tcfg.get('align_max_rot_deg', 6.0))
+        self.tiles.align_radius_m = float(tcfg.get('align_radius_m', 2.0))
+        self.tiles.align_min_quality = float(tcfg.get('align_min_quality', 1.5))
+        self.tiles.on_aligned = lambda r: (
+            self.log('info', f'Tile {r["tile"][0]},{r["tile"][1]}: grid aligned to the walls (turn {r["rot_deg"]:+.1f} deg, '
+                             f'shift {r["shift_u"]:+.2f} / {r["shift_v"]:+.2f} m).'),
+            self.event('tile_aligned', **r))
         self.tiles.skip_scene = bool(mode_cfg(cfg, 'exploring').get('scenes', False))   # scene tiles are looked at, never entered
         self.tiles.stair_min_points = int(tcfg.get('stair_min_points', 4))
+        self.tiles.stair_floor_min_known = float(tcfg.get('stair_floor_min_known', 0.90))
+        self.tiles.stair_floor_min_free = float(tcfg.get('stair_floor_min_free', 0.95))
+        self.tiles.stair_shift_max_m = float(tcfg.get('stair_shift_max_m', 0.35))
         self.tiles.roller_min_points = int(tcfg.get('roller_min_points', 4))
         self.tiles.roller_min_lidar = int(tcfg.get('roller_min_lidar', 2))
         self.tiles.roller_depth_only_points = int(tcfg.get('roller_depth_only_points', 0))
@@ -337,6 +357,10 @@ class MissionManager(Node):
         self.flat_pub = self.create_publisher(Bool, '/spin_flat', 10)
         self.step_up_pub = self.create_publisher(Bool, '/step_up', latched)      # h-step gait while driving to a higher tile
         self._step_up = None
+        # recovery mode (modes.recovery.keep_gait): the robot keeps the gait it already has (gait_switcher /gait_freeze)
+        self.gait_freeze_pub = self.create_publisher(Bool, '/gait_freeze', latched)
+        self._gait_frozen = False
+        self.gait_freeze_pub.publish(Bool(data=False))
         self._hstep_hold = False                                                 # roller mode: h-step gait while crossing
         self.roller_mode_pub = self.create_publisher(Bool, '/roller_mode', latched)
         self.roller_mode_pub.publish(Bool(data=False))
@@ -351,13 +375,29 @@ class MissionManager(Node):
         self.machine.start()
         self.create_timer(float(cfg['tick_period_s']), self._tick)
         self.create_timer(0.5, self._track_tiles)
+        self._slam_mo, self._slam_hold_until = None, 0.0   # last map->odom seen, tile reaching held until (monotonic)
+        if float(cfg['slam_jump_m']) > 0.0:
+            self.create_timer(0.2, self._watch_slam_jump)
         self.create_timer(1.0, self._refresh_tiles)
         self.create_timer(0.5, self._reevaluate_tiles)
         self.create_timer(0.5, self._publish_robot_position) #publish robot position every 0.5 seconds
         self.create_timer(1.0, self._publish_virtual_walls)     # re-marked every second: the lidar must not clear them
         self.create_timer(1.0, self._publish_status)
         # curtain mode (use_curtains): the detector's confirmed curtain spots, and direct velocity commands for the walk through it
-        self._curtain_pts = np.zeros((0, 4))
+        self._curtain_pts = np.zeros((0, 5))           # x, y, ux, uy, 1 = camera spot / 0 = lidar only
+        # the maze has ONE curtain: every spot ever confirmed is remembered for the rest of the run (the detector's own
+        # set can shrink: lidar spots un-confirm as more scans come in). 5 cm cell -> [x, y, camera]; carried into the
+        # new map's frame after the stairs (_carry_grid). From them the ONE tile edge the curtain lies on is picked
+        # (curtain_core.pick_curtain_wall) as (tile, side), and only that wall is drawn in yellow on ~/curtain_markers.
+        # It moves only to an edge with curtain_wall_switch_ratio x its camera spots (a grey wall seen close up can
+        # give the first few spots). An edge the curtain mode actually walked through (tiles.curtain_edges) wins.
+        self._curtain_seen = {}
+        self._curtain_wall = None                      # (tile, side) of the curtain wall, once found
+        self._curtain_switch_ratio = float(cfg['modes'].get('exploring', {}).get('curtain_wall_switch_ratio', 2.0))
+        self._curtain_drawn = None                     # grid the wall was last drawn with (redrawn when the grid moves)
+        self._curtain_ignore_until = 0.0               # after a new map: the detector's last old-frame points are ignored
+        self.curtain_marker_pub = self.create_publisher(MarkerArray, '~/curtain_markers', latched)
+        self.create_timer(1.0, self._update_curtain_wall)
         self.create_subscription(String, '/curtain/points', self._on_curtain_points, latched)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._cmd = None                                  # (vx, wz, expires): republished at 20 Hz until it expires
@@ -368,12 +408,38 @@ class MissionManager(Node):
         self.create_subscription(String, '/roller/points', self._on_roller_points, latched)
         self.ai_pub = self.create_publisher(Bool, '/ai_mode', latched)
         self.ai_pub.publish(Bool(data=False))
-        # stairs mode with climber: true: the stair_climber package does the alignment + AI crossing
-        self.climber_enable_pub = self.create_publisher(Bool, '/stair_climber/enable', 10)
-        self.climber_ai_on_pub = self.create_publisher(Bool, '/stair_climber/ai_on', latched)
+        # stair detector on / off: always on when an exploring mode climbs staircases (use_stairs), else only while a
+        # mode asks for it (the opening scan, modes.scanning.opening_stairs)
+        self._stairs_always = any(m.type_name == 'exploring' and m.cfg.get('stairs', False)
+                                  for m in self.machine.modes.values())
+        self._stairs_enabled = None
+        self.stairs_enable_pub = self.create_publisher(Bool, '/stairs/enable', latched)
+        self.stair_detection(False)
         self.odom_rebase_pub = self.create_publisher(PoseStamped, '/odom_rebase', 10)
-        self._climber_state = (None, 0.0)
-        self.create_subscription(String, '/stair_climber/state', self._on_climber_state, 10)
+        # new map after the stairs (modes.stairs.new_map): save the map, restart slam_toolbox, start a new tile grid
+        self._last_map, self._map_rx_at = None, 0.0
+        self._nm = None                                   # the new-map job in progress (see start_new_map)
+        self._map_parts = 1                               # tile report / map file number (part 1 = the first map)
+        self.save_map_client = None
+        try:
+            from slam_toolbox.srv import SaveMap
+            self._save_map_type = SaveMap
+            self.save_map_client = self.create_client(SaveMap, '/slam_toolbox/save_map')
+        except ImportError:
+            self._save_map_type = None
+        self.map_reset_pub = self.create_publisher(Empty, '/map_reset', 10)    # detectors forget what they saw
+        self.create_timer(0.2, self._new_map_tick)
+        # robot state [basic, gait, policy, motion] from robot_state_bridge (0x0901 UDP report):
+        # the stairs mode sends AI on / off again until the robot reports it
+        self._robot_state = (None, 0.0)
+        self.create_subscription(Int32MultiArray, '/robot_state', self._on_robot_state, 10)
+        # stairs FIX 3: the IMU stays live in AI mode (odom_tf_bridge freezes the map pose): pitch + yaw for the crossing
+        self._imu = None
+        self.create_subscription(Imu, '/imu/data', self._on_imu, qos_profile_sensor_data)
+        # stairs: the wall beyond the staircase. The map pose is frozen in AI mode (and so is the local costmap), so the
+        # crossing looks at the raw scan (base_link frame) for something in the body's corridor ahead (front_gap)
+        self._scan = None
+        self.create_subscription(LaserScan, cfg.get('front_scan_topic', '/scan'), self._on_scan, qos_profile_sensor_data)
         self.simple_cmd_pub, self._simple_cmd_type = None, None
         try:
             from transfer_interfaces.msg import MotionSimpleCMD
@@ -509,9 +575,88 @@ class MissionManager(Node):
 
     def _on_curtain_points(self, msg):
         try:
-            self._curtain_pts = np.array(json.loads(msg.data).get('points', []), float).reshape(-1, 4)
+            data = json.loads(msg.data)
+            pts = np.array(data.get('points', []), float).reshape(-1, 4)
+            n_cam = int(data.get('camera', len(pts)))          # no count (older publishers, the sim): all camera spots
+            self._curtain_pts = np.hstack([pts, (np.arange(len(pts)) < n_cam).astype(float)[:, None]])
         except (ValueError, TypeError):
-            pass
+            return
+        if time.monotonic() >= self._curtain_ignore_until and len(pts):
+            self._remember_curtain(self._curtain_pts[:, [0, 1, 4]])
+
+    def _remember_curtain(self, rows):
+        """Add confirmed curtain spots (x, y, camera) to the run's curtain memory, then look for the curtain wall."""
+        for x, y, cam in np.asarray(rows, float).reshape(-1, 3):
+            key = (int(math.floor(x / 0.05)), int(math.floor(y / 0.05)))
+            e = self._curtain_seen.setdefault(key, [float(x), float(y), 0.0])
+            e[2] = max(e[2], float(cam))
+        self._update_curtain_wall()
+
+    def _update_curtain_wall(self):
+        """Pick (once) the tile edge the curtain lies on and draw it. A curtain edge the robot walked through overrides
+        the pick (that is certain); otherwise the pick stays for the rest of the run, unless the curtain mode rejects
+        it (timed out / blocked walking through it): then it is unmarked and the curtain is looked for elsewhere. Spots on
+        a rejected edge or on the initial tile's edges never count (tiles.not_curtain_mask)."""
+        tg = self.tiles.grid
+        if tg is None:
+            return
+        if self._curtain_wall is not None and self.tiles.is_not_curtain(*self._curtain_wall):
+            tile, side = self._curtain_wall
+            self._curtain_wall = None
+            self.log('warn', f'Curtain on the {SIDE_NAMES[side]} edge of tile {T.tile_label(tile)} was no curtain: '
+                             f'unmarked, looking for it elsewhere.')
+            self.event('curtain_wall_cleared', tile=T.tile_label(tile), side=side)
+            self._publish_curtain_markers()
+        if self._curtain_wall is not None and self._curtain_drawn != tg.as_dict():
+            self._publish_curtain_markers()            # new / nudged grid (or a new map): the edge moved with it
+        walked = next(iter(self.tiles.curtain_edges.values()), None)
+        wall, found = None, None
+        if walked is not None:
+            tile, nb = walked
+            wall = (tuple(tile), T.side_towards(tuple(tile), tuple(nb)))
+            if self._curtain_wall is not None and T.edge_key(tg, *self._curtain_wall) == T.edge_key(tg, *wall):
+                wall = None                                # already the drawn one
+        elif self._curtain_seen:
+            # redone on every update: a detected wall moves to an edge with clearly more camera spots (pick_curtain_wall)
+            seen = np.array(list(self._curtain_seen.values()), float)
+            found = CC.pick_curtain_wall(tg, seen[self.tiles.not_curtain_mask(seen)], current=self._curtain_wall,
+                                         switch_ratio=self._curtain_switch_ratio)
+            if found is not None:
+                wall = (tuple(found['tile']), found['side'])
+        if wall is None:
+            return
+        was = self._curtain_wall
+        self._curtain_wall = wall
+        (x0, y0), (x1, y1) = tg.edge(*wall)
+        why = 'walked through' if walked is not None else 'moved' if was is not None else 'detected'
+        extra = {} if found is None else {'camera_spots': found['camera_spots'], 'spots': found['spots']}
+        if was is not None:
+            extra['was'] = [T.tile_label(was[0]), was[1]]
+        self.log('info', f'Curtain {why} on the {SIDE_NAMES[wall[1]]} edge of tile {T.tile_label(wall[0])}'
+                         + (f' (was the {SIDE_NAMES[was[1]]} edge of tile {T.tile_label(was[0])})' if was else '')
+                         + ': marked in yellow.')
+        self.event('curtain_wall', tile=T.tile_label(wall[0]), side=wall[1], how=why,
+                   segment=[[round(x0, 2), round(y0, 2)], [round(x1, 2), round(y1, 2)]], **extra)
+        self._publish_curtain_markers()
+
+    def _publish_curtain_markers(self):
+        """The curtain wall: a yellow, curtain-high panel along its tile edge (kept for the rest of the run)."""
+        m = Marker()
+        m.header.frame_id, m.header.stamp = self.global_frame, self.get_clock().now().to_msg()
+        m.ns, m.id, m.type = 'curtain', 0, Marker.CUBE
+        tg = self.tiles.grid
+        if self._curtain_wall is None or tg is None:
+            m.action = Marker.DELETE
+        else:
+            (x0, y0), (x1, y1) = tg.edge(*self._curtain_wall)
+            yaw = math.atan2(y1 - y0, x1 - x0)
+            m.action = Marker.ADD
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = (x0 + x1) / 2, (y0 + y1) / 2, 0.35
+            m.pose.orientation.z, m.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+            m.scale.x, m.scale.y, m.scale.z = math.dist((x0, y0), (x1, y1)), 0.06, 0.7
+            m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.9, 0.0, 0.9
+        self._curtain_drawn = tg.as_dict() if m.action == Marker.ADD else None
+        self.curtain_marker_pub.publish(MarkerArray(markers=[m]))
 
     def curtain_points(self):
         return self._curtain_pts
@@ -523,7 +668,8 @@ class MissionManager(Node):
             return
         if self.tiles.set_stair_points(pts):
             self.tiles.update()
-            self.log('info', f'Staircase tile(s): {", ".join(T.tile_label(t) for t in sorted(self.tiles.stairs))}.')
+            self.log('info', f'Staircase tile {", ".join(T.tile_label(t) for t in sorted(self.tiles.stairs))}: '
+                             f'marked as the staircase for the rest of the run.')
             self.event('staircases', tiles=[T.tile_label(t) for t in sorted(self.tiles.stairs)])
 
     def _on_roller_points(self, msg):
@@ -537,21 +683,13 @@ class MissionManager(Node):
             self.event('rollers', tiles=self.tiles.rollers_left())
 
     def hstep(self, on):
-        """Hold the h-step gait (/step_up true: gait_switcher sends rug_hstep) while the roller mode crosses a roller;
+        """Hold the h-step gait (/step_up true: gait_switcher sends rug_hstep) while the roller or curtain mode crosses;
         /roller_mode tells the roller detector to pause."""
         on = bool(on)
         if on != self._hstep_hold:
             self._hstep_hold = on
             self.roller_mode_pub.publish(Bool(data=on))
             self._update_step_up()
-
-    def ai_flag(self, on):
-        """/ai_mode only (gait_switcher / stair_detector pause), no /simple_cmd: stair_climber sends the AI codes."""
-        self.ai_pub.publish(Bool(data=bool(on)))
-
-    def stair_climber_ai_on(self, on):
-        """Tell stair_climber the robot is already in AI mode (no Move Mode on enable, no second Enter AI)."""
-        self.climber_ai_on_pub.publish(Bool(data=bool(on)))
 
     def rebase_odom(self, x, y, yaw):
         """Tell odom_tf_bridge the robot is at (x, y, yaw) in the global frame (after AI mode threw the leg odometry
@@ -562,21 +700,53 @@ class MissionManager(Node):
         ps.pose.orientation.z, ps.pose.orientation.w = math.sin(0.5 * yaw), math.cos(0.5 * yaw)
         self.odom_rebase_pub.publish(ps)
 
-    def stair_climber_enable(self, on):
-        """Enable / disable the stair_climber node. Enabling sends false first, so it restarts from IDLE after an
-        earlier DONE / ABORT."""
-        if on:
-            self.climber_enable_pub.publish(Bool(data=False))
-            self._climber_state = (None, 0.0)          # ignore the state from before
-        self.climber_enable_pub.publish(Bool(data=bool(on)))
+    def _on_imu(self, msg):
+        q, w = msg.orientation, msg.angular_velocity
+        pitch = math.asin(max(-1.0, min(1.0, 2.0 * (q.w * q.y - q.z * q.x))))
+        self._imu = (pitch, self._yaw_of(q), w.z, time.monotonic())
 
-    def _on_climber_state(self, msg):
-        self._climber_state = (msg.data, time.monotonic())
+    def _on_scan(self, msg):
+        r = np.asarray(msg.ranges, dtype=float)
+        a = msg.angle_min + msg.angle_increment * np.arange(r.size)
+        ok = np.isfinite(r) & (r >= msg.range_min) & (r <= msg.range_max)
+        # how old the scan already is when it arrives (bag fullrun_25_11_183742: ~1.1 s from the Livox to /scan)
+        lag = (self.get_clock().now().nanoseconds - Time.from_msg(msg.header.stamp).nanoseconds) * 1e-9
+        self._scan = (r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok]), msg.header.frame_id, max(0.0, lag), time.monotonic())
 
-    def stair_climber_state(self):
-        """(last /stair_climber/state or None, seconds since it arrived)."""
-        state, t = self._climber_state
-        return (state, time.monotonic() - t) if state is not None else (None, math.inf)
+    def front_gap(self, half_width_m=0.20, nose_m=0.305):
+        """(gap_m, age_s): how far ahead of the nose (nose_m in front of the scan frame's origin) the nearest scan return
+        lies in the corridor |y| < half_width_m; gap_m None = no return in the corridor. age_s = how old the scan is NOW
+        (transport lag + time since it arrived): the robot has kept walking since. None = no scan yet."""
+        if self._scan is None:
+            return None
+        x, y, _frame, lag, received = self._scan
+        sel = (x > 0.0) & (np.abs(y) < half_width_m)
+        gap = float(np.min(x[sel])) - nose_m if np.any(sel) else None
+        return gap, lag + (time.monotonic() - received)
+
+    def imu(self):
+        """(pitch_rad (ROS: + = nose DOWN), yaw_rad, gyro_z_rad_s, age_s) of the latest /imu/data, or None."""
+        if self._imu is None:
+            return None
+        pitch, yaw, gz, t = self._imu
+        return pitch, yaw, gz, time.monotonic() - t
+
+    def _on_robot_state(self, msg):
+        if len(msg.data) >= 4:
+            self._robot_state = (tuple(int(v) for v in msg.data[:4]), time.monotonic())
+
+    def robot_state(self, max_age_s=0.5):
+        """(basic, gait, policy, motion) from /robot_state, or None when there is none this fresh."""
+        st, t = self._robot_state
+        return st if st is not None and time.monotonic() - t <= max_age_s else None
+
+    def stair_detection(self, on):
+        """Stair detector on / off (/stairs/enable). It stays on regardless with use_stairs (exploring climbs staircases)."""
+        on = bool(on) or self._stairs_always
+        if on != self._stairs_enabled:
+            self._stairs_enabled = on
+            self.stairs_enable_pub.publish(Bool(data=on))
+            self.get_logger().info(f'Stair detector {"on" if on else "off"}.')
 
     def ai_mode(self, on, cmd_code):
         """Robot AI mode on / off: MotionSimpleCMD {cmd_code, type: 0} on /simple_cmd (what `ros2 topic pub --once
@@ -673,6 +843,8 @@ class MissionManager(Node):
         with no measurement counts as the start floor, 0 m). The start elevation is taken once, when the target is set, and the
         largest elevation measured for the target is kept, so neither the robot moving over the step edge nor a later low reading
         of the raised tile switches the h-step gait off. It stays on until the target changes (the tile is reached, or given up)."""
+        if self._gait_frozen:
+            return                                # recovery keeps the gait: /step_up stays as it was
         on = False
         if self.cfg.get('step_up_gait', True) and self.target and self.tiles.ready:
             if self._rise_target != self.target[0]:
@@ -692,7 +864,7 @@ class MissionManager(Node):
         if on != self._step_up:
             self._step_up = on
             self.step_up_pub.publish(Bool(data=on))
-            self.log('info', 'Crossing a roller: h-step gait.' if on and not rise else
+            self.log('info', 'Crossing a roller / curtain: h-step gait.' if on and not rise else
                      f'Target tile {self.target[0] if self.target else "-"}: '
                      + (f'{self._rise_max:+.2f} m above the start tile: h-step gait.' if on else 'no step up: terrain gait.'))
             self.event('step_up', on=on, tile=self.target[0] if self.target else None)
@@ -714,6 +886,14 @@ class MissionManager(Node):
 
     def on_mode_change(self, mode, phase):
         self.mode_pub.publish(String(data=f'{mode}:{phase}' if phase else mode))
+        m = self.machine.modes.get(mode) if getattr(self, 'machine', None) else None
+        freeze = m is not None and m.type_name == 'recovery' and bool(m.cfg.get('keep_gait', True))
+        if freeze != self._gait_frozen:
+            self._gait_frozen = freeze
+            self.gait_freeze_pub.publish(Bool(data=freeze))
+            self.log('info', 'Recovery: keeping the current gait.' if freeze else 'Gait follows terrain / targets again.')
+            if not freeze:
+                self._update_step_up()            # the target may have changed meanwhile
 
     def on_complete(self, reason):
         self.get_logger().info(f'MISSION COMPLETE: {reason}')
@@ -745,8 +925,11 @@ class MissionManager(Node):
     # ===================================================== inputs
     def _on_map(self, msg):
         i = msg.info
-        self.tiles.set_map(G.grid_from_msg_data(msg.data, i.width, i.height),
-                           G.GridInfo(i.width, i.height, i.resolution, i.origin.position.x, i.origin.position.y))
+        grid = G.grid_from_msg_data(msg.data, i.width, i.height)
+        info = G.GridInfo(i.width, i.height, i.resolution, i.origin.position.x, i.origin.position.y)
+        self._last_map = (grid, info)
+        self._map_rx_at = time.monotonic()
+        self.tiles.set_map(grid, info)
 
     def _on_global_costmap(self, msg):
         i = msg.info
@@ -790,6 +973,33 @@ class MissionManager(Node):
     def _track_tiles(self):
         if self.tiles.ready and self.opening_done:
             self.tiles.track(self.pose())
+
+    def _watch_slam_jump(self):
+        """map->odom only moves by scan-matching corrections of a few cm; a jump of slam_jump_m / slam_jump_deg in one
+        check is SLAM re-placing the robot (a loop closure), possibly falsely. Hold tile reaching for slam_jump_hold_s so
+        the jumped pose marks no tile (fullrun_25_11_215528: 'tile_reached 1,-2' 1 s after the robot was on 0,-4)."""
+        now = time.monotonic()
+        try:
+            t = self.tf_buffer.lookup_transform(self.global_frame, self.odom_frame, Time())
+        except TransformException:
+            t = None
+        if t is not None:
+            cur = (t.transform.translation.x, t.transform.translation.y, self._yaw_of(t.transform.rotation))
+            nm = getattr(self, '_nm', None)
+            if nm is not None and nm['state'] == 'working':
+                cur = None                       # new map: slam_toolbox restarts map->odom; the next one is the baseline
+            prev, self._slam_mo = self._slam_mo, cur
+            if prev is not None and cur is not None:
+                d = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+                dyaw = math.degrees(abs(math.atan2(math.sin(cur[2] - prev[2]), math.cos(cur[2] - prev[2]))))
+                if d > float(self.cfg['slam_jump_m']) or dyaw > float(self.cfg['slam_jump_deg']):
+                    self._slam_hold_until = now + float(self.cfg['slam_jump_hold_s'])
+                    self.log('warn', f'SLAM jump: {self.global_frame}->{self.odom_frame} moved {d:.2f} m / {dyaw:.0f} deg '
+                                     f'at once (loop closure?); no tile counts as reached for '
+                                     f'{float(self.cfg["slam_jump_hold_s"]):.0f} s.')
+                    self.event('slam_jump', moved_m=round(d, 3), turned_deg=round(dyaw, 1),
+                               before=[round(v, 3) for v in prev], after=[round(v, 3) for v in cur])
+        self.tiles.reach_hold = now < self._slam_hold_until
 
     def _publish_virtual_walls(self):
         """Virtual walls as a point cloud (Nav2 global costmap, source 'virtual_walls'): the wall behind the robot at
@@ -1006,7 +1216,7 @@ class MissionManager(Node):
         context = (f"SCENE TILE CONTEXT: tile {label} of the robot's {size:g} m x {size:g} m tile grid is a scene tile "
                    f'(a scanned, mostly non-traversable tile the robot does not enter). The robot stands on the '
                    f'neighbouring tile {here} at ({pose[0]:.2f}, {pose[1]:.2f}) in the map frame and is facing tile {label}. '
-                   f'Classify what is on tile {label}: one of the eight scene types, or traversable.')
+                   f'Classify what is on tile {label}: one of the scene types listed above, or traversable.')
         if view:
             context += (f' This picture is the {view} view of three (left, centre, right: the robot yaws its body to '
                         f'each), so part of the tile may be out of frame.')
@@ -1035,7 +1245,7 @@ class MissionManager(Node):
             self.book.set_no_ai(label, 'AI disabled (use_ai:=false)')
         else:
             self.book.set_error(label, call.failure())
-        self._write_book()
+        self._write_book(finished=self.machine.finished_reason is not None)   # a background answer may come after the end
         self._publish_tile_report(label)
 
     def _poll_tile_reports(self):
@@ -1175,7 +1385,34 @@ class MissionManager(Node):
         markers.extend(self._split_markers(stamp))
         markers.extend(self._free_label_markers(stamp))
         markers.extend(self._target_markers(stamp))
+        markers.extend(self._stair_ref_markers(stamp))
         self.tile_marker_pub.publish(MarkerArray(markers=markers))
+
+    def _stair_ref_markers(self, stamp):
+        """Reference tiles beyond staircases (odom is rebased to them after a climb): an off-grid outline turned to the
+        stairs with an arrow up the steps. Orange while planned, green once odom was rebased to it."""
+        out = []
+        for n, ref in enumerate(getattr(self.tiles, 'stair_refs', [])):
+            rgba = (0.1, 0.8, 0.2, 1.0) if ref.get('used') else (1.0, 0.55, 0.0, 1.0)
+            m = Marker()
+            m.header.frame_id, m.header.stamp = self.global_frame, stamp
+            m.ns, m.id, m.type, m.action = 'stair_ref', 2 * n, Marker.LINE_STRIP, Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x = 0.04
+            m.color.r, m.color.g, m.color.b, m.color.a = rgba
+            for x, y in list(ref['corners']) + [ref['corners'][0]]:
+                q = type(m.pose.position)()
+                q.x, q.y, q.z = x, y, 0.07
+                m.points.append(q)
+            a = Marker()
+            a.header.frame_id, a.header.stamp = self.global_frame, stamp
+            a.ns, a.id, a.type, a.action = 'stair_ref', 2 * n + 1, Marker.ARROW, Marker.ADD
+            a.pose.position.x, a.pose.position.y, a.pose.position.z = ref['centre_xy'][0], ref['centre_xy'][1], 0.07
+            a.pose.orientation.z, a.pose.orientation.w = math.sin(ref['yaw'] / 2), math.cos(ref['yaw'] / 2)
+            a.scale.x, a.scale.y, a.scale.z = 0.4 * ref['size'], 0.06, 0.06
+            a.color.r, a.color.g, a.color.b, a.color.a = rgba
+            out += [m, a]
+        return out
 
     def _hatch_marker(self, tg, tile, mid, ns, stamp, z=0.04, rgba=(0.2, 0.5, 1.0, 1.0), hatch_m=0.12):
         """A tile drawn as an outline with diagonal hatch lines."""
@@ -1240,10 +1477,12 @@ class MissionManager(Node):
             m.pose.orientation.w = 1.0
             m.scale.z = 0.14
             m.color.r = m.color.g = m.color.b = m.color.a = 1.0
-            # the scene test is free/KNOWN < scene_max_free (and known >= scene_min_known); 'free' alone is free/TOTAL, which
-            # reads lower than the tested ratio whenever the tile is not fully scanned (0.79 free of 0.97 known = 0.81)
+            # the scene test is free/KNOWN < scene_max_free (and known >= scene_min_known), over the tile's interior only
+            # (scene_margin_m in from the edges: 'inner'); 'free' alone is free/TOTAL over the whole tile, which reads lower
+            # than the tested ratio whenever the tile is not fully scanned (0.79 free of 0.97 known = 0.81)
             ratio = d['free'] / d['known'] if d['known'] > 0 else 0.0
-            m.text = f"free/known {ratio:.2f}\nknown {d['known']:.2f}\nfree {d['free']:.2f}"
+            m.text = (f"inner free/known {d.get('scene_free', ratio):.2f}\nfree/known {ratio:.2f}\n"
+                      f"known {d['known']:.2f}\nfree {d['free']:.2f}")
             out.append(m)
         return out
 
@@ -1262,7 +1501,7 @@ class MissionManager(Node):
             if self.target:
                 label, goal = self.target
                 cx, cy = tg.center(tuple(int(v) for v in label.split(',')))
-                rgb = {'recovery': (0.9, 0.1, 0.9), 'backtracking': (0.0, 0.8, 0.9)}.get(
+                rgb = {'recovery': (0.9, 0.1, 0.9), 'backtracking': (0.0, 0.8, 0.9), 'ending': (0.1, 0.9, 0.2)}.get(
                     self.machine.current.type_name, (1.0, 0.5, 0.0))
                 m.color.r, m.color.g, m.color.b, m.color.a = (*rgb, 0.6 if n == 0 else 1.0)
                 if n == 0:
@@ -1280,6 +1519,137 @@ class MissionManager(Node):
         return out
 
     # ===================================================== output / shutdown
+    # ===================================================== new map after the stairs
+    def start_new_map(self, out_dir=None, timeout_s=60.0):
+        """Stairs mode (new_map): save the map so far under out_dir (default reports_dir; <run>_part<n>.pgm / .yaml, tile
+        report, tiles json), then restart slam_toolbox (Humble has no reset service; the launch file respawns it) and
+        start a fresh tile grid. Poll new_map_state(): 'working' | 'done' | 'failed'. A failure leaves the old map, grid
+        and report exactly as they were."""
+        if self._nm is not None and self._nm['state'] == 'working':
+            return True
+        out = os.path.expanduser(out_dir or self.cfg['reports_dir'])
+        stamp = os.path.basename(self.run_dir)[len('run_'):]
+        self._nm = {'state': 'working', 'step': 'save', 'dir': out, 't0': self.now(), 'timeout': float(timeout_s),
+                    'base': os.path.join(out, f'map_{stamp}_part{self._map_parts}'), 'future': None}
+        return True
+
+    def new_map_state(self):
+        return self._nm['state'] if self._nm is not None else 'failed'
+
+    def _new_map_fail(self, why):
+        self.log('error', f'New map after the stairs: {why}; carrying on with the old map.')
+        self.event('new_map_failed', why=why, step=self._nm['step'])
+        self._nm['state'] = 'failed'
+
+    def _new_map_tick(self):
+        nm = self._nm
+        if nm is None or nm['state'] != 'working':
+            return
+        if self.now() - nm['t0'] > nm['timeout']:
+            return self._new_map_fail(f'timed out in step "{nm["step"]}"')
+        if nm['step'] == 'save':
+            if self.save_map_client is None or not self.save_map_client.wait_for_service(timeout_sec=0.0):
+                if self.now() - nm['t0'] > 5.0:
+                    self._new_map_fail('slam_toolbox save_map service not available')
+                return
+            try:
+                os.makedirs(nm['dir'], exist_ok=True)
+                if self.tiles.ready:
+                    self.tiles.update(force=True)
+                    with open(nm['base'] + '_tiles.json', 'w', encoding='utf-8') as fh:
+                        json.dump(self.tiles.as_dict(self.global_frame), fh, indent=2, ensure_ascii=False, default=str)
+            except OSError as exc:
+                return self._new_map_fail(f'cannot write to {nm["dir"]}: {exc}')
+            self._write_book(finished=True)
+            req = self._save_map_type.Request()
+            req.name.data = nm['base']
+            nm['future'] = self.save_map_client.call_async(req)
+            nm['step'] = 'saving'
+        elif nm['step'] == 'saving':
+            if not nm['future'].done():
+                return
+            res = nm['future'].result()
+            if res is None or res.result != 0 or not os.path.exists(nm['base'] + '.yaml'):
+                return self._new_map_fail('slam_toolbox could not save the map')
+            nm['old_pose'] = self.pose()                 # same robot, both maps: gives the old frame -> new frame transform
+            nm['old_grid'], nm['crossed'] = self.tiles.grid, set(self.tiles.stairs_crossed)
+            nm['initial'] = (self.tiles.initial_tile, self.tiles.initial_left)
+            nm['not_curtains'] = list(self.tiles.not_curtains)
+            nm['forward'] = self.tiles.forward          # 'behind the stairs' stays relative to the original heading
+            self.log('info', f'Map up to the staircase saved: {nm["base"]}.pgm/.yaml (+ _tiles.json, tile report {self.book.path}).')
+            self.event('map_saved', path=nm['base'], tile_report=self.book.path)
+            # clear: stop slam_toolbox; the launch file respawns it with an empty map (map frame = odom at that moment)
+            if subprocess.run(['pkill', '-f', 'async_slam_toolbox_node'], check=False).returncode != 0:
+                return self._new_map_fail('could not stop slam_toolbox (pkill found no async_slam_toolbox_node)')
+            nm['killed_at'] = time.monotonic()
+            nm['step'] = 'restart'
+        elif nm['step'] == 'restart':
+            # a map published well after the kill = the respawned slam_toolbox is mapping from scratch
+            if self._map_rx_at < nm['killed_at'] + 1.0 or self._last_map is None:
+                return
+            if self.pose() is None:
+                return
+            self._new_map_apply()
+            nm['state'] = 'done'
+
+    def _new_map_apply(self):
+        """slam_toolbox runs an empty map: forget the old grid and everything on it. The next scan (opening scan:
+        spin, tile grid on the new map with the robot's tile as start tile and the wall behind it, i.e. against the
+        staircase) establishes the new grid."""
+        self._map_parts += 1
+        stamp = os.path.basename(self.run_dir)[len('run_'):]
+        self.book = TileReportBook(os.path.join(os.path.expanduser(self.cfg['reports_dir']),
+                                                f'tile_report_{stamp}_part{self._map_parts}.md'),
+                                   self.run_dir, self.use_ai, float(self.cfg['tiles']['reach_radius_m']))
+        self.report_args, self.report_tries, self.report_calls = {}, {}, {}
+        self.tiles.reset()
+        self.tiles.set_map(*self._last_map)
+        n_curtain = len(self._curtain_seen)
+        self._carry_grid()
+        if n_curtain and self.tiles.carry is None:
+            # no transform to the new frame (nor the same tile numbering): the old curtain would be drawn in the wrong place
+            self._curtain_seen, self._curtain_wall = {}, None
+            self.log('warn', 'New map: the curtain seen before cannot be carried over (no transform); forgotten.')
+        self._curtain_ignore_until = time.monotonic() + 2.0   # the detector's old-frame spots still in flight
+        self._publish_curtain_markers()
+        self.machine.reset_for_new_map()
+        self.opening_done = False
+        self._walls_sig, self._reeval_at, self._reeval_tiles, self._reeval_back = None, None, [], {}
+        self._published_tiles = -1
+        self.target = None
+        self.map_reset_pub.publish(Empty())
+        self.clear_costmaps()              # the old virtual walls are in the old map's frame
+        self.tile_marker_pub.publish(MarkerArray(markers=[Marker(action=Marker.DELETEALL)]))   # old tiles off RViz
+        self.log('info', f'New map started (part {self._map_parts}); tile report {self.book.path}.')
+        self.event('new_map', part=self._map_parts, tile_report=self.book.path)
+
+    def _carry_grid(self):
+        """The new map has its own frame (slam_toolbox starts at the robot). The robot's pose before and after tells the
+        old-frame -> new-frame transform; the old tile grid moved through it keeps its tile numbering and coordinates
+        (start tile = the tile the robot is on, e.g. 0,3 after crossing from 0,1), and so do the staircase walls."""
+        nm = self._nm
+        old, a, b = nm.get('old_grid'), nm.get('old_pose'), self.pose()
+        if old is None or a is None or b is None:
+            self.log('warn', 'New map: previous tile grid or pose unknown; the new map gets its own tile numbering.')
+            return
+        d = T.wrap(b[2] - a[2])
+        c, s = math.cos(d), math.sin(d)
+        ox, oy = old.origin_x - a[0], old.origin_y - a[1]
+        grid = T.TileGrid(b[0] + c * ox - s * oy, b[1] + s * ox + c * oy, T.wrap(old.yaw + d), old.size)
+        # the remembered curtain moves through the same old-frame -> new-frame transform
+        seen, self._curtain_seen = list(self._curtain_seen.values()), {}
+        for x, y, cam in seen:
+            ux, uy = x - a[0], y - a[1]
+            nx, ny = b[0] + c * ux - s * uy, b[1] + s * ux + c * uy
+            self._curtain_seen[(int(math.floor(nx / 0.05)), int(math.floor(ny / 0.05)))] = [nx, ny, cam]
+        # the curtain wall is kept as (tile, side): the carried grid has the same numbering, so it stays where it was
+        self.tiles.carry = {'grid': grid, 'stairs_crossed': nm.get('crossed', set()), 'forward': nm.get('forward'),
+                           'initial_tile': nm.get('initial', (None, False))[0],
+                           'initial_left': nm.get('initial', (None, False))[1],
+                           'not_curtains': nm.get('not_curtains', [])}
+        self.log('info', f'New map: tile grid carried over (robot on tile {T.tile_label(grid.tile_of(b[0], b[1]))}, '
+                         f'frame turned {math.degrees(d):+.1f} deg).')
+
     def _save_json(self, name, data):
         with open(os.path.join(self.run_dir, name), 'w', encoding='utf-8') as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False, default=str)

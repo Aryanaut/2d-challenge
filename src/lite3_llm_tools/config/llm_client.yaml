@@ -27,6 +27,11 @@ llm_client:
     view_query_workers: 3         # views of one stop sent to the server at once
     request_workers: 4            # requests served at once
     output_dir: "~/lite3_survey_runs"   # images + answers, unless a request names its own save_dir
+    # ---- scene references (describe_scene) ----
+    # Photos named <scene_type>_<n>.jpg. The live frame is sent in one collage with them and only their scene types
+    # can be answered: anything else becomes "traversable". "" = no references (the 8 fixed scene types).
+    scene_references_dir: "~/2d/images/scene_references"
+    scene_min_confidence: 0.0     # a scene answer below this confidence -> traversable (0 = off)
     # ---- prompts (empty = share/lite3_llm_tools/prompts/<default>) ----
     prompt_file: ""                      # environment_report.txt   (describe_views)
     describe_view_prompt_file: ""
@@ -34,3 +39,4 @@ llm_client:
     place_initial_tile_prompt_file: ""   # tile_init.txt
     choose_tile_prompt_file: ""          # tile_choice.txt
     choose_frontier_prompt_file: ""      # frontier_choice.txt
+    describe_scene_refs_prompt_file: ""  # scene_reference_report.txt (describe_scene with scene_references_dir)

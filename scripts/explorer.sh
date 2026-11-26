@@ -4,9 +4,10 @@
 #   window 1 "explorer": the full launch (SLAM, Nav2, mission manager, AI client)
 #   window 2 "status"  : mission mode / controller driving now | mission events (decisions, stuck, recovery)
 #                        tile report for every tile reached | chosen tile (what it is driving to)
-#                        last AI answer | velocity sent to the dog / current gait
+#                        last AI answer | velocity sent to the dog / current gait / robot state (robot_state_bridge)
 #   window 3 "health"  : /scan rate | /map rate | odom->base_link TF | rviz2 (Ctrl-C it to get a shell)
 #   window 4 "bag"     : only with --bag: rosbag record (Ctrl-C there to stop it)
+#   window "perception": only with --reporter: object/hazard/survivor detector + qr_scanner (perception.launch.py)
 #   window "reporter"  : only with --reporter: the mission reporter (lite3_mission_reporter), POSTing to the chosen server URL
 #
 # RViz (scripts/explorer_debug.rviz) shows the tiles like the kitchen explorer: blue = visited (travelled to),
@@ -20,15 +21,17 @@
 #                                    up to and walked through with forward commands, then exploring goes on
 #   ./explorer.sh --stairs           detect staircases (depth camera, low rate); one on a tile beside the current tile is climbed
 #                                    over in the robot's AI mode into the tile beyond, then walled off, then exploring goes on
+#   ./explorer.sh --no-opening-stairs  do not run the stair detector during the opening scan (by default it does, and a
+#                                    staircase beside the start tile is climbed right after the scan, even without --stairs)
 #   ./explorer.sh --roller           detect roller tiles (depth camera, confirmed by the 3D lidar; low rate): the lidar maps the
 #                                    roller as a wall across half the tile; one beside the current tile is squared up to and
 #                                    crossed in the h-step gait into the tile beyond, the roller tile is marked explored
 #   ./explorer.sh --roller-angle DEG  roller approach angle (default: mission.yaml modes.roller.approach_angle_deg, 20): the body stays
 #                                    this far off the roller plane (+ = left, - = right, 0 = square on) while walking the straight line
-#   ./explorer.sh --reporter URLA    also start the mission reporter, sending results to http://192.168.10.141:8001/task_report_A
+#   ./explorer.sh --reporter URLA    also start perception + QR detection and the mission reporter, sending results to http://192.168.10.141:8001/task_report_A
 #   ./explorer.sh --reporter URLB    ... to http://192.168.10.141:8001/task_report_B   (A / B and --reporter=URLA work too)
-#   ./explorer.sh --images           with --bag: also record the depth and (compressed) colour camera images, so the slats
-#                                    detection can be replayed offline (large)
+#   ./explorer.sh --images           with --bag: also record the depth and (compressed) colour camera images + camera_info, so the
+#                                    slats / curtain detection can be replayed offline (large; implied by --curtains)
 #   ./explorer.sh --bag [bagname]    also record a rosbag to bags/<bagname>_DD_MM_HHMMSS (default bagname: explorer)
 #   ./explorer.sh stop               Ctrl-C the launch, stop the bag, close the session
 #   Ctrl-b d / closing the session   same as stop; every process started from the session is killed
@@ -38,6 +41,7 @@
 #   ROS_SETUP, ATTACH (0 = detached), RVIZ_CONFIG (default scripts/explorer_debug.rviz),
 #   BAG_TOPICS  extra topics to record, space separated
 #   CLOUD_TOPIC lidar pointcloud recorded in every bag (default /livox/points)
+#   STATE_PORT  UDP port the motion host sends its 0x0901 robot state to (default 43897)
 set -euo pipefail
 
 SESSION="${SESSION:-explorer}"
@@ -61,7 +65,7 @@ LATCHED="--qos-durability transient_local --qos-reliability reliable"
 DEBUG_TOPICS="/tf /tf_static /map /scan /odom /cmd_vel /plan /local_plan /global_costmap/costmap /local_costmap/costmap /local_costmap/published_footprint /spin_crawl /spin_flat
 /exploration_complete /terrain_type /terrain_classifier/details /terrain_classifier/slats_detections /terrain_kind /mission_manager/terrain_markers $CLOUD_TOPIC /tile_map /tile_report /llm/last_result
 /mission_manager/mode /mission_manager/status /mission_manager/events /mission_manager/current_goal
-/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /stair_climber/state /stair_climber/debug /stair_climber/active /imu/data /leg_odom2 /odom_rebase"
+/mission_manager/next_target /gait_switcher/gait /mission_manager/route /curtain/points /curtain/markers /stairs/points /stairs/markers /stairs/enable /roller/points /roller/markers /roller_mode /step_up /ai_mode /simple_cmd /controller_monitor/mppi_omni /controller_monitor/active /virtual_walls /mission_manager/tile_markers /mission_manager/markers /robot_state /robot_state/text /imu/data /leg_odom2 /odom_rebase"
 
 BAG=0
 BAG_NAME=""
@@ -69,6 +73,7 @@ QUICKSCAN=0
 IMAGES=0
 CURTAINS=0
 STAIRS=0
+OPENING_STAIRS=1
 ROLLER=0
 ROLLER_ANGLE=
 REPORTER=
@@ -82,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         --images) IMAGES=1 ;;
         --curtains) CURTAINS=1 ;;
         --stairs) STAIRS=1 ;;
+        --no-opening-stairs) OPENING_STAIRS=0 ;;
         --roller|--rollers) ROLLER=1 ;;
         --roller-angle) ROLLER=1; ROLLER_ANGLE="${2:?--roller-angle needs a number of degrees}"; shift ;;
         --roller-angle=*) ROLLER=1; ROLLER_ANGLE="${1#--roller-angle=}" ;;
@@ -165,11 +171,15 @@ LAUNCH="ros2 launch lite3_explorer exploration.launch.py"
 [[ $QUICKSCAN == 1 ]] && LAUNCH+=" quickscan_on_edge:=true"
 [[ $CURTAINS == 1 ]] && LAUNCH+=" use_curtains:=true"
 [[ $STAIRS == 1 ]] && LAUNCH+=" use_stairs:=true"
+[[ $OPENING_STAIRS == 0 ]] && LAUNCH+=" stairs_on_opening:=false"
 [[ $ROLLER == 1 ]] && LAUNCH+=" use_rollers:=true"
 [[ -n $ROLLER_ANGLE ]] && LAUNCH+=" roller_angle_deg:=$ROLLER_ANGLE"
 [[ -n "$LAUNCH_ARGS" ]] && LAUNCH+=" $LAUNCH_ARGS"
 
-[[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS /camera/depth/image_raw /camera/color/image_raw/compressed"
+[[ $CURTAINS == 1 ]] && IMAGES=1     # the curtain detector (depth + colour) can only be replayed with the images
+# with --reporter the bag also records what the reporter and perception do (small topics, no images)
+[[ -n $REPORTER ]] && BAG_TOPICS="$BAG_TOPICS /mission/result /scene/result /perception/event /perception/qr_text /qr/visible /qr/detections"
+[[ $IMAGES == 1 ]] && BAG_TOPICS="$BAG_TOPICS /camera/depth/image_raw /camera/depth/camera_info /camera/color/image_raw/compressed /camera/color/camera_info"
 if [[ $BAG == 1 ]]; then
     BAG_NAME="${BAG_NAME:-explorer}_$(date +%d_%m_%H%M%S)"     # name_DD_MM_HHMMSS
     BAG_NAME="${BAG_NAME//\//_}"          # a name, not a path: it always lands under bags/
@@ -241,6 +251,13 @@ GAIT_PANE=$(tmux split-window -t "$SESSION:status.4" -v -l 30% -P -F '#{pane_id}
 run "$GAIT_PANE" "CURRENT GAIT (gait_switcher)" \
     "ros2 topic echo /gait_switcher/gait std_msgs/msg/String --field data $LATCHED"
 
+# robot state as the robot reports it (UDP 0x0901 -> /robot_state, /robot_state/text): robot_state_bridge logs one
+# line per change, e.g. "robot state (6,13,1) stepping, RUG H-step  battery 87%", "(16,0,1) AI basic gait".
+# the mission's stairs mode uses /robot_state to resend AI on / off until the robot reports it.
+STATE_PANE=$(tmux split-window -t "$GAIT_PANE" -v -l 50% -P -F '#{pane_id}')
+run "$STATE_PANE" "ROBOT STATE (basic,gait|policy,motion)" \
+    "ros2 run lite3_explorer robot_state_bridge --ros-args -p port:=${STATE_PORT:-43897} || echo 'robot_state_bridge not found: colcon build --packages-select lite3_explorer'"
+
 # controller in charge (Nav2 FollowPath RPP / MPPI, RecoveryMPPI, Spin, or the mission's own /cmd_vel): under the mode pane
 CTRL_PANE=$(tmux split-window -t "$SESSION:status.0" -v -l 60% -P -F '#{pane_id}')
 run "$CTRL_PANE" "CONTROLLER (who drives the dog now)" "ros2 run lite3_explorer controller_monitor"
@@ -268,10 +285,19 @@ fi
 
 # ---- window: mission reporter (optional) ----------------------------------
 if [[ -n $REPORTER ]]; then
+    # perception (object / hazard / survivor detector) + qr_scanner: the reporter's only source of results
+    tmux new-window -t "$SESSION:" -n perception
+    style_window "$SESSION:perception"
+    run "$SESSION:perception.0" "PERCEPTION + QR SCANNER" \
+        "ros2 launch lite3_perception perception.launch.py with_qr:=true"
     tmux new-window -t "$SESSION:" -n reporter
     style_window "$SESSION:reporter"
     run "$SESSION:reporter.0" "MISSION REPORTER (URL$REPORTER)" \
-        "ros2 launch lite3_mission_reporter mission_reporter.launch.py url:=$REPORTER"
+        "ros2 launch lite3_mission_reporter mission_reporter.launch.py server_url:=http://192.168.10.141:8001/task_report_$REPORTER"
+    # live view of every result sent (/mission/result, same JSON as the POST body)
+    RES_PANE=$(tmux split-window -t "$SESSION:reporter.0" -v -l 40% -P -F '#{pane_id}')
+    run "$RES_PANE" "MISSION RESULT (what is sent to server $REPORTER)" \
+        "ros2 topic echo /mission/result std_msgs/msg/String --field data $LATCHED"
 fi
 
 tmux select-window -t "$SESSION:status"

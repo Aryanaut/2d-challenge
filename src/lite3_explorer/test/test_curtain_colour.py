@@ -32,8 +32,8 @@ def scene(surface_rgb, floor_rgb=(130, 132, 120), wall_x=1.0, wall_from=0.0, noi
     return depth, np.clip(rgb, 0, 255).astype(np.uint8)
 
 
-def detect(depth, rgb):
-    return ccol.detect_curtain_colour(depth, rgb, K, K, IDENT, UP)
+def detect(depth, rgb, **params):
+    return ccol.detect_curtain_colour(depth, rgb, K, K, IDENT, UP, ccol.ColourParams(**params))
 
 
 def test_pale_smooth_curtain_is_found():
@@ -44,8 +44,29 @@ def test_pale_smooth_curtain_is_found():
     assert heights.min() > 0.12
 
 
-def test_neutral_white_curtain_close_up_is_found():
-    assert detect(*scene((123, 123, 127), wall_x=0.6, wall_from=0.17)) is not None
+# colours measured in bag fullrun_25_11_233315 (median RGB of the masked pixels / of the floor in the same frame)
+FLOOR_25NOV = (128, 130, 130)
+CURTAIN_25NOV = (129, 124, 114)
+
+
+def test_cream_curtain_close_up_is_found():
+    # 0.5 m away the camera sees only up to ~0.8 m above the floor: no extend band needed (the 25 Nov bag's curtain was
+    # 15-44 % of the image from 0.4-0.9 m away, extend 0)
+    d = detect(*scene(CURTAIN_25NOV, floor_rgb=FLOOR_25NOV, wall_x=0.5, wall_from=0.15))
+    assert d is not None and d.fraction > 0.3
+
+
+def test_grey_wall_as_bright_as_the_floor_is_not_a_curtain():
+    # bags fullrun_25_11_231517 / 232027 / 233315: under the 25 Nov lights the grey wall panels were 0.85-1.1x as
+    # bright as the floor, low saturation and smooth = curtain-like on every other test, at 20-55 % of the image. They
+    # are not warmer than the floor; the cream curtain is.
+    for wall, floor in (((98, 100, 101), (112, 112, 111)), ((89, 94, 96), (92, 92, 89))):
+        assert detect(*scene(wall, floor_rgb=floor)) is None
+        assert detect(*scene(wall, floor_rgb=floor), min_rel_warmth=None) is not None   # warmth off: found
+
+
+def test_neutral_white_curtain_close_up_is_found_without_the_warmth_test():
+    assert detect(*scene((123, 123, 127), wall_x=0.6, wall_from=0.17), min_rel_warmth=None) is not None
 
 
 def test_grey_wall_is_not_a_curtain():
@@ -74,3 +95,26 @@ def test_one_per_cell():
     pts = np.array([[0.01, 0.01], [0.02, 0.03], [0.30, 0.0]])
     out = ccol.one_per_cell(pts, 0.05)
     assert len(out) == 2
+
+
+def _cut_top(depth, top_m, wall_x=1.0):
+    """Nothing above top_m on the surface (open space far away): a panel that is only top_m tall."""
+    v = np.arange(480)[:, None] * np.ones((1, 640))
+    above = (v - K[3]) / K[1] * wall_x < CAM_H - top_m
+    depth = depth.copy()
+    depth[above] = 0.0
+    return depth
+
+
+def test_pale_wall_only_as_tall_as_the_arena_walls_is_not_a_curtain_with_the_extend_check():
+    # bag fullrun_25_11_215528: grey wall panels (0.5-0.6 m tall) looked as pale as the curtain under the arena
+    # lights. The curtain hangs higher: the same surface must go on up into 0.6-1.2 m above the floor.
+    # (min_extend_m2 is off by default now: the warmth test rejects the grey walls)
+    ext = {'min_extend_m2': 0.06}
+    depth, rgb = scene((146, 137, 114), wall_from=0.15)
+    assert detect(_cut_top(depth, 0.55), rgb, **ext) is None
+    d = detect(_cut_top(depth, 1.20), rgb, **ext)
+    assert d is not None and d.extend_m2 >= 0.06
+    # a taller wall FURTHER BACK does not count for the low panel in front of it
+    low = _cut_top(depth, 0.55)
+    assert detect(np.where(low == 0.0, 2.5, low).astype(np.float32), rgb, **ext) is None

@@ -1,0 +1,424 @@
+diff -ruN orig_lite3_explorer/config/curtain.yaml lite3_explorer/config/curtain.yaml
+--- a/src/lite3_explorer/config/curtain.yaml	2026-11-24 21:59:19
++++ b/src/lite3_explorer/config/curtain.yaml	2026-11-24 22:01:44
+@@ -28,3 +28,15 @@
+     lidar_high_min_m: 0.30      # returns from this height are "wall height"
+     lidar_min_low: 20           # floor-level returns a cell needs (summed over scans)
+     lidar_min_high_behind: 10   # wall-height returns needed beyond the cell, along the robot's view
++    # Front colour camera + depth (curtain_colour.py): a pale, smooth, upright surface 0.12-1.2 m above the floor and at
++    # least 0.8x as bright as the floor in the same image = the fabric curtain. Off by default; tuned on 24 Nov snapshots.
++    use_colour: false
++    colour_topic: /camera/color/image_raw/compressed   # or /camera/color/image_raw (rgb8 / bgr8)
++    colour_info_topic: /camera/color/camera_info
++    colour_max_age_s: 0.5         # ignore colour images older than this
++    colour_min_height_m: 0.12     # above the floor (the wooden ledge under the curtain is ~0.09 m)
++    colour_max_texture: 0.012     # curtain ~0.005, OSB wood 0.016-0.033
++    colour_max_saturation: 0.30   # curtain 0.04-0.22, OSB 0.25-0.37
++    colour_min_rel_brightness: 0.80   # vs the floor; grey wall ~0.6, curtain ~1.0
++    colour_min_area_m2: 0.15      # curtain area needed (far away)...
++    colour_min_fraction: 0.15     # ...or this share of the image (close up)
+diff -ruN orig_lite3_explorer/lite3_explorer/curtain_colour.py lite3_explorer/lite3_explorer/curtain_colour.py
+--- a/src/lite3_explorer/lite3_explorer/curtain_colour.py	1970-01-01 07:30:00
++++ b/src/lite3_explorer/lite3_explorer/curtain_colour.py	2026-11-24 22:00:20
+@@ -0,0 +1,176 @@
++"""Curtain check from the front colour camera + depth camera (no ROS, numpy only).
++
++The arena curtain is a pale (white / cream) fabric hanging above a low wooden ledge. The lidar and the depth hem test
++cannot tell it from a wall when there is no gap under it. The camera can, with all of these together:
++
++    upright    the depth surface stands within ~20 deg of vertical (not the floor, not the top of a platform)
++    high       0.12-1.2 m above the floor (not the ledge / the floor / skirting rails)
++    smooth     almost no texture in the colour image (OSB wood grain is 3-6x rougher)
++    pale       low colour saturation (OSB is yellow, S 0.25-0.37; the curtain S 0.04-0.22)
++    bright     at least 0.8x as bright as the floor IN THE SAME IMAGE (the grey arena walls are ~0.6x; the camera's
++               auto exposure changes absolute brightness from frame to frame, the ratio stays)
++
++and enough of such pixels: min_area_m2 square metres (far away) or min_fraction of the image (close up).
++Colour alone is NOT enough: the floor and the white roller have the same colour as the curtain.
++
++Measured on 5 snapshots (24 Nov, tools/curtain_snapshot.py), area / share of the image:
++    curtain 0.6 m  0.08 m^2 / 32 %      curtain 1.5 m  0.25 m^2 / 7 %
++    floor          0       /  0 %      grey wall      0       / 0 %      OSB board  0.01 m^2 / 0.7 %
++
++The floor is found in the depth image itself (lowest flat surface), so the camera height / small body tilts do not need
++to be known; `fallback_camera_height_m` is used only when no floor is in view.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Optional, Sequence, Tuple
++
++import numpy as np
++
++
++@dataclass
++class ColourParams:
++    stride: int = 4                     # use every n-th depth pixel
++    min_range_m: float = 0.25
++    max_range_m: float = 2.5
++    upright_max: float = 0.35           # |normal . up| below this = upright surface (within ~20 deg of vertical)
++    flat_min: float = 0.80              # |normal . up| above this = flat, floor-like surface (within ~37 deg)
++    min_height_m: float = 0.12          # above the floor (the wooden ledge under the curtain is ~0.09 m)
++    max_height_m: float = 1.20
++    max_texture: float = 0.012          # local brightness std-dev (0..1); curtain ~0.005, OSB 0.016-0.033
++    max_saturation: float = 0.30        # curtain 0.04-0.22, OSB 0.25-0.37
++    min_rel_brightness: float = 0.80    # vs the floor's median brightness in the same image; grey wall ~0.6
++    floor_tol_m: float = 0.04           # floor pixels used for the brightness reference
++    default_floor_v: float = 0.50       # brightness reference when no floor is in view
++    fallback_camera_height_m: float = 0.46   # standing Lite3 (base 0.39 m + camera 0.074 m); only if no floor in view
++    texture_win: int = 9                # colour pixels, box size for the texture measure
++    min_area_m2: float = 0.15           # curtain-like area needed (stray patches on the wall / wood were < 0.02)...
++    min_fraction: float = 0.15          # ...OR this share of the image (close up only a strip of curtain is in view:
++                                        #    0.6 m -> 0.08 m^2 but 32 %; stray patches were < 1 %)
++
++
++@dataclass
++class ColourDetection:
++    points: np.ndarray                  # Nx3 curtain points in the DEPTH OPTICAL frame (x right, y down, z forward)
++    area_m2: float                      # curtain-like area in view
++    fraction: float                     # share of the valid depth pixels that look like curtain
++    floor_v: float                      # brightness reference used (median floor brightness)
++    ranges: np.ndarray                  # depth of each point, metres
++
++
++def _box(img: np.ndarray, k: int) -> np.ndarray:
++    """k x k box mean (same size, edges padded), numpy only."""
++    r = k // 2
++    p = np.pad(img, ((r + 1, r), (r + 1, r)), mode='edge').astype(np.float64)
++    c = p.cumsum(0).cumsum(1)
++    s = c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
++    return (s / (k * k))[:img.shape[0], :img.shape[1]]
++
++
++def colour_features(rgb: np.ndarray, win: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """Brightness V (0..1), saturation S (0..1) and texture (local std-dev of grey, 0..1) of an HxWx3 RGB uint8 image."""
++    f = np.asarray(rgb, np.float32) / 255.0
++    mx, mn = f.max(-1), f.min(-1)
++    v = mx
++    s = np.where(mx > 1e-6, (mx - mn) / np.maximum(mx, 1e-6), 0.0)
++    g = 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
++    m = _box(g, win)
++    tex = np.sqrt(np.maximum(_box(g * g, win) - m * m, 0.0))
++    return v, s, tex
++
++
++def colour_mask(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequence[float], k_colour: Sequence[float],
++                depth_to_colour: Tuple[np.ndarray, Sequence[float]], up: Sequence[float],
++                p: ColourParams = ColourParams(), features=None) -> dict:
++    """Per-pixel curtain test on the strided depth grid. Returns a dict with 'mask', 'points' (HxWx3, depth optical
++    frame), 'valid', 'area_m2', 'fraction', 'floor_v', 'uc', 'vc' (colour pixel of each cell).
++
++    k_depth / k_colour: fx, fy, cx, cy. depth_to_colour: (R, t) taking depth-optical points into the colour optical
++    frame. up: unit 'up' direction expressed in the depth optical frame (from TF; body tilt of a few degrees is fine)."""
++    s = max(1, int(p.stride))
++    d = np.nan_to_num(np.asarray(depth_m, np.float32), nan=0.0)[::s, ::s]
++    h, w = d.shape
++    fx, fy, cx, cy = k_depth
++    vv, uu = np.mgrid[0:h, 0:w]
++    uu, vv = uu * s, vv * s
++    P = np.stack([(uu - cx) * d / fx, (vv - cy) * d / fy, d], -1)
++    valid = (d > p.min_range_m) & (d < p.max_range_m)
++
++    # surface normals from neighbours two cells apart; invalid across depth jumps
++    du = np.zeros_like(P)
++    dv = np.zeros_like(P)
++    du[:, 1:-1] = P[:, 2:] - P[:, :-2]
++    dv[1:-1] = P[2:] - P[:-2]
++    nb = np.zeros_like(valid)
++    nb[1:-1, 1:-1] = (valid[1:-1, 2:] & valid[1:-1, :-2] & valid[2:, 1:-1] & valid[:-2, 1:-1])
++    jump = (np.abs(du[..., 2]) > 0.15 * d + 0.02) | (np.abs(dv[..., 2]) > 0.15 * d + 0.02)
++    n = np.cross(du, dv)
++    n /= np.linalg.norm(n, axis=-1, keepdims=True) + 1e-9
++    good_n = valid & nb & ~jump
++
++    up = np.asarray(up, float)
++    up = up / (np.linalg.norm(up) or 1.0)
++    cosu = np.abs(n @ up)
++    flat = good_n & (cosu > p.flat_min)
++    # refine 'up' with the flat surfaces (handles a tilted body), then find the floor = lowest flat surface
++    if flat.sum() > 50:
++        nf = n[flat]
++        nf = nf * np.sign(nf @ up)[:, None]
++        up2 = nf.mean(0)
++        up = up2 / (np.linalg.norm(up2) or 1.0)
++        cosu = np.abs(n @ up)
++        flat = good_n & (cosu > p.flat_min)
++    height = P @ up                                      # relative to the camera, + = up
++    if flat.sum() > 50:
++        floor = float(np.percentile(height[flat], 10))
++    else:
++        floor = -p.fallback_camera_height_m
++    hgt = height - floor
++
++    # colour of each depth cell
++    R, t = depth_to_colour
++    C = P @ np.asarray(R, float).T + np.asarray(t, float)
++    fxc, fyc, cxc, cyc = k_colour
++    zc = np.maximum(C[..., 2], 1e-3)
++    uc = np.round(fxc * C[..., 0] / zc + cxc).astype(int)
++    vc = np.round(fyc * C[..., 1] / zc + cyc).astype(int)
++    H, W = rgb.shape[:2]
++    inimg = (uc >= 0) & (uc < W) & (vc >= 0) & (vc < H) & (C[..., 2] > 0.05)
++    ucc, vcc = np.clip(uc, 0, W - 1), np.clip(vc, 0, H - 1)
++    V, S, T = features if features is not None else colour_features(rgb, p.texture_win)
++    V, S, T = V[vcc, ucc], S[vcc, ucc], T[vcc, ucc]
++
++    floor_px = flat & inimg & (np.abs(hgt) < p.floor_tol_m)
++    floor_v = float(np.median(V[floor_px])) if floor_px.sum() > 50 else p.default_floor_v
++
++    mask = (good_n & inimg & (cosu < p.upright_max) & (hgt > p.min_height_m) & (hgt < p.max_height_m)
++            & (T < p.max_texture) & (S < p.max_saturation) & (V > p.min_rel_brightness * floor_v))
++    cell_area = (s * d / fx) * (s * d / fy)              # m^2 one cell covers, facing the camera
++    area = float(cell_area[mask].sum())
++    nvalid = int(valid.sum())
++    return {'mask': mask, 'points': P, 'valid': valid, 'area_m2': area,
++            'fraction': float(mask.sum()) / max(1, nvalid), 'floor_v': floor_v, 'uc': uc, 'vc': vc, 'depth': d}
++
++
++def detect_curtain_colour(depth_m: np.ndarray, rgb: np.ndarray, k_depth: Sequence[float], k_colour: Sequence[float],
++                          depth_to_colour: Tuple[np.ndarray, Sequence[float]], up: Sequence[float],
++                          p: ColourParams = ColourParams()) -> Optional[ColourDetection]:
++    """Curtain seen by the colour + depth cameras, or None (see the module doc)."""
++    r = colour_mask(depth_m, rgb, k_depth, k_colour, depth_to_colour, up, p)
++    if r['area_m2'] < p.min_area_m2 and r['fraction'] < p.min_fraction:
++        return None
++    m = r['mask']
++    return ColourDetection(points=r['points'][m], area_m2=r['area_m2'], fraction=r['fraction'],
++                           floor_v=r['floor_v'], ranges=r['depth'][m])
++
++
++def one_per_cell(points_xy: np.ndarray, cell_m: float) -> np.ndarray:
++    """One point (the mean) per cell_m grid cell, so one image counts once per spot in a CurtainMap."""
++    p = np.asarray(points_xy, float).reshape(-1, 2)
++    if len(p) == 0:
++        return p
++    keys, inv = np.unique(np.floor(p / cell_m).astype(np.int64), axis=0, return_inverse=True)
++    inv = inv.reshape(-1)
++    out = np.zeros((len(keys), 2))
++    np.add.at(out, inv, p)
++    return out / np.bincount(inv)[:, None]
+diff -ruN orig_lite3_explorer/lite3_explorer/curtain_detector.py lite3_explorer/lite3_explorer/curtain_detector.py
+--- a/src/lite3_explorer/lite3_explorer/curtain_detector.py	2026-11-24 21:59:19
++++ b/src/lite3_explorer/lite3_explorer/curtain_detector.py	2026-11-24 22:00:46
+@@ -4,6 +4,8 @@
+   sub  /camera/depth/camera_info    intrinsics (else depth_hfov_deg is used)
+   sub  <cloud_topic>                3D lidar pointcloud (default /livox/points; use_lidar): a curtain edge returns only floor-level
+                                     points while a standard wall (0.5-0.6 m) returns them up to its top (curtain_core.LidarCurtainMap)
++  sub  <colour_topic>               front colour camera (use_colour, default off): a pale, smooth, upright surface above the floor,
++                                    as bright as the floor = the fabric curtain (curtain_colour.py); needs the depth image too
+   pub  /curtain/points   std_msgs/String   JSON {"points": [[x, y, ux, uy], ...]} in the map frame (latched): confirmed
+                                            curtain spots and the unit direction the camera was looking at each
+   pub  /curtain/markers  MarkerArray       the remembered curtain, for RViz
+@@ -23,11 +25,12 @@
+ from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+ from rclpy.time import Time
+ import sensor_msgs_py.point_cloud2 as pc2
+-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
++from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
+ from std_msgs.msg import String
+ from tf2_ros import Buffer, TransformListener
+ from visualization_msgs.msg import Marker, MarkerArray
+ 
++from lite3_explorer import curtain_colour as ccol
+ from lite3_explorer import curtain_core as cc
+ 
+ 
+@@ -65,6 +68,24 @@
+             cell_m=float(p('lidar_cell_m', 0.05).value), low_max_m=float(p('lidar_low_max_m', 0.20).value),
+             high_min_m=float(p('lidar_high_min_m', 0.30).value), min_low=int(p('lidar_min_low', 20).value),
+             min_high_behind=int(p('lidar_min_high_behind', 10).value), floor_z=self.floor_z)
++        # colour camera check (curtain_colour.py): off by default
++        self.use_colour = bool(p('use_colour', False).value)
++        self.colour_topic = p('colour_topic', '/camera/color/image_raw/compressed').value
++        self.colour_info_topic = p('colour_info_topic', '/camera/color/camera_info').value
++        self.colour_max_age = float(p('colour_max_age_s', 0.5).value)
++        d = ccol.ColourParams()
++        self.colour_params = ccol.ColourParams(
++            stride=int(p('colour_stride', d.stride).value),
++            max_range_m=float(p('colour_max_range_m', d.max_range_m).value),
++            min_height_m=float(p('colour_min_height_m', d.min_height_m).value),
++            max_texture=float(p('colour_max_texture', d.max_texture).value),
++            max_saturation=float(p('colour_max_saturation', d.max_saturation).value),
++            min_rel_brightness=float(p('colour_min_rel_brightness', d.min_rel_brightness).value),
++            min_area_m2=float(p('colour_min_area_m2', d.min_area_m2).value),
++            min_fraction=float(p('colour_min_fraction', d.min_fraction).value))
++        self.colour_cell_m = float(p('cell_m', 0.05).value)
++        self.colour_msg = None
++        self.colour_k = None
+         self.tf = Buffer()
+         self.tf_listener = TransformListener(self.tf, self)
+         self.intrinsics = None
+@@ -75,15 +96,75 @@
+         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+         self.points_pub = self.create_publisher(String, '/curtain/points', latched)
+         self.marker_pub = self.create_publisher(MarkerArray, '/curtain/markers', latched)
++        if self.use_colour:
++            ctype = CompressedImage if self.colour_topic.endswith('/compressed') else Image
++            self.create_subscription(ctype, self.colour_topic, self._on_colour, qos_profile_sensor_data)
++            self.create_subscription(CameraInfo, self.colour_info_topic, self._on_colour_info, 1)
+         if self.use_lidar:
+             self.create_subscription(PointCloud2, self.cloud_topic, self._on_cloud, qos_profile_sensor_data)
+         self.create_timer(1.0, self._publish)
+-        self.get_logger().info(f'curtain detector on {self.depth_topic} at {self.rate_hz:g} Hz')
++        self.get_logger().info(f'curtain detector on {self.depth_topic} at {self.rate_hz:g} Hz'
++                               + (f', colour check on {self.colour_topic}' if self.use_colour else ''))
+ 
+     def _on_info(self, msg):
+         if msg.k[0] > 0:
+             self.intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+ 
++    def _on_colour(self, msg):
++        self.colour_msg = msg                                  # decoded only when a depth frame is processed
++
++    def _on_colour_info(self, msg):
++        if msg.k[0] > 0:
++            self.colour_k = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
++
++    def _colour_rgb(self):
++        """Latest colour image as HxWx3 RGB uint8, or None (missing / too old / unknown encoding)."""
++        m = self.colour_msg
++        if m is None:
++            return None
++        age = (self.get_clock().now() - Time.from_msg(m.header.stamp)).nanoseconds * 1e-9
++        if age > self.colour_max_age:
++            return None
++        if isinstance(m, CompressedImage):
++            import cv2                                         # only needed for the compressed topic
++            bgr = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_COLOR)
++            return None if bgr is None else bgr[..., ::-1]
++        img = np.frombuffer(m.data, np.uint8).reshape(m.height, m.step)[:, :m.width * 3].reshape(m.height, m.width, 3)
++        if m.encoding == 'rgb8':
++            return img
++        if m.encoding == 'bgr8':
++            return img[..., ::-1]
++        return None
++
++    def _colour_check(self, depth, msg, k):
++        """Colour + depth curtain test (curtain_colour.py); adds the curtain to self.curtain."""
++        rgb = self._colour_rgb()
++        if rgb is None or self.colour_k is None:
++            self.get_logger().warn('colour check: no recent colour image / camera_info', throttle_duration_sec=10.0)
++            return
++        try:
++            tc = self.tf.lookup_transform(self.colour_msg.header.frame_id, msg.header.frame_id, Time(),
++                                          Duration(seconds=0.2))
++            tm = self.tf.lookup_transform(self.global_frame, msg.header.frame_id, Time(), Duration(seconds=0.2))
++        except Exception as e:  # noqa: BLE001 - TF not ready yet
++            self.get_logger().warn(f'colour check: no TF: {e}', throttle_duration_sec=5.0)
++            return
++        r_dc = quat_to_matrix(tc.transform.rotation)
++        t_dc = (tc.transform.translation.x, tc.transform.translation.y, tc.transform.translation.z)
++        rot = quat_to_matrix(tm.transform.rotation)
++        tr = tm.transform.translation
++        up = rot.T @ np.array([0.0, 0.0, 1.0])                 # map 'up' in the depth optical frame
++        det = ccol.detect_curtain_colour(depth, rgb, k, self.colour_k, (r_dc, t_dc), up, self.colour_params)
++        if det is None:
++            return
++        pts = det.points @ rot.T + np.array([tr.x, tr.y, tr.z])
++        pts = ccol.one_per_cell(pts[:, :2], self.colour_cell_m)   # one hit per spot per image
++        if self.curtain.add(pts, (tr.x, tr.y)):
++            self.version += 1
++            self.get_logger().info(f'curtain seen by the colour camera: {det.area_m2:.2f} m2 '
++                                   f'({100 * det.fraction:.0f} % of the image), {float(np.median(det.ranges)):.2f} m '
++                                   f'ahead; {len(self.curtain)} spots')
++
+     def _on_depth(self, msg):
+         now = self.get_clock().now().nanoseconds * 1e-9
+         if now - self.last < 1.0 / self.rate_hz:
+@@ -95,12 +176,14 @@
+             depth = np.frombuffer(msg.data, np.float32).reshape(msg.height, msg.width)
+         else:
+             return
++        fx = fy = (msg.width / 2) / math.tan(self.hfov / 2)
++        k = self.intrinsics or (fx, fy, msg.width / 2, msg.height / 2)
++        if self.use_colour:
++            self._colour_check(depth, msg, k)
+         det = cc.detect_curtain(depth, self.params)
+         top = cc.detect_wall_top(depth, self.params) if self.top_height_m > 0 else None
+         if det is None and top is None:
+             return
+-        fx = fy = (msg.width / 2) / math.tan(self.hfov / 2)
+-        k = self.intrinsics or (fx, fy, msg.width / 2, msg.height / 2)
+         try:
+             t = self.tf.lookup_transform(self.global_frame, msg.header.frame_id, Time(), Duration(seconds=0.2))
+         except Exception as e:  # noqa: BLE001 - TF not ready yet
+diff -ruN orig_lite3_explorer/test/test_curtain_colour.py lite3_explorer/test/test_curtain_colour.py
+--- a/src/lite3_explorer/test/test_curtain_colour.py	1970-01-01 07:30:00
++++ b/src/lite3_explorer/test/test_curtain_colour.py	2026-11-24 22:01:08
+@@ -0,0 +1,76 @@
++"""Colour + depth curtain check (curtain_colour.py) on synthetic camera views: camera 0.46 m above the floor, level,
++looking at an upright surface 1 m ahead. Optical frame: x right, y down, z forward."""
++import numpy as np
++
++from lite3_explorer import curtain_colour as ccol
++
++K = (372.0, 372.0, 320.0, 240.0)
++UP = (0.0, -1.0, 0.0)                     # 'up' in the optical frame (y points down)
++IDENT = (np.eye(3), (0.0, 0.0, 0.0))      # colour camera = depth camera
++CAM_H = 0.46
++
++
++def scene(surface_rgb, floor_rgb=(130, 132, 120), wall_x=1.0, wall_from=0.0, noise=0.0, no_wall=False, seed=0):
++    """Depth (m) and RGB image of a floor + an upright surface wall_x ahead that starts wall_from above the floor."""
++    rng = np.random.default_rng(seed)
++    v, u = np.mgrid[0:480, 0:640].astype(float)
++    ry = (v - K[3]) / K[1]                  # ray direction (x, y, 1)
++    with np.errstate(divide='ignore'):
++        t_floor = np.where(ry > 1e-6, CAM_H / ry, np.inf)
++    t_wall = np.full_like(ry, np.inf) if no_wall else np.full_like(ry, wall_x)
++    y_at_wall = ry * wall_x                 # + = below the camera
++    t_wall[y_at_wall > CAM_H - wall_from] = np.inf    # below the surface's lower edge: see past it
++    t = np.minimum(t_floor, t_wall)
++    depth = np.where(np.isfinite(t) & (t < 4.0), t, 0.0).astype(np.float32)
++    rgb = np.zeros((480, 640, 3), float)
++    on_wall = t_wall <= t_floor
++    rgb[on_wall] = surface_rgb
++    rgb[~on_wall] = floor_rgb
++    rgb += rng.normal(0, 1.0, rgb.shape)    # a little sensor noise everywhere
++    if noise:
++        rgb[on_wall] += rng.normal(0, noise, (on_wall.sum(), 1))   # texture (wood grain)
++    return depth, np.clip(rgb, 0, 255).astype(np.uint8)
++
++
++def detect(depth, rgb):
++    return ccol.detect_curtain_colour(depth, rgb, K, K, IDENT, UP)
++
++
++def test_pale_smooth_curtain_is_found():
++    d = detect(*scene((146, 137, 114), wall_from=0.15))           # cream, hangs from 0.15 m
++    assert d is not None
++    assert abs(float(np.median(d.ranges)) - 1.0) < 0.05
++    heights = CAM_H - d.points[:, 1]
++    assert heights.min() > 0.12
++
++
++def test_neutral_white_curtain_close_up_is_found():
++    assert detect(*scene((123, 123, 127), wall_x=0.6, wall_from=0.17)) is not None
++
++
++def test_grey_wall_is_not_a_curtain():
++    assert detect(*scene((75, 79, 80))) is None                   # arena wall panel, darker than the floor
++
++
++def test_textured_wood_is_not_a_curtain():
++    assert detect(*scene((129, 116, 81), noise=12.0)) is None     # OSB: yellow and grainy
++
++
++def test_floor_only_is_not_a_curtain():
++    assert detect(*scene((0, 0, 0), no_wall=True)) is None
++
++
++def test_low_white_object_is_not_a_curtain():
++    # pale surface only up to 0.10 m (e.g. a ledge / skirting): wall_from at floor, but cut it to 0.10 m tall
++    depth, rgb = scene((143, 145, 133))
++    v = np.arange(480)[:, None] * np.ones((1, 640))
++    y_at_wall = (v - K[3]) / K[1] * 1.0
++    above = y_at_wall < CAM_H - 0.10                               # rows looking above 0.10 m on the surface
++    depth[above] = 0.0                                             # nothing there (open space far away)
++    assert detect(depth, rgb) is None
++
++
++def test_one_per_cell():
++    pts = np.array([[0.01, 0.01], [0.02, 0.03], [0.30, 0.0]])
++    out = ccol.one_per_cell(pts, 0.05)
++    assert len(out) == 2

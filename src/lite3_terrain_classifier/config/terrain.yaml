@@ -25,7 +25,7 @@ terrain_classifier:
     # /terrain_kind then carries elevation_m (+ higher / - lower than the start floor), elevation_class and slope_deg.
     # Needs kinds.enabled (default) and the odom -> base_link TF. ~/recalibrate_ground (Trigger) takes a new reference.
     elevation:
-      enabled: false
+      enabled: true
       frame: odom                 # odom: absolute (odom z must be real) | gravity: rotation only, for planar odometry
       calibrate_s: 2.0            # collect this long at the start; the reference is refused (and retried) if the floor is not flat
       min_points: 300

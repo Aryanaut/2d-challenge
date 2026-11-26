@@ -40,6 +40,14 @@ Visualization Manager:
       Enabled: true
       Topic: {Value: /mission_manager/tile_markers, Depth: 5, Durability Policy: Transient Local, Reliability Policy: Reliable}
     - Class: rviz_default_plugins/MarkerArray
+      Name: Curtain spots (curtain detector, confirmed)
+      Enabled: true
+      Topic: {Value: /curtain/markers, Depth: 5, Durability Policy: Transient Local, Reliability Policy: Reliable}
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Curtain wall (yellow, one tile edge, kept for the whole run)
+      Enabled: true
+      Topic: {Value: /mission_manager/curtain_markers, Depth: 5, Durability Policy: Transient Local, Reliability Policy: Reliable}
+    - Class: rviz_default_plugins/MarkerArray
       Name: Tile descriptions
       Enabled: true
       Topic: {Value: /mission_manager/markers, Depth: 5, Durability Policy: Transient Local, Reliability Policy: Reliable}

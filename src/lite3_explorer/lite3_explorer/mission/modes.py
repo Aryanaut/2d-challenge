@@ -15,6 +15,7 @@
   backtracking  no exploration target left but tiles are still unexplored: drive back to the last split tile (a tile
              that had two or more tiles to travel to), then on to its option not travelled to yet; then exploring again.
   recovery   the robot is stuck (or no target has a Nav2 path): drive to the nearest tile centre, then rescan.
+  ending     the end condition ending_tile found the ending tile: drive to its centre, then complete.
   complete   the end condition is met. /exploration_complete is published.
 
 Add a mode type with @register_mode('name') on a Mode subclass and list an instance in mission.modes.
@@ -24,6 +25,8 @@ from __future__ import annotations
 import math
 from typing import Dict, Optional, Type
 
+import numpy as np
+
 from lite3_explorer import approach as A
 from lite3_explorer import costmap_escape as CE
 from lite3_explorer import curtain_core as CC
@@ -32,6 +35,7 @@ from lite3_explorer import stairs_core as SC
 from lite3_explorer import tiles as T
 from lite3_explorer.mission.core import Mode
 from lite3_explorer.mission.traversal import FAILED, SUCCEEDED, TraversalResult
+from lite3_explorer.robot_state import BASIC_AI, BASIC_STANDING
 
 MODE_TYPES: Dict[str, Type[Mode]] = {}
 
@@ -84,16 +88,30 @@ class ScanningMode(Mode):
         self.start_yaw, self.returned, self.setpoints = None, False, False
         self.spun, self.early = False, False
         self.turned, self._last_yaw = 0.0, None
+        self.back_tries = 0
 
     def targets(self):
-        return [self.cfg.get('next_mode', 'exploring')]
+        out = [self.cfg.get('next_mode', 'exploring')]
+        if self.cfg.get('opening_stairs', False):
+            out.append(self.cfg.get('stairs_mode', 'stairs'))
+        return out
+
+    def _stair_detection(self, on):
+        f = getattr(self.ctx, 'stair_detection', None)
+        if f is not None:
+            f(on)
 
     def enter(self, reason, opening=False, **kw):
         self.opening = bool(opening) or not self.ctx.tiles.ready
+        self.after_stairs = kw.get('after_stairs')       # tile the stairs mode put the robot on: checked against the scan
+        self.slam_waited = False
+        if self.opening and self.cfg.get('opening_stairs', False):
+            self._stair_detection(True)          # stair detector on for the opening scan (off again in exit)
         self.retries, self.queue, self.pending_deg = 0, [], None
         self.start_yaw, self.returned, self.setpoints = None, False, False
         self.spun, self.early = False, False
         self.turned, self._last_yaw = 0.0, None
+        self.back_tries = 0
         self.ctx.set_target(None, None, None)
         if not self.ctx.tiles.ready:
             self.set_phase('wait_map')
@@ -108,7 +126,7 @@ class ScanningMode(Mode):
             self.set_phase('done')
             return
         if self.opening:
-            self.queue = [float(v) for v in cfg.get('opening_setpoints_deg', [0.0, 80.0, -160.0, -80.0])]
+            self.queue = [float(v) for v in cfg.get('opening_setpoints_deg', [0.0, 80.0, -80.0])]
             self.setpoints = True            # queue = yaw setpoints relative to the starting heading
             if not self.queue:
                 self.set_phase('done')
@@ -186,10 +204,17 @@ class ScanningMode(Mode):
                 # relative to the starting heading, so it does not matter where the robot stopped).
                 self.retries += 1
                 self.ctx.log('warn', f'Opening spin did not finish ({status or "timeout"}); retry {self.retries}.')
-                self.queue = [float(v) for v in cfg.get('opening_setpoints_deg', [0.0, 80.0, -160.0, -80.0])]
+                self.queue = [float(v) for v in cfg.get('opening_setpoints_deg', [0.0, 80.0, -80.0])]
                 self.returned = False
                 self.set_phase('settle')
                 return None
+            if status != SUCCEEDED and self.opening and self.back_tries < 2:
+                # Sweep retries used up (e.g. Nav2 'Collision Ahead' in a tight start tile): still face the starting
+                # heading before exploring. First the short way, then the long way round (the other side may be clear).
+                self.back_tries += 1
+                self.returned = False
+                if self._turn_back(other_way=self.back_tries > 1):
+                    return None
             if status != SUCCEEDED:
                 self.ctx.log('warn', 'The scan turn did not finish; continuing with the map so far.')
             self.set_phase('done')
@@ -197,18 +222,91 @@ class ScanningMode(Mode):
             self.ctx.gait_hold(None)
             self.set_phase('wait_map')                    # spin over and heading restored: now place the tile grid
             return None
+        if (self.phase == 'done' and self.opening and self.cfg.get('opening_stairs', False)
+                and float(cfg.get('opening_stairs_wait_s', 2.0)) > 0.0):
+            self.set_phase('stairs_wait')                 # stand still: the stair detector confirms what it sees now
+            return None
+        if self.phase == 'stairs_wait':
+            if self.in_phase_s() < float(cfg.get('opening_stairs_wait_s', 2.0)):
+                return None
+            self.set_phase('done')
+        if (self.phase == 'done' and getattr(self, 'after_stairs', None) is not None and not self.slam_waited
+                and float(cfg.get('relocate_wait_s', 3.0)) > 0.0):
+            # After the stairs the pose is the odom rebase until slam_toolbox has matched a scan taken AFTER it: the scan
+            # reaches SLAM ~1.1 s late, then has to be matched. Bag fullrun_25_11_183742: the scan turn was skipped (no
+            # room) and the check ran 0.17 s after the rebase, so it only read the rebase back ('as assumed').
+            self.slam_waited = True
+            self.set_phase('slam_wait')
+            return None
+        if self.phase == 'slam_wait':
+            if self.in_phase_s() < float(cfg.get('relocate_wait_s', 3.0)):
+                return None
+            self.set_phase('done')
         if self.phase == 'done':
             self.ctx.gait_hold(None)
+            self._relocate_after_stairs()
             self.ctx.opening_done = True      # virtual walls and tile calculation start only now
             if self.ctx.tiles.current is not None:
                 self.machine.scanned_tile = tuple(self.ctx.tiles.current)
             self.ctx.tiles.invalidate()
             self.ctx.tiles.update()
-            return self.go(cfg.get('next_mode', 'exploring'), 'scan finished')
+            hop = self._opening_stairs() if self.opening else None
+            return hop or self.go(cfg.get('next_mode', 'exploring'), 'scan finished')
         return None
 
-    def _turn_back(self):
-        """Opening scan: turn back to the heading the robot started with before exploring. True if a turn started."""
+    def _relocate_after_stairs(self):
+        """After a stairs climb the tile the robot was put on came from dead reckoning (odom rebased in AI mode). The scan
+        has let SLAM place the robot in the map: if its pose is in another tile, that tile is where it is."""
+        assumed, self.after_stairs = getattr(self, 'after_stairs', None), None
+        tiles = self.ctx.tiles
+        pose = self.ctx.pose()
+        if assumed is None or pose is None or tiles.grid is None:
+            return
+        actual = tiles.relocate(assumed, pose, 'stairs: placed by the scan')
+        if actual is None:
+            return
+        gx, gy = tiles.grid.center(tuple(assumed))
+        self.ctx.event('stairs_relocated', assumed=T.tile_label(tuple(assumed)), actual=T.tile_label(actual),
+                       pose=[round(float(v), 3) for v in pose[:3]],
+                       offset_m=round(math.hypot(pose[0] - gx, pose[1] - gy), 3))
+        if tuple(actual) == tuple(assumed):
+            self.ctx.log('info', f'Scan after the stairs: SLAM puts the robot on tile {T.tile_label(actual)}, as assumed.')
+        else:
+            self.ctx.log('warn', f'Scan after the stairs: SLAM puts the robot on tile {T.tile_label(actual)}, not '
+                                 f'{T.tile_label(tuple(assumed))} (dead reckoning was off); the tile is corrected.')
+
+    def _opening_stairs(self):
+        """opening_stairs: the stair detector ran during the opening scan. A staircase tile sharing a side with the start
+        tile (steps going up away from it, stairs_core.stair_crossing) -> straight into the stairs mode. A staircase seen
+        further away is only logged (the stairs mode starts from the tile in front of it; exploring climbs it when it gets
+        there with use_stairs)."""
+        cfg, tiles = self.cfg, self.ctx.tiles
+        mode = cfg.get('stairs_mode', 'stairs')
+        if not cfg.get('opening_stairs', False) or mode not in self.machine.modes:
+            return None
+        if not tiles.stairs or tiles.grid is None or tiles.current is None:
+            self.ctx.log('info', 'Opening scan: no staircase seen.')
+            return None
+        crossing = SC.stair_crossing(tiles.grid, tuple(tiles.current), tiles.stairs,
+                                     skip=self.machine.stairs_tried | tiles.stairs_crossed,
+                                     min_facing=float(cfg.get('stair_min_facing', 0.5)))
+        seen = ', '.join(T.tile_label(t) for t in sorted(tiles.stairs))
+        if crossing is not None and not tiles.stairs_ready():
+            self.ctx.log('info', f'Opening scan: staircase on tile {T.tile_label(crossing["neighbour"])} beside the start '
+                                 f'tile, but this side is explored first (the stairs are one way).')
+            return None
+        if crossing is None:
+            self.ctx.log('info', f'Opening scan: staircase tile(s) {seen}, but none beside start tile '
+                                 f'{T.tile_label(tiles.current)} to climb from here.')
+            return None
+        here, first = T.tile_label(tiles.current), T.tile_label(crossing['neighbour'])
+        self.ctx.log('info', f'Opening scan: staircase on tile {first}, along the {crossing["side"]} side of tile {here}: '
+                             f'stairs mode, climbing over it into tile {T.tile_label(crossing["beyond"])}.')
+        return self.go(mode, f'staircase on tile {first} seen in the opening scan', crossing=crossing)
+
+    def _turn_back(self, other_way=False):
+        """Opening scan: turn back to the heading the robot started with before exploring. True if a turn started.
+        other_way: go the long way round (the short way was blocked)."""
         self.returned = True
         pose = self.ctx.pose()
         if self.start_yaw is None or pose is None:
@@ -216,6 +314,8 @@ class ScanningMode(Mode):
         delta = math.degrees(math.atan2(math.sin(self.start_yaw - pose[2]), math.cos(self.start_yaw - pose[2])))
         if abs(delta) < float(self.cfg.get('return_tolerance_deg', 3.0)):
             return False
+        if other_way:
+            delta -= math.copysign(360.0, delta)
         self.ctx.log('info', f'Opening scan done: turning {delta:+.0f} deg back to the starting heading.')
         self.queue = []
         self.pending_deg = None
@@ -242,9 +342,12 @@ class ScanningMode(Mode):
                 pose = self.ctx.pose()
                 if pose is None:
                     continue
-                # yaw setpoint relative to the starting heading -> the turn from where the robot is now
-                target = self.start_yaw + math.radians(deg)
-                deg = math.degrees(math.atan2(math.sin(target - pose[2]), math.cos(target - pose[2])))
+                # yaw setpoint relative to the starting heading -> the turn from where the robot is now. Both are
+                # measured in (-180, 180] from the starting heading and the turn is their plain difference (NOT the
+                # shortest way): it never crosses the +-180 deg point, so the sweep stays in front of the robot instead
+                # of swinging round through the wall behind it (shortest way from +80 to -160 is +120, through the back).
+                rel = math.degrees(math.atan2(math.sin(pose[2] - self.start_yaw), math.cos(pose[2] - self.start_yaw)))
+                deg = max(-180.0, min(180.0, deg)) - rel
                 if abs(deg) < tol:
                     continue
             self.ctx.scanner.start(deg, float(self.cfg.get('time_allowance_s', 20.0)))
@@ -258,6 +361,8 @@ class ScanningMode(Mode):
         if self.phase in ('settle', 'turning'):
             self.ctx.scanner.cancel()
         self.ctx.gait_hold(None)
+        if self.opening and self.cfg.get('opening_stairs', False):
+            self._stair_detection(False)         # stays on with use_stairs (mission manager)
 
 
 # ---------------------------------------------------------------------------------------- exploring
@@ -280,9 +385,13 @@ class ExploringMode(Mode):
         self.pending = None           # (strategy index, candidates) while the Nav2 path checks run
         self.index = 0                # which strategy is being asked in this decision
         self.unreached = []           # labels of candidates that had no path in this decision
+        self.via_only = []            # labels Nav2 had a path to, but only through other tiles (this decision)
         self.curtain = None           # curtain edge seen this decision (curtain_last: another way is taken first)
         self.avoid = set()            # goals that just failed: the next decision picks a different tile
         self.no_path_streak = 0       # decisions in a row without any Nav2 path (reset when a target is chosen)
+        self.stuck_rounds = 0         # retry rounds with nothing reachable left (reset when a new tile is visited)
+        self.stairs_backtracks = 0    # backtracks started towards the tile in front of a forced staircase
+        self._stuck_visited = None    # tiles.visited_count() when stuck_rounds was last counted
         self.valid_checked_at = 0.0
         self.tile_traversals = self._overrides('tile_traversals', lambda k: k.replace(' ', ''))
         self.kind_traversals = self._overrides('kind_traversals', str.strip)
@@ -326,11 +435,12 @@ class ExploringMode(Mode):
     def enter(self, reason, **kw):
         self.target, self.strategy, self.traversal, self.pending = None, None, None, None
         self.avoid = set()
+        self._stairs_wait_logged = None
         self._new_decision()
 
     def _new_decision(self):
-        self.index, self.unreached = 0, []
-        self.curtain = None                          # a curtain seen this decision, left for later if another way exists
+        self.index, self.unreached, self.via_only = 0, [], []
+        self.curtain = None                         # a curtain seen this decision, left for later if another way exists
         self.set_phase('decide')
 
     def tick(self):
@@ -356,20 +466,28 @@ class ExploringMode(Mode):
             return None
         edge = self._curtain_on_edge(pose) if self.index == 0 else None
         if self.index == 0:
+            self._note_discovered_splits()
             # scenes first: the scene mode keeps the robot on this tile, but a stairs crossing is one way (the staircase
             # is walled off behind it), so a scene beside this tile could never be looked at afterwards.
             # Both before the end condition: the lidar cannot see past a staircase's riser, so the tiles behind it are
             # not identified yet and 'all identified tiles explored' can be true while a staircase is still to climb.
             # A roller is the same: one way for Nav2 (no route back over it), and the map shows a wall across the half
             # tile, so nothing behind it is identified until it is crossed.
-            hop = self._scene_beside(pose) or self._roller_ahead(pose) or self._stairs_beside(pose)
+            # the end condition found the ending tile (the robot entered the outside of the maze): straight back to it,
+            # no scene / roller / stairs out there first
+            hop = self.machine.goal_hop() or self._scene_beside(pose) or self._roller_ahead(pose) \
+                or self._stairs_beside(pose)
+            if hop is None and self.ctx.tiles.stairs_forced:
+                # this side was given up on for the staircase: backtrack to the tile in front of it (no Nav2 path checks
+                # to the tiles left, so no recovery); arriving there starts the stairs mode
+                hop = self.stairs_backtrack('going for the staircase')
             if hop is not None:
                 return hop
             # a curtain on an edge of the tile the robot stands on (e.g. the opening tile) hides what is behind it: the map
             # shows a wall there, so the end condition must not see the mission as finished before the curtain is checked
-            end = None if edge is not None else self.machine.check_end()
-            if end:
-                return self.go(self.machine.complete_mode, end)
+            end = None if edge is not None else self.machine.end_hop()
+            if end is not None:
+                return end
             if edge is not None:
                 self.ctx.log('info', f'Curtain on the {edge["side"]} edge of the current tile: end condition not checked yet.')
                 if not self._can_defer_curtain():
@@ -395,6 +513,13 @@ class ExploringMode(Mode):
         # every strategy asked: nothing reachable this decision
         if self.curtain is not None:
             return self._through_curtain(self.curtain, 'no other way to take first')
+        if self.via_only:
+            # Nav2 HAS a path, it just runs through other tiles: not a transient planner failure, so no retries and no
+            # recovery (that only re-centres on this tile). Go back to the last split and take its untravelled way.
+            hop = self._backtrack(f'only paths through other tiles to {", ".join(self.via_only)}')
+            if hop is not None:
+                return hop
+            self.unreached += [v for v in self.via_only if v not in self.unreached]   # no split: as before
         if self.unreached:
             self.ctx.log('warn', f'No Nav2 path to any candidate ({", ".join(self.unreached)}).')
             self.ctx.event('no_path', targets=self.unreached)
@@ -403,14 +528,17 @@ class ExploringMode(Mode):
 
     def _nothing_left(self, why):
         pose = self.ctx.pose()
-        end = None if pose is not None and self._curtain_on_edge(pose) is not None else self.machine.check_end()
-        if end:
-            return self.go(self.machine.complete_mode, end)
+        end = None if pose is not None and self._curtain_on_edge(pose) is not None else self.machine.end_hop()
+        if end is not None:
+            return end
         tiles = self.ctx.tiles
-        if tiles.ready and (tiles.unexplored() or tiles.unreachable or tiles.curtains_left()):
+        if tiles.ready and (tiles.unexplored() or tiles.unreachable or tiles.curtains_left() or self.machine.stairs_left()):
             hop = self._backtrack(why)
             if hop is not None:
                 return hop
+            if self._force_stairs(why):
+                self._new_decision()
+                return None
             # unexplored tiles are left: never finish, look for new Nav2 paths to them later
             self.ctx.log('warn', f'{why}, but {len(tiles.unexplored()) + len(tiles.unreachable)} tile(s) are still '
                                  f'unexplored: retrying for Nav2 paths in {self._retry_period():.0f} s.')
@@ -419,6 +547,83 @@ class ExploringMode(Mode):
         idle = self.machine._first_of_type('idle')
         self.ctx.log('warn', f'{why}, but the end condition is not met ({self.machine.end.describe()}): idling.')
         return self.go(idle, f'{why}; end condition not met') if idle else None
+
+    def _force_stairs(self, why):
+        """Nothing reachable is left on this side but the staircase is still to climb: after stairs_after_retries retry
+        rounds without a new tile, stop waiting for the tiles left (they hold the stairs back via tiles.stairs_ready,
+        and each retry restores the given-up ones) and go for the stairs: the exploring decision then targets the tile
+        in front of the staircase (TileExploration._stairs_approach) and the stairs mode climbs from there."""
+        tiles = self.ctx.tiles
+        if (not self.cfg.get('stairs', False) or not self.cfg.get('stairs_when_stuck', True) or tiles.stairs_forced
+                or not self.machine.stairs_left()):
+            return False
+        visited = tiles.visited_count()
+        if visited != self._stuck_visited:
+            self._stuck_visited, self.stuck_rounds = visited, 0
+        rounds = int(self.cfg.get('stairs_after_retries', 1))
+        if self.stuck_rounds < rounds:
+            self.stuck_rounds += 1
+            return False
+        left = sorted(set(tiles.unexplored()) | set(tiles.unreachable))
+        tiles.stairs_forced = True
+        for label in tiles.unexplored():               # given up on: no longer candidates in front of the stairs
+            tiles.unreachable[label] = 'given up for the staircase'
+        tiles.invalidate()
+        tiles.update()
+        stair = T.tile_label(tiles.staircase_tile)
+        self.ctx.log('warn', f'{why} after {self.stuck_rounds} retry round(s): giving up on {", ".join(left) or "nothing"} '
+                             f'and going for the staircase on tile {stair}.')
+        self.ctx.event('stairs_forced', stairs=stair, given_up=left, why=why)
+        return True
+
+    def stairs_backtrack(self, why):
+        """stairs_forced: make the tile in front of the staircase the last split (its option: the staircase) and
+        backtrack there along the moves already made (tiles.known_route, tile centre to tile centre); at the split
+        tile the backtracking mode starts the stairs mode. Used instead of recovery while the stairs are forced (also by
+        the machine when the robot gets stuck on the way). None when there is nothing to do or stairs_backtrack_attempts
+        backtracks were started already (then the usual handling, recovery included, takes over)."""
+        tiles = self.ctx.tiles
+        mode = self.cfg.get('backtracking_mode', 'backtracking')
+        if (not tiles.stairs_forced or not self.machine.stairs_left() or mode not in self.machine.modes
+                or tiles.grid is None or tiles.current is None):
+            return None
+        limit = int(self.cfg.get('stairs_backtrack_attempts', 3))
+        if limit and self.stairs_backtracks >= limit:
+            if self.stairs_backtracks == limit:
+                self.stairs_backtracks += 1          # log once
+                self.ctx.log('warn', f'Stairs: {limit} backtracks to the staircase did not get there; '
+                                     f'back to the usual handling.')
+            return None
+        approach = self._stairs_approach_tile()
+        if approach is None:
+            return None
+        self.stairs_backtracks += 1
+        stair, here = T.tile_label(tiles.staircase_tile), T.tile_label(approach)
+        tiles.mark_split(approach, [stair])
+        self.ctx.log('info', f'Stairs: {why}; tile {here} in front of the staircase {stair} is the last split: '
+                             f'backtracking there (attempt {self.stairs_backtracks}).')
+        self.ctx.event('stairs_backtrack', split=here, stairs=stair, why=why, attempt=self.stairs_backtracks)
+        return self.go(mode, f'{why}: backtracking to tile {here} in front of the staircase {stair}', split=here)
+
+    def _stairs_approach_tile(self):
+        """The tile the staircase can be climbed from (stairs_core.stair_crossing), the one with the shortest way back
+        along the moves already made first (then the nearest), or None."""
+        tiles = self.ctx.tiles
+        stair = tuple(tiles.staircase_tile)
+        here = tuple(tiles.current)
+        best = None
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            v = (stair[0] + di, stair[1] + dj)
+            if tiles.tiles.get(v, {}).get('status') not in ('visited', 'to_visit', 'unreachable') or tiles.is_closed(v):
+                continue
+            if SC.stair_crossing(tiles.grid, v, tiles.stairs, skip=self.machine.stairs_tried | tiles.stairs_crossed,
+                                 min_facing=float(self.cfg.get('stair_min_facing', 0.5))) is None:
+                continue
+            route = tiles.known_route(here, v)
+            key = (route is None, len(route) if route else 0, math.dist(tiles.grid.center(v), tiles.grid.center(here)))
+            if best is None or key < best[0]:
+                best = (key, v)
+        return best[1] if best else None
 
     def _retry_period(self):
         return float(self.cfg.get('retry_period_s', 15.0))
@@ -458,7 +663,9 @@ class ExploringMode(Mode):
         reachable = strat.select(checked, self.ctx.pose() or [0.0, 0.0, 0.0])
         if reachable:
             return self._choose(strat, reachable)
-        self.unreached += [c['label'] for c, _ in checked]
+        via = set(getattr(strat, 'via_rejected', ()) or ())
+        self.via_only += [c['label'] for c, _ in checked if c['label'] in via]
+        self.unreached += [c['label'] for c, _ in checked if c['label'] not in via]
         self.ctx.log('info', f'Exploration {strat.name!r}: no reachable candidate; trying the next profile.')
         self.index = index + 1
         self.set_phase('decide')
@@ -473,9 +680,14 @@ class ExploringMode(Mode):
             self.ctx.log('info', f'No Nav2 path ({self.no_path_streak}/{patience}): retrying before recovery.')
             self.set_phase('retry_wait')
             return None
+        if self.ctx.tiles.stairs_forced:
+            hop = self.stairs_backtrack('no Nav2 path to any exploration target')   # never recovery for the stairs
+            if hop is not None:
+                return hop
         if action == 'recovery' and self.ctx.tiles.ready and self.cfg.get('backtracking', False):
-            hop = self._backtrack('no Nav2 path to any exploration target') \
-                if self._split_at_roller() is not None else None      # boxed in behind a roller: recovery cannot help
+            # a split with an untravelled way is left (or the robot is boxed in behind a roller): go back there rather
+            # than recover, which only re-centres on a nearby tile and gives up on the targets after a few rounds
+            hop = self._backtrack('no Nav2 path to any exploration target')
             if hop is not None:
                 return hop
         if action == 'recovery':
@@ -537,6 +749,17 @@ class ExploringMode(Mode):
             self.ctx.log('info', f'Tile {label} is the last split: {len(options)} tiles to travel to '
                                  f'({", ".join(options)}).')
             self.ctx.event('split', tile=label, options=options)
+
+    def _note_discovered_splits(self):
+        """New untravelled tiles found beside tiles visited earlier: those tiles become splits (backtracking returns to
+        them), not only the tile the robot stands on."""
+        tiles = self.ctx.tiles
+        if not (self.cfg.get('backtracking', False) and self.cfg.get('split_on_discovery', True)) or not tiles.ready:
+            return
+        for s in tiles.note_discovered_splits():
+            self.ctx.log('info', f'Tile {s["tile"]} is a split again: new tile(s) {", ".join(s["new"])} beside it '
+                                 f'({len(s["options"])} to travel to: {", ".join(s["options"])}).')
+            self.ctx.event('split', tile=s['tile'], options=s['options'], discovered=s['new'])
 
     def _backtrack(self, why):
         """No exploration target left but tiles are still unexplored -> backtracking mode, back to the last split tile
@@ -741,6 +964,8 @@ class ExploringMode(Mode):
         tile = tuple(int(v) for v in label.split(','))
         if label in self.machine.scenes_done or not tiles.is_scene(tile):
             return None
+        if tiles.wall_between(tiles.current, tile):
+            return None          # a wall between: looked at later from a neighbour across an open side (scene_viewpoints)
         back = T.tile_label(tiles.current)
         self.ctx.log('warn', f'Tile {label} turned out to be a scene tile while driving to it: recovering to tile {back}, '
                              f'then looking at it.')
@@ -786,6 +1011,13 @@ class ExploringMode(Mode):
         if crossing is None:
             return None
         here, first = T.tile_label(tiles.current), T.tile_label(crossing['neighbour'])
+        if not tiles.stairs_ready():
+            # the stairs are one way: every traversable tile on this side is explored (scene tiles looked at) first
+            if self._stairs_wait_logged != here:
+                self._stairs_wait_logged = here
+                self.ctx.log('info', f'Staircase on tile {first} beside tile {here}: not yet, '
+                                     f'{len(tiles.unexplored())} tile(s) to visit / scene tile(s) to look at first.')
+            return None
         self.ctx.log('info', f'Staircase on tile {first}, along the {crossing["side"]} side of tile {here}: climbing '
                              f'over it into tile {T.tile_label(crossing["beyond"])}.')
         return self.go(self.cfg.get('stairs_mode', 'stairs'), f'staircase on tile {first} beside tile {here}',
@@ -844,10 +1076,18 @@ class ExploringMode(Mode):
         pts = self.ctx.curtain_points()
         if pts is None or len(pts) == 0:
             return None
+        pts = np.asarray(pts, float)
+        pts = pts[tiles.not_curtain_mask(pts)]         # no spots on a rejected edge nor on the initial tile's edges
+        if len(pts) == 0:
+            return None
         edge = CC.edge_curtain(tiles.grid, tuple(tiles.current), pts, visited=tiles.trail,
                                skip=self.machine.curtains_tried,
                                tol_m=float(self.cfg.get('curtain_edge_tol_m', 0.30)),
-                               min_span_m=float(self.cfg.get('curtain_min_span_m', 0.40)))
+                               min_span_m=float(self.cfg.get('curtain_min_span_m', 0.40)),
+                               min_camera_spots=int(self.cfg.get('curtain_min_camera_spots', 3)),
+                               lidar_only=bool(self.cfg.get('curtain_lidar_only', True)),
+                               camera_tol_m=float(self.cfg.get('curtain_camera_tol_m', 0.15)),
+                               camera_min_span_m=float(self.cfg.get('curtain_camera_min_span_m', 0.30)))
         return edge
 
     def _can_defer_curtain(self):
@@ -859,7 +1099,7 @@ class ExploringMode(Mode):
         tiles = self.ctx.tiles
         tiles.deferred_curtains.pop(tuple(edge['neighbour']), None)
         self.ctx.log('info', f'Curtain along the {edge["side"]} edge of tile {T.tile_label(tiles.current)} '
-                             f'({edge["spots"]} spots, {edge["span_m"]} m): walking through it'
+                             f'({edge["spots"]} spots, {edge.get("camera_spots", "?")} by camera, {edge["span_m"]} m): walking through it'
                              + (f' ({why}).' if why else '.'))
         return self.go(self.cfg.get('curtain_mode', 'curtain'),
                        f'curtain on the {edge["side"]} edge of tile {T.tile_label(tiles.current)}', edge=edge)
@@ -1024,8 +1264,11 @@ class MppiMode(Mode):
 # ----------------------------------------------------------------------------------------- curtain
 class _ViewsCall:
     """The AI calls of a scene tile's views (left / centre / right) as one call: done when all are, ok when any is.
-    The result is the centre view's with all the descriptions joined; the scene type is the commonest one the views
-    named (traversable only when every view said so)."""
+    The result is the centre view's with all the descriptions joined; the scene type is a majority vote of the views:
+    a scene only when more views named a scene type than said traversable (a tie goes to the side with the higher summed
+    confidence, traversable when that ties too), then the commonest scene type named (ties: summed confidence). One view
+    catching the edge of a neighbouring scene no longer outvotes two that saw none (bags 104357: traversable / kitchen /
+    traversable -> kitchen, 175813: traversable / traversable / workshop -> workshop)."""
     ORDER = ('centre', 'left', 'right')
 
     def __init__(self, calls):
@@ -1050,11 +1293,34 @@ class _ViewsCall:
         out['scene_description'] = ' | '.join(f'{v.capitalize()}: {good[v].get("scene_description", "")}'
                                               for v in ('left', 'centre', 'right') if v in good)
         out['images'] = {v: good[v]['image'] for v in ('left', 'centre', 'right') if good[v].get('image')}
-        types = [good[v].get('scene_type') for v in views if good[v].get('scene_type')]
-        named = [t for t in types if t != 'traversable']
-        if types:
-            out['scene_type'] = max(set(named), key=named.count) if named else 'traversable'
+        votes = [(good[v]['scene_type'], self._confidence(good[v])) for v in views if good[v].get('scene_type')]
+        if votes:
+            out['scene_type'] = self.vote(votes)
+            out['scene_votes'] = {v: good[v]['scene_type'] for v in views if good[v].get('scene_type')}
         return out
+
+    @staticmethod
+    def _confidence(result) -> float:
+        try:
+            return float(result.get('confidence') or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def vote(votes) -> str:
+        """[(scene_type, confidence)] of the views -> the tile's scene type (see the class docstring)."""
+        named = [(t, c) for t, c in votes if t != 'traversable']
+        trav = [c for t, c in votes if t == 'traversable']
+        if not named:
+            return 'traversable'
+        named_conf = sum(c for _, c in named)
+        if len(named) < len(trav) or (len(named) == len(trav) and named_conf <= sum(trav)):
+            return 'traversable'
+        score = {}
+        for t, c in named:
+            n, conf = score.get(t, (0, 0.0))
+            score[t] = (n + 1, conf + c)
+        return max(sorted(score), key=lambda t: score[t])
 
 
 @register_mode('scene')
@@ -1067,7 +1333,12 @@ class SceneMode(Mode):
     keep that direction while it is almost behind the robot: right at 180 deg the shorter way flips with every bit of
     coasting) -> settle (stand still) -> describe (the AI is asked
     what is on the tile; retried llm_attempts times) -> next_mode (exploring), with the scene tile marked explored
-    whatever the AI said (machine.scenes_done: never twice). The robot does not leave its tile."""
+    whatever the AI said (machine.scenes_done: never twice). The robot does not leave its tile.
+
+    background: true: once the pictures are taken the robot does not wait for the AI. The call goes to the machine
+    (describe_in_background), the scene tile is marked explored and the robot goes on exploring; the answer is recorded
+    when it comes (a 'traversable' answer then reopens the tile). No retry: a new picture would be taken from wherever
+    the robot is by then, so a failed answer is recorded as failed."""
 
     def __init__(self, name, machine, cfg):
         super().__init__(name, machine, cfg)
@@ -1089,8 +1360,15 @@ class SceneMode(Mode):
             self.set_phase('abort')
             return
         self.tile = tuple(int(v) for v in tile.split(','))
-        self.machine.scenes_done.add(tile)
         here = tiles.current if tiles.current is not None else tiles.grid.tile_of(pose[0], pose[1])
+        if tiles.wall_between(here, self.tile):
+            # a wall between this tile and the scene tile: the camera would only see the wall. Not looked at (and not
+            # marked done): exploration brings the robot to a neighbour across an open side (scene_viewpoints).
+            self.ctx.log('warn', f'Scene tile {tile}: a wall between it and tile {T.tile_label(here)}; not looking at it from here.')
+            self.ctx.event('scene_skipped', tile=tile, from_tile=T.tile_label(here), why='wall between')
+            self.set_phase('walled')
+            return
+        self.machine.scenes_done.add(tile)
         self.centre = tuple(tiles.grid.center(tuple(here)))
         self.yaw = self._facing(self.centre)
         self.ctx.event('scene', tile=tile, from_tile=T.tile_label(here), yaw_deg=round(math.degrees(self.yaw), 1))
@@ -1119,6 +1397,14 @@ class SceneMode(Mode):
     def _ask(self):
         self.attempt += 1
         self.call = self.ctx.describe_scene(self.label, self.pose0)
+        self._describe()
+
+    def _describe(self):
+        """The pictures are taken (self.call holds the AI call). background: hand the call to the machine, which records
+        the answer when it comes, and go on exploring now; otherwise wait for it here (describe phase, with retries)."""
+        if self.cfg.get('background', False) and not self.call.done:
+            self.machine.describe_in_background(self.label, self.pose0, self.call)
+            return self.set_phase('handed_off')
         self.set_phase('describe')
 
     def tick(self):
@@ -1126,6 +1412,9 @@ class SceneMode(Mode):
         pose = self.ctx.pose()
         if self.phase == 'abort':
             return self._finish('nothing to look at')
+        if self.phase == 'walled':
+            self.ctx.stop()
+            return self.go(self.cfg.get('next_mode', 'exploring'), f'scene tile {self.label}: wall between, not looked at')
         if pose is None or len(pose) < 3:
             self.ctx.stop()
             return self._finish('no pose') if self.in_phase_s() > 3.0 else None
@@ -1201,9 +1490,11 @@ class SceneMode(Mode):
                 self.attempt += 1
                 self.call = _ViewsCall(self.views)
                 self.ctx.event('scene_quickscan', tile=self.label, views=sorted(self.views))
-                self.set_phase('describe')
+                self._describe()
             else:
                 self._ask()                                # no picture was taken: the single one from here
+        elif self.phase == 'handed_off':
+            return self._finish('pictures taken, the AI describes it in the background')
         elif self.phase == 'describe':
             if not self.call.done:
                 return None
@@ -1230,8 +1521,11 @@ class CurtainMode(Mode):
     through it with forward (vx) commands (vy keeps the robot on the line from the tile centre through the edge).
 
     Phases: center (turn towards the centre of the tile in front of the curtain, drive there with vx / wz only: no vy) -> align (turn in
-    place until square to the edge) -> cross (vx forward, small wz / vy to hold the line) until the robot is `through_m`
-    past the edge line (the centre of the next tile). A cross that stalls (blocked: progress under stall_m for stall_s),
+    place until square to the edge) -> gait_on (hstep: true, the default: ctx.hstep holds rug_hstep; stand gait_settle_s)
+    -> cross (vx forward, small wz / vy to hold the line) until the robot is `through_m` past the edge line (the centre of
+    the next tile) -> gait_off (h-step released, stand gait_settle_s). Curtains are only ever crossed in rug_hstep: the
+    gait is released on a failed try and on leaving the mode however it is left. A cross that stalls (blocked: progress under stall_m for stall_s,
+    judged only start_grace_s after the cross starts: the robot needs a moment to get walking from standing),
     times out, or an align that times out counts as a failed try: back to center -> align -> cross, up to
     max_attempts tries. Through: next_mode (or `then`). Given up: back to the mode that was running before the curtain
     mode (backtracking gets curtain_ok=False and goes on its way without this curtain).
@@ -1242,14 +1536,35 @@ class CurtainMode(Mode):
     then, then_kwargs, from_tile, came_from = None, {}, None, None
 
     def targets(self):
-        return [self.cfg.get('next_mode', 'exploring')]
+        return [self.cfg.get('next_mode', 'exploring'), self.cfg.get('low_move_mode', 'recovery')]
 
     @property
     def is_driving(self):
         return self.phase in ('center', 'cross')
 
+    def _low_movement(self, pose):
+        """True when the robot has barely moved for low_move_s while the mode is moving it (0 = off): less than
+        low_move_m of position AND less than low_move_deg of heading since the reference pose, which is renewed whenever
+        it moves more, at every phase change and while the first low_move_grace_s of a phase run (a standing robot takes
+        ~1.5 s to get walking). Moving includes turning on the spot, so the align / turn phases do not trip it."""
+        c = self.cfg
+        limit = float(c.get('low_move_s', 2.0))
+        if limit <= 0 or self.phase not in ('center', 'align', 'cross'):
+            self._lm_ref = None
+            return False
+        now = self.ctx.now()
+        ref = getattr(self, '_lm_ref', None)
+        dyaw = abs(math.atan2(math.sin(pose[2] - ref[2]), math.cos(pose[2] - ref[2]))) if ref else 0.0
+        if (ref is None or ref[4] != self.phase or math.hypot(pose[0] - ref[0], pose[1] - ref[1]) >= float(c.get('low_move_m', 0.05))
+                or dyaw >= math.radians(float(c.get('low_move_deg', 3.0)))):
+            self._lm_ref = (pose[0], pose[1], pose[2], now, self.phase)
+            return False
+        still_since = max(ref[3], self.phase_since + float(c.get('low_move_grace_s', 2.0)))
+        return now - still_since > limit
+
     def enter(self, reason, edge=None, then=None, then_kwargs=None, **kw):
         self.edge = edge
+        self._lm_ref = None
         self.then, self.then_kwargs = then, dict(then_kwargs or {})   # backtracking: hand back to it afterwards
         prev = self.machine.previous
         self.came_from = then or (prev if prev and prev != self.name else None) or self.cfg.get('next_mode', 'exploring')
@@ -1257,12 +1572,13 @@ class CurtainMode(Mode):
         self.machine.curtains_tried.add(tuple(edge['neighbour']))
         self.start_pose = self.ctx.pose()
         self.attempts = 0
+        self.hstep_on, self.result = False, None
         cx, cy = edge['centre_xy']
         nx, ny = edge['normal']
         self.tile_centre = (cx - nx * edge['through_m'], cy - ny * edge['through_m'])   # tile in front of the curtain
         self.ctx.set_target(None, None, None)
         self.ctx.event('curtain', side=edge['side'], neighbour=list(edge['neighbour']), centre_xy=edge['centre_xy'],
-                       spots=edge['spots'])
+                       spots=edge['spots'], camera_spots=edge.get('camera_spots'))
         self._start_center()
 
     def _start_center(self):
@@ -1291,8 +1607,37 @@ class CurtainMode(Mode):
         c, s = math.cos(pose[2]), math.sin(pose[2])
         self.ctx.drive(ux * c + uy * s, wz, -ux * s + uy * c)
 
-    def _finish(self, why, through=False):
+    def _curtain_hstep(self, on):
+        """Hold (on) / release the h-step gait (rug_hstep, via ctx.hstep) for the cross."""
+        if on != getattr(self, 'hstep_on', False):
+            self.hstep_on = on
+            if hasattr(self.ctx, 'hstep'):
+                self.ctx.hstep(on)
+            self.ctx.log('info', f'Curtain: h-step gait {"ON" if on else "released"}.')
+            self.ctx.event('curtain_gait', on=on)
+
+    def _start_cross(self, pose):
+        # the robot stands still when the cross starts and takes ~1.5 s to get walking: the stall window only
+        # opens start_grace_s later (else a curtain right in front is called a wall before the first step)
+        self.best = self._progress(pose)
+        self.best_at = self.ctx.now() + float(self.cfg.get('start_grace_s', 2.0))
+        self.set_phase('cross')
+
+    def _reject(self):
+        """This edge is no curtain (timed out / blocked walking through it): unmark it, so detection goes on elsewhere
+        (tiles.not_curtain_mask drops the spots on it; the mission manager drops it as the curtain wall)."""
+        if self.from_tile is None:
+            return
+        self.ctx.tiles.reject_curtain(self.from_tile, self.edge['side'])
+        self.ctx.event('curtain_rejected', tile=T.tile_label(self.from_tile), side=self.edge['side'],
+                       neighbour=list(self.edge['neighbour']))
+
+    def _finish(self, why, through=False, reject=False):
         self.ctx.stop()
+        self._curtain_hstep(False)
+        if reject and not through:
+            self._reject()
+            why += '; unmarked as a curtain'
         self.ctx.log('info' if through else 'warn', f'Curtain: {why}')
         if through and self.from_tile is not None:
             self.ctx.tiles.add_curtain_edge(self.from_tile, self.edge['neighbour'])   # backtracking may walk it again
@@ -1306,13 +1651,15 @@ class CurtainMode(Mode):
             return self.go(self.then, f'curtain: {why}', curtain_ok=False, **self.then_kwargs)
         return self.go(self.came_from, f'curtain: {why}')
 
-    def _failed_try(self, why):
-        """One try did not get through: back to the tile centre and try again, or give up."""
+    def _failed_try(self, why, reject=False):
+        """One try did not get through: back to the tile centre and try again, or give up (reject: the edge is
+        unmarked as a curtain when given up)."""
         self.attempts += 1
         tries = int(self.cfg.get('max_attempts', 3))
         if self.attempts >= tries:
-            return self._finish(f'{why}; gave up after {self.attempts} tries')
+            return self._finish(f'{why}; gave up after {self.attempts} tries', reject=reject)
         self.ctx.stop()
+        self._curtain_hstep(False)
         self.ctx.log('warn', f'Curtain: {why} (try {self.attempts}/{tries}); back to the tile centre to try again.')
         self.ctx.event('curtain_retry', neighbour=list(self.edge['neighbour']), why=why, attempt=self.attempts)
         self._start_center()
@@ -1324,6 +1671,21 @@ class CurtainMode(Mode):
             self.ctx.stop()
             return self._finish('no pose') if self.in_phase_s() > 3.0 else None
         c = self.cfg
+        if self._low_movement(pose):
+            self.ctx.stop()
+            why = (f'barely moved for {float(c.get("low_move_s", 2.0)):g} s while {self.phase}ing'
+                   if self.phase != 'cross' else f'barely moved for {float(c.get("low_move_s", 2.0)):g} s while crossing')
+            self.ctx.log('warn', f'Curtain: {why}; recovery.')
+            self.ctx.event('curtain_failed', neighbour=list(self.edge['neighbour']), why=why, attempts=self.attempts,
+                           back_to=c.get('low_move_mode', 'recovery'))
+            return self.go(c.get('low_move_mode', 'recovery'), f'curtain: {why}')
+        if self.phase in ('gait_on', 'gait_off'):            # standing still while the gait switches
+            self.ctx.stop()
+            if self.in_phase_s() < float(c.get('gait_settle_s', 2.0)):
+                return None
+            if self.phase == 'gait_off':
+                return self._finish(*self.result)
+            return self._start_cross(pose)
         if self.phase == 'center':
             dx, dy = self.tile_centre[0] - pose[0], self.tile_centre[1] - pose[1]
             dist = math.hypot(dx, dy)
@@ -1359,8 +1721,11 @@ class CurtainMode(Mode):
             crossed = prev is not None and prev * err < 0 and abs(err) < math.radians(float(c.get('align_cross_deg', 30.0)))
             if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))) or crossed:
                 self.ctx.stop()
-                self.best, self.best_at = self._progress(pose), self.ctx.now()
-                self.set_phase('cross')
+                if c.get('hstep', True):                 # curtains are crossed in rug_hstep only: switch, stand, then walk
+                    self._curtain_hstep(True)
+                    self.set_phase('gait_on')
+                    return None
+                self._start_cross(pose)
                 return None
             if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
                 return self._failed_try('could not square up to it')
@@ -1371,15 +1736,23 @@ class CurtainMode(Mode):
         if self.phase == 'cross':
             prog = self._progress(pose)
             if prog >= self.edge['through_m'] + float(c.get('extra_m', 0.0)):
+                if self.hstep_on:                            # release the h-step gait and stand before driving on
+                    self.ctx.stop()
+                    self.result = ('through the curtain', True)
+                    self._curtain_hstep(False)
+                    self.set_phase('gait_off')
+                    return None
                 return self._finish('through the curtain', through=True)
             if prog > self.best + float(c.get('stall_m', 0.05)):
                 self.best, self.best_at = prog, self.ctx.now()
             if self.ctx.now() - self.best_at > float(c.get('stall_s', 3.0)):
                 if c.get('blocked_gives_up', True):      # a curtain gives way: a robot that stalls is pushing on a wall
-                    return self._finish(f'blocked {prog:+.2f} m from the edge line (a wall, not a curtain)')
+                    return self._finish(f'blocked {prog:+.2f} m from the edge line (a wall, not a curtain)', reject=True)
                 return self._failed_try(f'blocked {prog:+.2f} m from the edge line')
             if self.in_phase_s() > float(c.get('cross_timeout_s', 20.0)):
-                return self._failed_try('timed out walking through it')
+                if c.get('timeout_gives_up', True):      # timed out: no curtain here, look for it elsewhere
+                    return self._finish('timed out walking through it (not a curtain)', reject=True)
+                return self._failed_try('timed out walking through it', reject=True)
             wz = max(-0.3, min(0.3, float(c.get('heading_gain', 1.0)) * err))
             nx, ny = self.edge['normal']
             lim = float(c.get('lateral_max_mps', 0.1))
@@ -1390,6 +1763,7 @@ class CurtainMode(Mode):
 
     def exit(self, next_mode, reason):
         self.ctx.stop()
+        self._curtain_hstep(False)                         # left mid-crossing (low movement, operator command): release
         if next_mode != self.then:
             self.ctx.tiles.open_curtains = False
 
@@ -1417,82 +1791,28 @@ class StairsMode(CurtainMode):
     AI mode off. Each staircase is gone for once (machine.stairs_tried). While AI mode is on, the mission manager also
     publishes /ai_mode true: the gait switcher sends no gait and the stair detector pauses.
 
-    climber: true hands the climb to the stair_climber package (lidar alignment on the real steps, AI mode, IMU-based
-    crossing): after centre + align, phase 'climber' publishes /ai_mode true (gait switcher and stair detector pause),
-    sends no /cmd_vel, enables /stair_climber/enable and watches /stair_climber/state. DONE = crossed (as 'cross'
-    reaching the tile beyond). ABORT / NOT_STAIRS / timeouts = failed; if the climber had entered AI mode, AI mode is
-    turned off here as well. If the climber never sees the stairs (still SEARCH after climber_search_timeout_s) the
-    staircase is given up without climbing (lidar and depth camera must agree).
     The centring / squaring-up / line-following helpers are the curtain mode's: the geometry is the same (walk straight
     through one edge of the current tile and on to the centre of a tile further along)."""
 
     def targets(self):
-        return [self.cfg.get('next_mode', 'exploring'), self.cfg.get('fail_mode', 'recovery')]
+        return [self.cfg.get('next_mode', 'exploring'), self.cfg.get('fail_mode', 'recovery'),
+                self.cfg.get('scan_mode', 'scanning')]
 
     @property
     def is_driving(self):
         return self.phase in ('center', 'cross')
 
-    # stair_climber states once the robot is (about to be) in AI mode: a failure from here on walls the staircase off
-    CLIMBER_AI_STATES = ('ENTER_AI', 'CROSS_AI', 'EXIT_AI', 'SWITCH_TO_FLAT_GAIT', 'DONE')
-
-    def _start_climber(self):
-        self.ctx.stop()
-        self.ctx.ai_flag(True)                       # gait switcher + stair detector pause; no /simple_cmd from here
-        self.ctx.stair_climber_ai_on(self.ai_on)     # AI mode already on: the climber sends no Move Mode / Enter AI
-        self.ctx.stair_climber_enable(True)
-        self.climber_on, self.climber_states, self.climber_ai = True, [], False
-        self.ctx.log('info', f'Stairs: handing staircase tile(s) {self._labels()} to stair_climber.')
-        self.ctx.event('stair_climber', on=True)
-        self.set_phase('climber')
-
-    def _stop_climber(self):
-        if getattr(self, 'climber_on', False):
-            self.ctx.stair_climber_enable(False)
-            self.ctx.stair_climber_ai_on(False)
-            self.ctx.ai_flag(False)
-            self.climber_on = False
-            self.ctx.event('stair_climber', on=False, states=list(self.climber_states))
-
-    def _climber_tick(self):
-        c = self.cfg
-        state, age = self.ctx.stair_climber_state()
-        if state is not None and age < 2.0:
-            if not self.climber_states or self.climber_states[-1] != state:
-                self.climber_states.append(state)
-                self.ctx.log('info', f'Stairs: stair_climber {state}.')
-            if state in self.CLIMBER_AI_STATES:
-                self.climber_ai = True
-                self.climbed = True
-        else:
-            state = None
-        fail = None
-        if state == 'DONE':
-            self.ai_on = False                       # stair_climber sent Exit AI itself: no second one from here
-            self._stop_climber()
-            return self._finish('stair_climber crossed it', through=True)
-        if state in ('ABORT', 'NOT_STAIRS'):
-            fail = f'stair_climber {state}'
-        elif state is None and self.in_phase_s() > float(c.get('climber_lost_s', 5.0)):
-            fail = 'no state from stair_climber (is it running?)'
-        elif (not self.climber_ai and self.climber_states and self.climber_states[-1] in ('IDLE', 'SEARCH')
-              and self.in_phase_s() > float(c.get('climber_search_timeout_s', 15.0))):
-            fail = 'stair_climber did not see the stairs'
-        elif self.in_phase_s() > float(c.get('climber_timeout_s', 180.0)):
-            fail = f'stair_climber timed out in {state}'
-        if fail is None:
-            return None
-        self._stop_climber()
-        if self.climber_ai or self.ai_on:            # it may have left the robot in AI mode (or we put it there): off from here
-            self._ai(False)
-        return self._finish(fail)
-
     def enter(self, reason, crossing=None, **kw):
         self.edge, self.then, self.then_kwargs = crossing, None, {}
         prev = self.machine.previous
-        self.came_from = prev if prev and prev != self.name else self.cfg.get('next_mode', 'exploring')
+        prev_type = self.machine.modes[prev].type_name if prev in self.machine.modes else None
+        # straight from the opening scan (opening_stairs): giving up goes on to exploring, not into another scan
+        self.came_from = (prev if prev and prev != self.name and prev_type != 'scanning'
+                          else self.cfg.get('next_mode', 'exploring'))
         self.ai_on, self.climbed, self.attempts, self.pose_lost_at = False, False, 0, None
-        self.climber_on, self.climber_states, self.climber_ai = False, [], False
+        self.closest = None
+        self.ai_req, self.ai_attempts, self.ai_sent_t, self.ai_ok_since, self.ai_failed = None, 0, 0.0, None, False
+        self.ref = None
         self.ctx.set_target(None, None, None)
         if not crossing:
             self.set_phase('abort')
@@ -1503,22 +1823,91 @@ class StairsMode(CurtainMode):
         nx, ny = crossing['normal']
         half = 0.5 * self.ctx.tiles.grid.size
         self.tile_centre = (cx - nx * half, cy - ny * half)          # centre of the tile in front of the staircase
+        # the reference tile beyond the staircase is predicted only once the robot has squared up to it (_predict_beyond)
         self.ctx.event('stairs', side=crossing['side'], stairs=[T.tile_label(t) for t in crossing['stairs']],
                        beyond=T.tile_label(crossing['beyond']), facing=crossing.get('facing'),
                        through_m=crossing['through_m'])
         self._start_center()
+
+    def _predict_beyond(self):
+        """The reference tile beyond the staircase, along the staircase's own direction (not the grid's): odom is
+        rebased to it after the climb. Predicted after squaring up at the centre of the tile in front of the stairs, so
+        it uses the staircase as the detector sees it from there (the steps right ahead), not as first seen from
+        further away. Squaring up again (it coasted off while standing still) predicts it again."""
+        tiles, crossing = self.ctx.tiles, self.edge
+        if self.ref is not None:                                     # squared up again: replace the earlier prediction
+            tiles.stair_refs[:] = [r for r in tiles.stair_refs if r is not self.ref]
+        self.ref = SC.beyond_reference(tiles.grid, crossing['stairs'], tiles.stairs, fallback_dir=crossing['normal'])
+        tiles.stair_refs.append(self.ref)
+        tiles.version += 1                                           # publishers: draw the new reference tile
+        rx, ry = self.ref['centre_xy']
+        pose = self.ctx.pose()
+        self.ctx.log('info', f'Stairs: squared up; the tile beyond the staircase is predicted at ({rx:.2f}, {ry:.2f}), '
+                             f'{math.degrees(T.wrap(self.ref["yaw"] - crossing["yaw"])):+.1f} deg off the grid '
+                             f'(grid tile {T.tile_label(self.ref["grid_tile"])}).')
+        self.ctx.event('stairs_reference', stairs=[T.tile_label(t) for t in crossing['stairs']],
+                       centre_xy=[round(rx, 3), round(ry, 3)], yaw_deg=round(math.degrees(self.ref['yaw']), 1),
+                       off_grid_deg=round(math.degrees(T.wrap(self.ref['yaw'] - crossing['yaw'])), 1),
+                       grid_tile=T.tile_label(self.ref['grid_tile']),
+                       pose=[round(float(v), 3) for v in pose] if pose is not None else None)
 
     def _labels(self):
         return ', '.join(T.tile_label(t) for t in self.edge['stairs']) if self.edge else '?'
 
     def _ai(self, on):
         code = _cmd_code(self.cfg.get('ai_on_code' if on else 'ai_off_code', 0x21010528 if on else 0x2101052B))
+        if getattr(self, 'ai_req', None) != on:
+            self.ai_req, self.ai_attempts, self.ai_failed = on, 0, False
+        self.ai_attempts += 1
+        self.ai_sent_t, self.ai_ok_since = self.ctx.now(), None
         heard = self.ctx.ai_mode(on, code)
         self.ai_on = on
         self.climbed |= on
-        self.ctx.log('info' if heard else 'warn', f'Stairs: AI mode {"ON" if on else "OFF"} (0x{code:08X})'
+        again = f', attempt {self.ai_attempts}' if self.ai_attempts > 1 else ''
+        self.ctx.log('info' if heard and not again else 'warn',
+                     f'Stairs: AI mode {"ON" if on else "OFF"} (0x{code:08X}{again})'
                      + ('' if heard else ': nobody is listening on /simple_cmd, the robot did not get it') + '.')
-        self.ctx.event('ai_mode', on=on, cmd_code=f'0x{code:08X}', heard=heard)
+        self.ctx.event('ai_mode', on=on, cmd_code=f'0x{code:08X}', heard=heard, attempt=self.ai_attempts)
+
+    def _robot_state(self):
+        """(basic, gait, policy, motion) from /robot_state (0x0901 report), or None (no bridge / stale / ai_verify off)."""
+        if not self.cfg.get('ai_verify', True):
+            return None
+        get = getattr(self.ctx, 'robot_state', None)
+        return get() if get is not None else None
+
+    def _ai_settled(self, on):
+        """True once the robot reports the AI state asked for (on: (16, ai_policy_state, *), the AI basic gait; off:
+        basic state 6, torque control in a normal gait), held ai_confirm_s. Until then the AI command is sent again
+        every ai_retry_s (keeps trying unless ai_max_attempts is set). With no robot state: ai_settle_s, as before."""
+        c = self.cfg
+        settle = float(c.get('ai_settle_s', 2.0))
+        st = self._robot_state() if getattr(self, 'ai_req', None) == on else None
+        if st is None:
+            return self.in_phase_s() >= settle
+        basic, _gait, policy, _motion = st[:4]
+        want_policy = int(c.get('ai_policy_state', 0))
+        ok = (basic == BASIC_AI and (want_policy < 0 or policy == want_policy)) if on else basic == BASIC_STANDING
+        now = self.ctx.now()
+        if ok:
+            self.ai_ok_since = now if self.ai_ok_since is None else self.ai_ok_since
+            if now - self.ai_ok_since >= float(c.get('ai_confirm_s', 0.3)):
+                self.ctx.log('info', f'Stairs: robot reports AI mode {"ON" if on else "OFF"} {tuple(st[:4])} '
+                                     f'(attempt {self.ai_attempts}).')
+                return True
+            return False
+        self.ai_ok_since = None
+        if now - self.ai_sent_t >= max(float(c.get('ai_retry_s', 3.0)), settle):
+            limit = int(c.get('ai_max_attempts', 0))
+            if limit and self.ai_attempts >= limit:
+                self.ctx.log('error', f'Stairs: AI mode {"ON" if on else "OFF"} not reached after {self.ai_attempts} '
+                                      f'attempts (robot state {tuple(st[:4])}).')
+                self.ai_failed = True
+                return True
+            self.ctx.log('warn', f'Stairs: robot state {tuple(st[:4])}, not AI mode {"ON" if on else "OFF"} yet: '
+                                 'sending it again.')
+            self._ai(on)
+        return False
 
     def _finish(self, why, through=False):
         self.ctx.stop()
@@ -1532,20 +1921,66 @@ class StairsMode(CurtainMode):
             pose = self.ctx.pose()
             if self.climbed and self.cfg.get('rebase_odom', True):
                 # AI mode throws the leg odometry off: the robot is where the crossing was meant to end, the centre of
-                # the tile beyond, facing the way it crossed. Re-anchor odom there; SLAM matches the remainder.
-                bx, by = tiles.grid.center(beyond)
-                yaw = math.atan2(self.edge['normal'][1], self.edge['normal'][0])
+                # the reference tile beyond the staircase (along the steps, SC.beyond_reference), facing up the stairs
+                # (rebase_yaw 'stairs') or the way it squared up to the grid edge ('grid'). Re-anchor odom there; SLAM
+                # matches the remainder.
+                if self.ref is None:                     # never squared up (cannot happen once AI mode was on)
+                    self._predict_beyond()
+                ref = self.ref
+                # Where the robot really is: it squared up to the edge normal (not the staircase's own direction, which
+                # the grid can be turned off by) and walked straight along it from the centre of the tile in front of
+                # the staircase, heading held on the IMU. So: on that line, as far along as the reference centre; heading
+                # the squared-up one plus whatever the IMU yaw drifted since. (Snapping to the reference centre / the
+                # stairs yaw put the pose off the line and turned it by the grid-to-stairs angle.)
+                nx, ny = self.edge['normal']
+                if self.cfg.get('rebase_yaw', 'heading') == 'stairs':
+                    yaw = ref['yaw']
+                    bx, by = ref['centre_xy']
+                else:
+                    yaw = math.atan2(ny, nx)
+                    imu, yref = self._imu(), getattr(self, 'imu_yaw_ref', None)
+                    if imu is not None and yref is not None:
+                        yaw = T.wrap(yaw + T.wrap(imu[1] - yref))
+                    rx, ry = ref['centre_xy']
+                    d = (rx - self.tile_centre[0]) * nx + (ry - self.tile_centre[1]) * ny
+                    bx, by = self.tile_centre[0] + nx * d, self.tile_centre[1] + ny * d
                 self.ctx.rebase_odom(bx, by, yaw)
-                self.ctx.event('odom_rebase', tile=T.tile_label(beyond), pose=[round(bx, 3), round(by, 3), round(yaw, 3)],
+                ref['used'] = True
+                tiles.version += 1
+                ref_tile = tuple(tiles.grid.tile_of(bx, by))
+                if ref_tile in set(map(tuple, self.edge['stairs'])):    # steep angle off the grid: stay off the staircase
+                    ref_tile = beyond
+                self.ctx.event('odom_rebase', tile=T.tile_label(ref_tile), reference='stairs',
+                               pose=[round(bx, 3), round(by, 3), round(yaw, 3)],
+                               grid_beyond=T.tile_label(beyond),
                                was=[round(float(v), 3) for v in pose] if pose is not None else None)
+                if ref_tile != beyond:
+                    self.ctx.log('warn', f'Stairs: the reference tile beyond the staircase lies in grid tile '
+                                         f'{T.tile_label(ref_tile)}, not {T.tile_label(beyond)} (grid turned '
+                                         f'{math.degrees(T.wrap(ref["yaw"] - self.edge["yaw"])):+.0f} deg off the stairs).')
+                beyond = ref_tile
                 pose = [bx, by, yaw]
             tiles.mark_goal_reached(beyond, tiles.grid.center(beyond), pose)
             self.ctx.log('info', f'Stairs: {why}; staircase tile(s) {self._labels()} walled off, now on tile '
                                  f'{T.tile_label(beyond)}.')
             self.ctx.event('stairs_crossed', stairs=[T.tile_label(t) for t in self.edge['stairs']],
                            beyond=T.tile_label(beyond))
+            scan = self.cfg.get('scan_mode', 'scanning')
+            if (self.climbed and self.cfg.get('new_map', False) and scan in self.machine.modes
+                    and hasattr(self.ctx, 'start_new_map')):
+                # new_map: save the map up to here under reports/, clear it, and start a new one from this tile (the
+                # scan mode's opening scan places the new grid; the wall behind the robot is against the staircase)
+                self.after_new_map = (scan, why, tuple(beyond))
+                self.ctx.start_new_map(self.cfg.get('new_map_dir') or None, float(self.cfg.get('new_map_timeout_s', 60.0)))
+                self.set_phase('new_map')
+                return None
+            if self.cfg.get('scan_after', True) and scan in self.machine.modes:
+                # a scan lets SLAM place the robot in the map; the tile it stands on is corrected from that
+                return self.go(scan, f'stairs: {why}; scanning to place the robot', after_stairs=tuple(beyond))
             return self.go(self.cfg.get('next_mode', 'exploring'), f'stairs: {why}')
         back = self.cfg.get('fail_mode', 'recovery') if self.climbed else self.came_from
+        if self.climbed:
+            self._release_odom()
         self.ctx.log('warn', f'Stairs: {why}; giving up on staircase tile(s) {self._labels()}'
                              + (' (walled off)' if self.climbed else '') + '.')
         self.ctx.event('stairs_failed', stairs=self._labels(), why=why, ai_was_on=self.climbed, back_to=back)
@@ -1561,26 +1996,53 @@ class StairsMode(CurtainMode):
 
     def tick(self):
         c = self.cfg
+        if self.phase == 'new_map':
+            state = self.ctx.new_map_state()
+            if state == 'working':
+                self.ctx.stop()
+                return None
+            scan, why, beyond = self.after_new_map
+            if state == 'done':
+                return self.go(scan, f'stairs: {why}; new map, scanning from the tile beyond the stairs')
+            self.ctx.log('warn', 'Stairs: the new map could not be started; carrying on with the old one.')
+            if c.get('scan_after', True):
+                return self.go(scan, f'stairs: {why}; scanning to place the robot', after_stairs=beyond)
+            return self.go(c.get('next_mode', 'exploring'), f'stairs: {why}')
         if self.phase == 'abort':
             return self._finish('no staircase to climb')
-        if self.phase == 'climber':
-            return self._climber_tick()              # no pose / no /cmd_vel needed: stair_climber drives
-        if self.phase == 'climber_ai':
-            self.ctx.stop()
-            if self.in_phase_s() >= float(c.get('ai_settle_s', 2.0)):
-                self._start_climber()
-            return None
         if self.phase == 'ai_on':
-            self.ctx.stop()
-            if self.in_phase_s() >= float(c.get('ai_settle_s', 2.0)):
+            self.ctx.drive(0.0, 0.0)                 # FIX 2: zero /cmd_vel every tick while AI mode settles (stop() sends one)
+            if self._ai_settled(True):
+                if self.ai_failed:
+                    return self._climb_over('AI mode did not come on')
                 pose = self.ctx.pose()
                 self.best = self._progress(pose) if pose is not None and len(pose) >= 3 else -math.inf
                 self.best_at = self.ctx.now()
+                self.xs = {'phase': 'to_stairs', 't': self.ctx.now(), 'down': False,   # FIX 3: IMU crossing state
+                           # chosen once here: the whole crossing is followed on the IMU (the map pose is frozen in AI
+                           # mode), or, with no IMU at all, on the map pose
+                           'imu': bool(c.get('imu_cross', True)) and self._imu() is not None, 'imu_lost_at': None}
                 self.set_phase('cross')
             return None
+        if self.phase == 'cross' and getattr(self, 'xs', {}).get('imu'):
+            if self._imu() is not None:
+                self.xs['imu_lost_at'] = None
+                return self._cross_imu()             # FIX 3: the map pose is frozen in AI mode: IMU only
+            # A late IMU message is no reason to judge the climb on the frozen map pose (bag multiterrain_25_11_115442:
+            # /imu/data at ~2 Hz, one stale tick fell through to the pose check, which saw no progress for stall_s and
+            # called the robot stuck after it had crossed). Keep walking straight; give up only after imu_lost_s.
+            now = self.ctx.now()
+            lost_at = self.xs['imu_lost_at'] = self.xs['imu_lost_at'] if self.xs['imu_lost_at'] is not None else now
+            if now - lost_at > float(c.get('imu_lost_s', 3.0)):
+                over = self.xs['phase'] == 'clear'
+                self._climb_over(f'no IMU for {now - lost_at:.1f} s in {self.xs["phase"]}'
+                                 + (': over the staircase' if over else ''), through=over)
+                return None
+            self.ctx.drive(float(c.get('speed_mps', 0.20)), 0.0)
+            return None
         if self.phase == 'ai_off':
-            self.ctx.stop()
-            if self.in_phase_s() >= float(c.get('ai_settle_s', 2.0)):
+            self.ctx.drive(0.0, 0.0)                 # FIX 2
+            if self._ai_settled(False):
                 why, through = self.result
                 return self._finish(why, through=through)
             return None
@@ -1600,13 +2062,17 @@ class StairsMode(CurtainMode):
         if self.phase == 'center':
             dx, dy = self.tile_centre[0] - pose[0], self.tile_centre[1] - pose[1]
             dist = math.hypot(dx, dy)
-            if dist <= float(c.get('center_tol_m', 0.06)) or self.in_phase_s() > float(c.get('center_timeout_s', 15.0)):
-                if dist > float(c.get('center_tol_m', 0.06)):
-                    self.ctx.log('warn', f'Stairs: could not reach the tile centre ({dist:.2f} m off); squaring up '
-                                         f'from here.')
+            tol = float(c.get('center_tol_m', 0.10))
+            self.closest = dist if getattr(self, 'closest', None) is None else min(self.closest, dist)
+            # the climb (align -> AI mode) starts only from the centre of the tile in front of the staircase: close
+            # enough, or already closest and drifting off again (a legged robot cannot hold a few cm)
+            if dist <= tol or (self.closest <= 2.0 * tol and dist > self.closest + float(c.get('center_drift_m', 0.04))):
                 self.ctx.stop()
                 self.set_phase('align')
                 return None
+            if self.in_phase_s() > float(c.get('center_timeout_s', 30.0)):
+                # never climb from off-centre: give up before AI mode is on (back to the mode before)
+                return self._finish(f'could not reach the tile centre ({dist:.2f} m off)')
             v = max(float(c.get('center_min_speed_mps', 0.05)),
                     min(float(c.get('center_speed_mps', 0.15)), float(c.get('center_gain', 1.0)) * dist))
             # no omni motion: turn towards the centre, then drive there with vx and wz only (the way a Nav2 goal is driven)
@@ -1620,19 +2086,29 @@ class StairsMode(CurtainMode):
                 self.ctx.drive(v * math.cos(bearing), wz)
             return None
         err = self._yaw_error(pose)
+        if self.phase == 'still':
+            # FIX 1: zero /cmd_vel every tick until the robot has really stopped turning (IMU gyro), THEN Enter AI.
+            # The bags of 25 Nov: Enter AI went out mid-turn and the robot kept turning ~40 deg in AI mode.
+            self.ctx.drive(0.0, 0.0)
+            tol = math.radians(float(c.get('align_tol_deg', 5.0)) + float(c.get('still_drift_deg', 2.0)))
+            if abs(err) > tol:
+                self.set_phase('align')                  # it coasted off while stopping: square up again
+                return None
+            imu = self._imu()
+            calm = imu is None or abs(imu[2]) < float(c.get('still_gyro_rad_s', 0.05))
+            if self.in_phase_s() >= float(c.get('still_s', 1.5)) and calm:
+                # FIX 3: the heading to hold on the stairs, in the IMU's own frame (the map pose freezes from here)
+                self.imu_yaw_ref = None if imu is None else imu[1] + err
+                self._ai(True)
+                self.set_phase('ai_on')
+            elif self.in_phase_s() > float(c.get('still_timeout_s', 6.0)):
+                return self._finish('could not stand still before AI mode')
+            return None
         if self.phase == 'align':
             if abs(err) <= math.radians(float(c.get('align_tol_deg', 5.0))):
                 self.ctx.stop()
-                if c.get('climber', False):
-                    if c.get('ai_before_climber', False):
-                        self._ai(True)                           # the climber's alignment + walk in AI mode (pose is stale from here)
-                        self.climbed = False                     # not climbing yet: set once stair_climber reports an AI state
-                        self.set_phase('climber_ai')
-                        return None
-                    self._start_climber()
-                    return None
-                self._ai(True)
-                self.set_phase('ai_on')
+                self._predict_beyond()                   # squared up: only now predict the tile beyond the stairs
+                self.set_phase('still')                  # FIX 1: stand still first, Enter AI only then
                 return None
             if self.in_phase_s() > float(c.get('align_timeout_s', 15.0)):
                 return self._finish(f'could not square up to it ({math.degrees(err):+.0f} deg off)')
@@ -1661,12 +2137,148 @@ class StairsMode(CurtainMode):
             self._drive_map(pose, v * nx - lat * ny, v * ny + lat * nx, wz)
         return None
 
+    # ---- FIX 3 / 4: the crossing in AI mode from the IMU (pitch + yaw), never from the frozen map pose
+    def _imu(self):
+        """(nose_up_deg, yaw_rad, gyro_z_rad_s) from /imu/data, or None (no IMU in this context, or stale)."""
+        f = getattr(self.ctx, 'imu', None)
+        r = f() if f is not None else None
+        if r is None or r[3] > float(self.cfg.get('imu_max_age_s', 0.5)):
+            return None
+        pitch, yaw, gz, _ = r
+        return float(self.cfg.get('nose_up_sign', -1.0)) * math.degrees(pitch), yaw, gz
+
+    def _held(self, cond, key, hold_s):
+        """True once `cond` has been true for hold_s without a break."""
+        now = self.ctx.now()
+        if not cond:
+            self.xs.pop('held_' + key, None)
+            return False
+        return now - self.xs.setdefault('held_' + key, now) >= hold_s
+
+    def _cross_imu(self):
+        """to_stairs (walk at it until the nose tilts) -> on_stairs (up; nose-down = going down) -> level again -> clear
+        (a little further) -> AI mode off. Heading held on the IMU yaw. AI mode goes off only on level ground."""
+        c = self.cfg
+        nose, yaw, _ = self._imu()
+        now, xs = self.ctx.now(), self.xs
+        level = abs(nose) < float(c.get('level_deg', 4.0))
+        if self.in_phase_s() > float(c.get('cross_timeout_s', 60.0)) and (level or self.in_phase_s() > 2.0 * float(
+                c.get('cross_timeout_s', 60.0))):
+            # 'clear': it went up, (down) and is level again beyond the stairs: the crossing is done, only the short walk
+            # on has not finished. Bag stairs-rebasing_25_11_114524: timed out 0.1 s into that walk, counted as a
+            # failure, so odom was never rebased and the robot thought it was still on the start tile.
+            self._climb_over(f'timed out in {xs["phase"]} (nose {nose:+.0f} deg)'
+                             + (': over the staircase' if xs['phase'] == 'clear' else ''),
+                             through=xs['phase'] == 'clear')
+            return None
+        if xs['phase'] == 'to_stairs':
+            if self._held(abs(nose) > float(c.get('climb_start_deg', 8.0)), 'tilt', 0.3):
+                xs.update(phase='on_stairs', t=now)
+                self.ctx.log('info', f'Stairs: on the stairs (nose {nose:+.0f} deg).')
+            elif now - xs['t'] > float(c.get('reach_s', 10.0)):
+                self._climb_over('no climb tilt: never reached the stairs')     # still on flat ground: AI off is safe
+                return None
+        elif xs['phase'] == 'on_stairs':
+            if self._held(nose < -float(c.get('descend_deg', 12.0)), 'down', 0.3) and not xs['down']:
+                xs['down'] = True
+                self.ctx.log('info', f'Stairs: going down (nose {nose:+.0f} deg).')
+            if xs['down']:
+                done = self._held(nose > -float(c.get('level_deg', 4.0)), 'lvl', float(c.get('flat_after_down_s', 1.0)))
+            else:            # never nose-down: only a long level spell, late enough
+                done = (self._held(level, 'flat', float(c.get('flat_any_s', 3.0)))
+                        and now - xs['t'] >= float(c.get('min_cross_s', 12.0)))
+            if done:
+                xs.update(phase='clear', t=now)
+                self.ctx.log('info', 'Stairs: level again after the stairs.')
+        elif xs['phase'] == 'clear' and now - xs['t'] >= float(c.get('clear_s', 2.0)):
+            self._climb_over('over the staircase (level again)', through=True)
+            return None
+        nlog = xs.setdefault('nlog', [])
+        nlog.append((now, nose))
+        del nlog[:-400]
+        speed = float(c.get('speed_mps', 0.20))
+        if xs['phase'] in ('on_stairs', 'clear') and nose < float(c.get('level_deg', 4.0)):
+            # level or going down (never while climbing: the risers ahead are in the scan band): a wall beyond the stairs.
+            # Bag fullrun_25_11_183742: down the stairs, a wall ~0.5 m past the last step; level -> clear walked on at
+            # 0.34 m/s for 2 s into it (the scan already showed the nose 2 cm off it), AI off pressed against the wall.
+            r = self._wall_gap()
+            if r is not None:
+                gap, capture_nose = r
+                stop, slow = float(c.get('wall_stop_m', 0.15)), float(c.get('wall_slow_m', 0.60))
+                # stop only on a scan TAKEN level: nose down, the floor below the steps is in the scan band ahead
+                if gap <= stop and level and abs(capture_nose) <= float(c.get('wall_capture_level_deg', 8.0)):
+                    self._climb_over(f'over the staircase (wall {max(gap, 0.0):.2f} m ahead)', through=True)
+                    return None
+                if gap < slow:                         # nose still down: creep off the last step, then stop when level
+                    creep = float(c.get('wall_creep_mps', 0.10))
+                    speed = max(min(creep, speed), min(speed, speed * (gap - stop) / max(slow - stop, 1e-3)))
+        ref = getattr(self, 'imu_yaw_ref', None)
+        e = 0.0 if ref is None else math.atan2(math.sin(ref - yaw), math.cos(ref - yaw))
+        lim = float(c.get('max_wz', 0.25))
+        self._drive_logged(speed, max(-lim, min(lim, float(c.get('heading_gain', 1.0)) * e)))
+        return None
+
+    def _drive_logged(self, vx, wz):
+        """ctx.drive, remembering (t, vx): _wall_gap works out how far the robot walked since a scan was taken."""
+        self.ctx.drive(vx, wz)
+        log = self.xs.setdefault('vlog', [])
+        log.append((self.ctx.now(), float(vx)))
+        del log[:-200]
+
+    def _walked_since(self, t0):
+        """Distance walked (commanded vx integrated) since time t0 (ctx.now() clock)."""
+        log, now, d = self.xs.get('vlog', []), self.ctx.now(), 0.0
+        for i, (t, v) in enumerate(log):
+            t_end = log[i + 1][0] if i + 1 < len(log) else now
+            lo = max(t, t0)
+            if t_end > lo:
+                d += v * (t_end - lo)
+        return d
+
+    def _wall_gap(self):
+        """Gap (m) between the nose and the nearest scan return in the body's corridor ahead, as it is NOW: the scan is
+        ~1 s old when it arrives (bag fullrun_25_11_183742) and the robot walked on since, so that walk is taken off.
+        Closer than the scan's range_min the wall drops out of the scan (inf): an empty corridor right after a gap of
+        ~0 counts as touching. Returns (gap_m, nose_deg when the scan was taken), or None (no scan: the check is off)."""
+        f = getattr(self.ctx, 'front_gap', None)
+        r = f(float(self.cfg.get('wall_half_width_m', 0.20)), float(self.cfg.get('wall_nose_m', 0.305))) \
+            if f is not None else None
+        if r is None or r[1] > float(self.cfg.get('wall_scan_max_age_s', 2.5)):
+            return None
+        raw, age = r
+        now = self.ctx.now()
+        taken = now - age
+        if raw is None:
+            touch = self.xs.get('wall_touch')
+            if touch is not None and now - touch[0] < float(self.cfg.get('wall_touch_hold_s', 3.0)):
+                return 0.0, touch[1]
+            return None
+        capture_nose = self._nose_at(taken)
+        if raw < float(self.cfg.get('wall_touch_m', 0.08)):
+            self.xs['wall_touch'] = (now, capture_nose)
+        return raw - self._walked_since(taken), capture_nose
+
+    def _nose_at(self, t):
+        """IMU nose angle (deg) logged by the crossing closest to time t (the oldest one if t is before the log)."""
+        log = self.xs.get('nlog') or [(t, 0.0)]
+        for tt, n in reversed(log):
+            if tt <= t:
+                return n
+        return log[0][1]
+
+    def _release_odom(self):
+        """odom_tf_bridge holds odom->base_link after AI mode until a rebase arrives (so slam_toolbox never matches a scan
+        from beyond the stairs at the pre-climb pose). No rebase on this path: rebase to where the pose says the robot
+        is, which only lets go of the hold."""
+        pose = self.ctx.pose()
+        if pose is not None and self.cfg.get('rebase_odom', True):
+            self.ctx.rebase_odom(pose[0], pose[1], pose[2])
+
     def exit(self, next_mode, reason):
         self.ctx.stop()
-        was_climbing = getattr(self, 'climber_on', False) and getattr(self, 'climber_ai', False)
-        self._stop_climber()                             # left while stair_climber had it: disable it
-        if self.ai_on or was_climbing:                   # left mid-climb (operator command, shutdown): AI mode off
+        if self.ai_on:                                   # left mid-climb (operator command, shutdown): AI mode off
             self._ai(False)
+            self._release_odom()
 
 
 # ----------------------------------------------------------------------------------------- roller
@@ -2031,6 +2643,8 @@ class BacktrackingMode(Mode):
 
     def targets(self):
         out = [self.cfg.get('next_mode', 'exploring'), self.cfg.get('scan_mode', 'scanning')]
+        if self.cfg.get('stairs_mode', 'stairs') in self.machine.modes:
+            out.append(self.cfg.get('stairs_mode', 'stairs'))
         if self.cfg.get('curtain_mode', 'curtain') in self.machine.modes:
             out.append(self.cfg.get('curtain_mode', 'curtain'))
         if self.cfg.get('roller_mode', 'roller') in self.machine.modes:
@@ -2232,6 +2846,24 @@ class BacktrackingMode(Mode):
             return self._next_hop()
         self.set_phase(phase)
 
+    def _to_stairs(self, label):
+        """At the split tile in front of a forced staircase (ExploringMode.stairs_backtrack): start the stairs mode
+        from here. The split is dropped either way (the stairs mode goes for a staircase once)."""
+        tiles = self.ctx.tiles
+        tiles.drop_split(self.split)
+        mode = self.cfg.get('stairs_mode', 'stairs')
+        crossing = SC.stair_crossing(tiles.grid, self.split, tiles.stairs,
+                                     skip=self.machine.stairs_tried | tiles.stairs_crossed,
+                                     min_facing=float(self.cfg.get('stair_min_facing', 0.5)))
+        if mode not in self.machine.modes or crossing is None:
+            return self._abort(f'cannot climb the staircase on tile {label} from split tile {self._label()}')
+        self.ctx.log('info', f'Backtracking: at split tile {self._label()} in front of the staircase {label}: '
+                             f'starting the stairs mode.')
+        self.ctx.event('backtracked', split=self._label(), tile=label, stairs=True)
+        self.stairs_crossing = crossing
+        self.set_phase('to_stairs_mode')
+        return None
+
     def _option_via(self, option):
         """Split tile -> untravelled option: the straight line between their centres."""
         return [self.split, tuple(int(v) for v in option['tile'].split(','))]
@@ -2241,6 +2873,9 @@ class BacktrackingMode(Mode):
         tiles = self.ctx.tiles
         entry = next((s for s in tiles.splits if s['tile'] == self.split), None)
         remaining = tiles.split_remaining(entry, include_unreachable=True) if entry else []
+        stairs = [lab for lab in remaining if tuple(int(v) for v in lab.split(',')) in tiles.stairs]
+        if stairs:
+            return self._to_stairs(stairs[0])
         restored = [lab for lab in remaining if lab in tiles.unreachable]
         for lab in restored:                       # given up on from elsewhere: try again from the split tile
             tiles.unreachable.pop(lab, None)
@@ -2279,6 +2914,10 @@ class BacktrackingMode(Mode):
             return self._cross()
         if self.phase == 'through_curtain':
             return self._through_deferred_curtain()
+        if self.phase == 'to_stairs_mode':
+            crossing, self.stairs_crossing = self.stairs_crossing, None
+            return self.go(c.get('stairs_mode', 'stairs'),
+                           f'backtracked to tile {self._label()} in front of the staircase', crossing=crossing)
         if self.phase == 'align':
             pose = self.ctx.pose()
             err = A.wrap(self.align_yaw - pose[2]) if pose is not None and len(pose) >= 3 else 0.0
@@ -2373,7 +3012,7 @@ class BacktrackingMode(Mode):
 # ----------------------------------------------------------------------------------------- recovery
 @register_mode('recovery')
 class RecoveryMode(Mode):
-    """Stuck: move to the nearest tile centre. Phases: clearing -> driving (candidate by candidate) -> next mode.
+    """Stuck: move to the centre of the nearest previously explored tile (one the robot has stood on). Phases: clearing -> driving (candidate by candidate) -> next mode.
 
     Each candidate is driven to with `traversal` (default recovery_mppi: Nav2 with the holonomic RecoveryMPPI controller,
     vx / vy / wz). When that fails, `fallback_traversal` (default omni: straight linear x / y velocity, heading held, no
@@ -2442,15 +3081,15 @@ class RecoveryMode(Mode):
             if self.return_to:
                 # the tile the robot was just in, and only that one (min_distance 0: standing on it already is fine)
                 found = self.ctx.tiles.recovery_targets(
-                    pose[:2], statuses=('visited', 'to_visit'), limit=50, min_distance_m=0.0,
+                    pose[:2], limit=50, min_distance_m=0.0,
                     min_clearance_m=float(self.cfg.get('min_clearance_m', 0.25)), exclude=self.exclude)
                 self.candidates = [c for c in found if c['tile'] == self.return_to]
                 self.ctx.event('recovery', candidates=[c['tile'] for c in self.candidates], exclude=self.exclude,
                                return_to=self.return_to)
                 return self._next_candidate()
+            # always previously explored tiles (the robot stood on them), nearest first
             self.candidates = self.ctx.tiles.recovery_targets(
-                pose[:2], statuses=tuple(self.cfg.get('tile_statuses', ['visited', 'to_visit'])),
-                limit=int(self.cfg.get('candidates', 3)), min_distance_m=float(self.cfg.get('min_distance_m', 0.25)),
+                pose[:2], limit=int(self.cfg.get('candidates', 3)), min_distance_m=float(self.cfg.get('min_distance_m', 0.25)),
                 min_clearance_m=float(self.cfg.get('min_clearance_m', 0.25)), exclude=self.exclude,
                 adjacent_only=bool(self.cfg.get('adjacent_only', True)))
             self.ctx.event('recovery', candidates=[c['tile'] for c in self.candidates], exclude=self.exclude)
@@ -2462,6 +3101,16 @@ class RecoveryMode(Mode):
                 return self._leave(self.cfg.get('fail_mode', 'scanning'), 'traversal not available')
             return None
         if self.phase == 'driving':
+            if self._target_became_scene():
+                # the candidate passed the scene test when it was picked, but the scan on the way finished it (bag
+                # reporter3_25_11_180333: 1,-1 at free/known 0.88 when picked, 0.84 < scene_max_free 5 s later, the omni
+                # fallback drove on into it and, walked on, it never became a scene tile). Never recover INTO a scene
+                # tile: stop, no fallback onto it, next candidate. The scene mode looks at it from a neighbour later.
+                self.traversal.cancel()
+                label = self.target['tile']
+                self.ctx.log('warn', f'Recovery target tile {label} turned out to be a scene tile: not entering it.')
+                self.ctx.event('target_dropped', label=label, why='scene tile', mode='recovery')
+                return self._next_candidate()
             res = self.traversal.poll()
             if not res.done:
                 if self.in_phase_s() > float(self.cfg.get('attempt_timeout_s', 45.0)):
@@ -2476,6 +3125,12 @@ class RecoveryMode(Mode):
             self.ctx.log('warn', f'Recovery to tile {self.target["tile"]} ({self.profile}) failed: {res.reason}.')
             return self._fallback_or_next(res.reason)
         return None
+
+    def _target_became_scene(self) -> bool:
+        tiles = self.ctx.tiles
+        if self.target is None or not tiles.skip_scene:
+            return False
+        return tiles.is_scene(tuple(int(v) for v in self.target['tile'].split(',')))
 
     def _fallback_or_next(self, why):
         """The main traversal failed: the omni x / y fallback tries the same tile centre, then the next candidate."""
@@ -2519,15 +3174,133 @@ class RecoveryMode(Mode):
         if self.then_mode:                        # on to the scene mode whatever happened: it centres on the tile it stands on
             return self.go(self.then_mode, reason, **self.then_kwargs)
         if mode == self.machine.complete_mode or not self.ctx.tiles.unexplored():
-            end = self.machine.check_end()
-            if end:
-                return self.go(self.machine.complete_mode, end)
+            end = self.machine.end_hop()
+            if end is not None:
+                return end
         return self.go(mode, reason)
 
     def exit(self, next_mode, reason):
         if self.phase == 'driving' and self.traversal is not None:
             self.traversal.cancel()
         self.target, self.traversal = None, None
+        self.ctx.set_target(None, None, None)
+
+
+# ----------------------------------------------------------------------------------------- ending
+@register_mode('ending')
+class EndingMode(Mode):
+    """The end condition ending_tile found the ending tile: drive to its centre (`traversal`, then `fallback_traversal`
+    straight to the same centre when that fails or stops off-centre), then the end condition is checked and the mission
+    completes. Not reached: rescan (fail_mode) and exploring hands over here again; after give_up_after failed visits
+    (0 = never) the mission completes anyway, saying so."""
+
+    def __init__(self, name, machine, cfg):
+        super().__init__(name, machine, cfg)
+        self.tile, self.traversal, self.profile = None, None, None
+
+    def targets(self):
+        return [self.machine.complete_mode, self.cfg.get('fail_mode', 'scanning')]
+
+    @property
+    def is_driving(self):
+        return self.phase == 'driving'
+
+    @property
+    def target_label(self):
+        return T.tile_label(self.tile) if self.tile is not None else None
+
+    def enter(self, reason, tile=None, **kw):
+        self.tile = tuple(tile) if tile is not None else None
+        self.traversal, self.profile = None, None
+        if self.tile is None or not self.ctx.tiles.ready:
+            self.set_phase('no_tile')
+            return
+        if self.cfg.get('clear_costmaps', False):
+            self.ctx.clear_costmaps()
+        self._drive(self.cfg.get('traversal', 'direct'))
+
+    def _goal(self):
+        return list(self.ctx.tiles.grid.center(self.tile))
+
+    def _drive(self, profile):
+        self.profile = profile
+        try:
+            self.traversal = self.ctx.traversal(profile)
+        except KeyError as exc:
+            self.ctx.log('error', str(exc))
+            return self._fail('bad traversal profile')
+        if not self.traversal.available():
+            self.ctx.log('warn', f'Ending traversal {profile!r} not available yet (Nav2 down?): waiting.')
+            self.set_phase('wait_traversal')
+            return None
+        pose = self.ctx.pose() or [0.0, 0.0, 0.0]
+        gx, gy = self._goal()
+        yaw = A.snap_to_axis(math.atan2(gy - pose[1], gx - pose[0]), self.ctx.tiles.grid.yaw)
+        self.ctx.log('info', f'Ending: driving to the centre of ending tile {self.target_label} with {profile}.')
+        if not self.traversal.start([gx, gy], yaw, None):
+            return self._fallback_or_fail('could not start')
+        self.ctx.set_target(self.target_label, [gx, gy], None)
+        self.set_phase('driving')
+        return None
+
+    def tick(self):
+        if self.phase == 'no_tile':
+            return self.go(self.cfg.get('fail_mode', 'scanning'), 'no ending tile to drive to')
+        if self.phase == 'wait_traversal':
+            if self.traversal.available():
+                return self._drive(self.profile)
+            if self.in_phase_s() > float(self.cfg.get('attempt_timeout_s', 60.0)):
+                return self._fail('traversal not available')
+            return None
+        if self.phase == 'driving':
+            res = self.traversal.poll()
+            if not res.done:
+                if self.in_phase_s() > float(self.cfg.get('attempt_timeout_s', 60.0)):
+                    self.traversal.cancel()
+                    return self._fallback_or_fail('timed out')
+                return None
+            if res.state == SUCCEEDED:
+                # Nav2 stops within its goal tolerance (0.3-0.4 m): off by more than centre_tolerance_m, the straight
+                # fallback (omni) finishes the move to the centre
+                fallback = self.cfg.get('fallback_traversal', 'omni')
+                pose = self.ctx.pose()
+                if pose is not None and fallback and self.profile != fallback:
+                    gx, gy = self._goal()
+                    off = math.hypot(pose[0] - gx, pose[1] - gy)
+                    if off > float(self.cfg.get('centre_tolerance_m', 0.10)):
+                        self.ctx.log('info', f'Ending tile {self.target_label}: {off:.2f} m off centre, centring with '
+                                             f'{fallback}.')
+                        return self._drive(fallback)
+                self.machine.ending_driven = self.tile
+                end = self.machine.check_end()
+                if end:
+                    self.machine.ending_failures = 0
+                    self.ctx.event('ending_reached', tile=self.target_label, traversal=self.profile)
+                    return self.go(self.machine.complete_mode, end)
+                return self._fallback_or_fail('stopped off the centre')
+            return self._fallback_or_fail(res.reason)
+        return None
+
+    def _fallback_or_fail(self, why):
+        self.ctx.log('warn', f'Ending tile {self.target_label} ({self.profile}): {why}.')
+        fallback = self.cfg.get('fallback_traversal', 'omni')
+        if fallback and self.profile != fallback:
+            return self._drive(fallback)
+        return self._fail(why)
+
+    def _fail(self, why):
+        self.machine.ending_failures += 1
+        give_up = int(self.cfg.get('give_up_after', 0))
+        self.ctx.event('ending_failed', tile=self.target_label, why=why, attempt=self.machine.ending_failures)
+        if give_up and self.machine.ending_failures >= give_up:
+            return self.go(self.machine.complete_mode, f'ending tile {self.target_label}: centre not reached after '
+                                                       f'{self.machine.ending_failures} attempt(s) ({why})')
+        return self.go(self.cfg.get('fail_mode', 'scanning'), f'ending tile {self.target_label} not reached ({why})')
+
+    def exit(self, next_mode, reason):
+        if self.phase == 'driving' and self.traversal is not None:
+            self.traversal.cancel()
+        self.traversal = None
         self.ctx.set_target(None, None, None)
 
 

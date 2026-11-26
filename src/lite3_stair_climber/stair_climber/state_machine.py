@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from .robot_state import checkable, describe, target_reached
+
 from .stair_detector import StairObservation
 
 
@@ -125,7 +127,14 @@ class SMParams:
     top_gait_code: int = 0             # for crossing the top (0 = keep the stair gait)
     descend_gait_code: int = 0         # for going down (0 = keep the current gait)
     require_gait_codes: bool = True    # refuse to climb if codes are 0
-    gait_switch_wait: float = 2.0
+    gait_switch_wait: float = 2.0       # no robot state (/robot_state): just wait this long after a gait code
+    # With /robot_state (0x0901 report): after each gait / Enter AI / Exit AI code, wait until the robot reports the
+    # matching state; not there gait_retry_s after the last send -> send the code again (Move Mode first for gaits).
+    verify_gait: bool = True
+    gait_retry_s: float = 3.0           # (at least gait_switch_wait / ai_switch_wait)
+    gait_max_attempts: int = 0          # give up (ABORT) after this many sends; 0 = keep trying
+    gait_confirm_s: float = 0.3         # the target state must hold this long
+    ai_policy_state: int = 0            # robot_policy_state expected after Enter AI (0 = AI basic); -1 = any
 
     # --- motion on the stairs ----------------------------------------------
     heading_kp: float = 1.2
@@ -209,6 +218,7 @@ class Observation:
     vlm: Optional[bool] = None     # VLM verdict since the last request
     wall_dist: float = math.inf    # lidar: nearest tall obstacle straight ahead (inf = none / unknown)
     ai_on_already: bool = False    # the mission already put the robot in AI mode (/stair_climber/ai_on): no Enter AI / Move Mode
+    robot_state: Optional[tuple] = None   # (basic, gait, policy, motion) from /robot_state; None = none / stale
 
 
 @dataclass
@@ -271,6 +281,8 @@ class _Ctx:
     last_seq: int = -1
     last_seen_t: float = 0.0
     vlm_rejections: int = 0
+    gait_attempts: int = 0
+    gait_sent_t: float = 0.0
     progress_hist: list = field(default_factory=list)
 
 
@@ -283,6 +295,7 @@ class StairStateMachine:
         self.h_pitch = _Hold()
         self.h_level = _Hold()
         self.h_align = _Hold()
+        self.h_gait = _Hold()
         self.abort_reason = ''
         self.transitions = []          # [(t, from, to, why)] for logging/tests
         self._forced_abort = None
@@ -328,6 +341,7 @@ class StairStateMachine:
         self.h_pitch.reset()
         self.h_level.reset()
         self.h_align.reset()
+        self.h_gait.reset()
 
     def _entered(self) -> bool:
         """True exactly once, on the first tick of a state."""
@@ -412,10 +426,29 @@ class StairStateMachine:
                     self._go(State.ABORT, o, self.abort_reason)
                     return self._stop(self.abort_reason)
                 return self._stop(f'{label} gait code not set, skipping')
+            self.c.gait_attempts, self.c.gait_sent_t = 1, o.t
             return Command(self.state, gait_code=code, raw_code=raw,
                            note=f'switch to {label} gait')
-        if self._elapsed(o) >= wait:
-            self._go(next_state, o, f'{label} gait settled')
+        if p.verify_gait and code and checkable(code) and o.robot_state is not None:
+            now = describe(o.robot_state)
+            ok = target_reached(code, o.robot_state, p.ai_policy_state)
+            if self.h_gait.update(ok, o.t, p.gait_confirm_s):
+                self._go(next_state, o, f'{label} gait confirmed: robot state {now} '
+                                        f'(attempt {self.c.gait_attempts})')
+                return self._stop(f'{label} gait confirmed')
+            if not ok and o.t - self.c.gait_sent_t >= max(p.gait_retry_s, wait):
+                if p.gait_max_attempts and self.c.gait_attempts >= p.gait_max_attempts:
+                    return self._abort(o, f'{label} gait not reached after {self.c.gait_attempts} attempts '
+                                          f'(robot state {now})')
+                self.c.gait_attempts += 1
+                self.c.gait_sent_t = o.t
+                return Command(self.state, gait_code=code, raw_code=raw,
+                               note=f'{label} gait not reached (robot state {now}): '
+                                    f'sending again, attempt {self.c.gait_attempts}')
+            return self._stop(f'waiting for {label} gait, robot state {now}')
+        if self._elapsed(o) >= wait:   # no robot state: the old timed wait
+            self._go(next_state, o, f'{label} gait settled'
+                                    + (' (no robot state, not checked)' if p.verify_gait and checkable(code) else ''))
         return self._stop('waiting for gait change')
 
     # --------------------------------------------------------------- states

@@ -13,6 +13,7 @@ PROMPT_FILES = {
     'describe_view': 'environment_report.txt',
     'describe_tile': 'tile_report.txt',
     'describe_scene': 'scene_report.txt',
+    'describe_scene_refs': 'scene_reference_report.txt',   # describe_scene with reference photos (collage)
     'place_initial_tile': 'tile_init.txt',
     'choose_tile': 'tile_choice.txt',
     'choose_frontier': 'frontier_choice.txt',
@@ -38,10 +39,20 @@ SCENE_TYPES = ('clothes_shop', 'fitness_centre', 'kitchen', 'market', 'workshop'
 _SCENE = re.compile(r'^\W*(' + '|'.join(SCENE_TYPES + ('traversable',)) + r')\b', re.IGNORECASE)
 
 
-def parse_scene_type(scene_description: str) -> Optional[str]:
-    """One of SCENE_TYPES, 'traversable' (none of them fits), or None if the answer does not start with either."""
-    m = _SCENE.match(str(scene_description).strip())
-    return m.group(1).lower() if m else None
+def parse_scene_type(scene_description: str, allowed: Optional[Sequence[str]] = None) -> Optional[str]:
+    """One of `allowed` (default SCENE_TYPES), 'traversable' (none of them fits), or None if the answer does not
+    start with either. A scene type outside `allowed` is also None."""
+    if allowed is None:
+        m = _SCENE.match(str(scene_description).strip())
+        return m.group(1).lower() if m else None
+    m = re.match(r'^\W*([A-Za-z][A-Za-z0-9_]*)', str(scene_description).strip())
+    word = m.group(1).lower() if m else ''
+    return word if word == 'traversable' or word in {a.lower() for a in allowed} else None
+
+
+def build_scene_reference_prompt(template: str, scene_types: Sequence[str]) -> str:
+    return Template(template).safe_substitute(scene_types=', '.join(scene_types),
+                                              scene_words=', '.join(list(scene_types) + ['traversable']))
 
 
 _CHOICE = re.compile(r'\b(?:frontier|target)\s*(?:#|no\.?|number)?\s*(\d+)', re.IGNORECASE)

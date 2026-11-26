@@ -47,7 +47,7 @@ controller_server:
       iteration_count: 1
       motion_model: "Omni"               # DiffDrive | Omni | Ackermann: Omni = holonomic, vy is sampled too
       # speed limits (m/s, rad/s); the velocity smoother below uses the same
-      vx_max: 0.4
+      vx_max: 0.2
       vx_min: -0.2
       vy_max: 0.3
       wz_max: 0.3                        # low on purpose: lateral moves keep the heading (was 0.6)
@@ -314,11 +314,15 @@ behavior_server:
     # Seconds of rotation simulated ahead by Spin (was 2.0: the 0.61 m body swept against the walls of a 1 m
     # tile and "Collision Ahead - Exiting Spin" aborted the scan turns).
     simulate_ahead_time: 0.4
-    # The scan turn at every stop: fast, because the lidar adds points much faster than the AI answers. A full 360 deg
-    # takes about 6.3 s at 1.0 rad/s (10.5 s at the old 0.6). Lower these if the dog turns unsteadily.
-    max_rotational_vel: 1.0
-    min_rotational_vel: 0.3
-    rotational_acc_lim: 2.5
+    # Spin = the scan turns (the opening sweep and the turn at every stop). Slow: at 1.0 rad/s the robot turned ~50 deg/s,
+    # 7-14 deg between scans, and slam_toolbox's map->odom swung by up to 20 deg during the opening sweep (bag
+    # stairs-rebasing_25_11_113541; leg odom / IMU / gyro agreed throughout), so the walls round the start tile were
+    # mapped several times at different angles and the tile grid could not line up with them. At 0.35 rad/s (20 deg/s)
+    # it is ~3-5 deg between scans. The opening sweep (480 deg in all) takes ~25 s instead of ~9 s; the longest single
+    # turn (240 deg) ~12 s, inside the scanning mode's time_allowance_s (20 s).
+    max_rotational_vel: 0.35
+    min_rotational_vel: 0.15
+    rotational_acc_lim: 1.0
 
 waypoint_follower:
   ros__parameters:

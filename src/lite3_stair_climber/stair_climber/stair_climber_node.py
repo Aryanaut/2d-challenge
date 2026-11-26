@@ -7,6 +7,8 @@ Subscribes
     /leg_odom2                  nav_msgs/Odometry         x, y, z, yaw
     /stair_climber/enable       std_msgs/Bool             start / stop the behaviour
     /stair_climber/vlm_result   std_msgs/Bool             optional camera confirmation
+    /robot_state                std_msgs/Int32MultiArray  [basic, gait, policy, motion] (robot_state_bridge):
+                                                          every gait / AI switch is sent again until the robot reports it
 
 Publishes
     /cmd_vel                    geometry_msgs/Twist       only while active
@@ -36,7 +38,7 @@ from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy,
 from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, PointCloud2
-from std_msgs.msg import Bool, Empty, String
+from std_msgs.msg import Bool, Empty, Int32MultiArray, String
 from visualization_msgs.msg import Marker
 
 try:
@@ -126,6 +128,8 @@ class StairClimberNode(Node):
         self.declare_parameter('move_mode_after_ai_enter', False)
         # Enter/Exit AI: the manual test that walked sent each code ONCE.
         self.declare_parameter('ai_cmd_repeats', 1)
+        self.declare_parameter('robot_state_topic', '/robot_state')
+        self.declare_parameter('robot_state_max_age', 0.5)   # older = no robot state: timed gait waits
 
         # ---------------- algorithm parameters ----------------
         self.det_params = self._declare_dataclass(DetectorParams, 'detector.')
@@ -147,6 +151,7 @@ class StairClimberNode(Node):
         self.move_mode_on_enable = gp('move_mode_on_enable').value
         self.move_mode_after_ai = gp('move_mode_after_ai_enter').value
         self.ai_repeats = gp('ai_cmd_repeats').value
+        self.robot_state_max_age = gp('robot_state_max_age').value
         xyz = gp('lidar_xyz').value
         rpy = [math.radians(a) for a in gp('lidar_rpy_deg').value]
         self.fallback_R = rpy_to_matrix(*rpy)
@@ -168,6 +173,8 @@ class StairClimberNode(Node):
         self.was_active = False
         self.last_state = None
         self.pending_gait = []   # [(code, remaining_repeats)]
+        self.robot_state = None  # (basic, gait, policy, motion)
+        self.robot_state_t = None
 
         # ---------------- ROS interfaces ----------------
         self.create_subscription(PointCloud2, gp('cloud_topic').value, self.on_cloud,
@@ -177,6 +184,7 @@ class StairClimberNode(Node):
         self.create_subscription(Odometry, gp('odom_topic').value, self.on_odom, 10)
         self.create_subscription(Bool, '/stair_climber/enable', self.on_enable, 10)
         self.create_subscription(Bool, '/stair_climber/vlm_result', self.on_vlm, 10)
+        self.create_subscription(Int32MultiArray, gp('robot_state_topic').value, self.on_robot_state, 10)
         # the mission manager puts the robot in AI mode itself (before enabling this node) and says so here (latched):
         # no Move Mode on enable (it would leave AI mode) and no second Enter AI
         self.ai_on_already = False
@@ -252,6 +260,11 @@ class StairClimberNode(Node):
     def on_ai_on(self, msg: Bool):
         self.ai_on_already = bool(msg.data)
         self.get_logger().info(f'AI mode already on (set by the mission): {self.ai_on_already}')
+
+    def on_robot_state(self, msg: Int32MultiArray):
+        if len(msg.data) >= 4:
+            self.robot_state = tuple(int(v) for v in msg.data[:4])
+            self.robot_state_t = self.now()
 
     def on_vlm(self, msg: Bool):
         self.vlm = msg.data
@@ -340,6 +353,8 @@ class StairClimberNode(Node):
             stair=fresh_stair, stair_seq=self.stair_seq, vlm=self.vlm,
             wall_dist=self.wall_dist if (t - self.wall_t) <= self.det_max_age else math.inf,
             ai_on_already=self.ai_on_already,
+            robot_state=self.robot_state if (self.robot_state_t is not None
+                                             and t - self.robot_state_t <= self.robot_state_max_age) else None,
         )
         cmd = self.sm.update(obs)
 
@@ -362,6 +377,8 @@ class StairClimberNode(Node):
         if entered_search and self.move_mode_on_enable and self.move_mode_code and not self.ai_on_already:
             self.pending_gait.append([self.move_mode_code, self.gait_repeats])
         if cmd.gait_code:
+            if 'attempt' in cmd.note:
+                self.get_logger().warn(cmd.note)
             if self.move_mode_code and not cmd.raw_code:
                 self.pending_gait.append([self.move_mode_code, self.gait_repeats])
             ai = cmd.gait_code in (self.sm_params.ai_enter_code, self.sm_params.ai_exit_code)
@@ -396,6 +413,7 @@ class StairClimberNode(Node):
                 'yaw_deg': round(math.degrees(s.edge_yaw), 1),
                 'center_y': round(s.center_y, 3), 'width': round(s.width, 2),
                 'close': s.close},
+            'robot_state': obs.robot_state,
         })))
 
     def _send_gait(self):

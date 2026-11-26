@@ -1,0 +1,11 @@
+usb_cameras:
+  ros__parameters:
+    # names/devices are set by launch arguments (left_device, right_device).
+    width: 640            # 640x480 x2 cameras fits one USB 2.0 bus with MJPG
+    height: 480
+    fps: 15.0
+    mjpg: true            # keep true for two cameras on one bus
+    hfov_deg: 70.0        # webcam horizontal field of view (C270 ~60, C920 ~70-78)
+    publish_raw: true     # for nodes on this computer (qr_scanner)
+    publish_compressed: true   # for rqt_image_view over Remote Desktop / other computers
+    jpeg_quality: 80

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -23,13 +23,35 @@ class TileTracker:
     def __init__(self, size_m: float = 1.0, reach_radius_m: float = 0.30, max_failures: int = 2,
                  on_reached: Optional[Callable[[tuple, list, str], None]] = None,
                  on_enter: Optional[Callable[[tuple], None]] = None, min_known: float = 0.5,
-                 scene_min_known: float = 0.85, scene_max_free: float = 0.80):
+                 scene_min_known: float = 0.85, scene_max_free: float = 0.80, scene_margin_m: float = 0.10):
+        self._init_args = (size_m, reach_radius_m, max_failures, on_reached, on_enter, min_known, scene_min_known,
+                           scene_max_free, scene_margin_m)
         self.size_m = size_m
+        # new map after the stairs: {'grid': TileGrid, 'stairs_crossed': set} of the previous map, expressed in the new map's
+        # frame. establish() then keeps that grid (same tile numbering and coordinates) instead of placing a new one.
+        self.carry: Optional[dict] = None
+        # align_on_entry: every time the robot enters a tile, the grid is nudged so that tile's edges lie on the walls around
+        # it (tiles.align_to_walls), within these limits
+        self.align_on_entry, self.align_radius_m, self.align_max_shift_m = True, 2.0, 0.15
+        self.align_max_rot_deg, self.align_min_quality = 6.0, 1.5
+        self.on_aligned: Optional[Callable[[dict], None]] = None
         self.min_known = min_known           # share of a tile the lidar must have scanned before it becomes a tile
         self.scene_min_known, self.scene_max_free = scene_min_known, scene_max_free   # scene tile: scanned >= this, free/scanned < this
+        self.scene_margin_m = scene_margin_m           # ... free/scanned measured this far inside the tile edges (walls)
         self.reach_radius_m = reach_radius_m
+        # True while SLAM's map->odom has just jumped (mission manager, slam_jump_*): the robot pose may be metres off,
+        # so no tile counts as reached from it ('centre reached' / 'goal reached')
+        self.reach_hold = False
         self.wall_release_fraction = 0.25               # a virtual wall stays until less than this share of its edge is mapped wall
         self._wall_keys = set()                         # edges that are virtual walls now (hysteresis)
+        # a mapped wall this far across a tile edge (either side) still counts as on the edge (T.edge_coverage band_m):
+        # the grid is often a few cm off the maze walls in tiles the robot has not entered (no align_on_entry there)
+        self.wall_band_m = 0.15
+        # a shared edge at least this much mapped wall (within wall_band_m) is a wall between two tiles: no scene mode
+        # across it (_open_between); clutter against the edge of a scene tile reads less
+        self.scene_wall_fraction = 0.8
+        # tiles with a virtual wall on all four edges (map walls, not curtains): never a target ('blocked'), see update()
+        self.enclosed: set = set()
         self.skip_scene = False                        # True: scene tiles are never driven to (the scene mode looks at them)
         self.described: set = set()                    # scene tiles already looked at: explored without being entered
         self.traversable: set = set()                  # tiles the AI said are no scene (a wall seen from the side): ordinary tiles
@@ -51,6 +73,7 @@ class TileTracker:
         # {'tile': (i, j), 'options': [labels]}; the "last split" is the most recent one that still has an option
         # the robot has not travelled to (see last_split()). Backtracking returns to it.
         self.splits: List[dict] = []
+        self._split_seen: set = set()                  # tiles already seen as to_visit (note_discovered_splits)
         # tile edges the robot has walked through a curtain on: {edge key: (tile, neighbour)}. The lidar sees a curtain as
         # a wall, so these edges become virtual walls; with open_curtains (backtracking) they are left out.
         self.curtain_edges: Dict[tuple, tuple] = {}
@@ -63,8 +86,30 @@ class TileTracker:
         # one in AI mode; afterwards its four edges are virtual walls so it is never entered again (stairs_crossed).
         self.stair_points = np.zeros((0, 4))
         self.stair_min_points = 4                      # confirmed stair cells a tile needs to be a staircase tile
+        # a TRAVERSABLE tile is never a staircase (the steps stand at its edge): walked on, called traversable by the AI,
+        # or scanned open floor (known >= stair_floor_min_known and interior free/known >= stair_floor_min_free)
+        self.stair_floor_min_known = 0.90
+        self.stair_floor_min_free = 0.95
+        self.stair_shift_max_m = 0.35                  # stair cells this close inside a traversable tile's edge move across it
         self.stairs: Dict[tuple, dict] = {}            # staircase tile -> {'points': n, 'ascent': (ux, uy)}
         self.stairs_crossed: set = set()
+        # the exploring mode gave up on what is left on this side (nothing reachable after retries / recovery): the
+        # staircase may be taken although tiles are still unexplored (stairs_ready)
+        self.stairs_forced = False
+        # (axis, sign): the grid axis (0 = i, 1 = j) closest to the robot's original heading in the start tile and the
+        # direction along it (+1 / -1), set by establish, carried over to a new map. 'Behind' / 'beyond' the staircase
+        # are measured along it (is_closed).
+        self.forward: Optional[Tuple[int, int]] = None
+        # reference tiles beyond staircases (stairs_core.beyond_reference): off-grid squares turned to the staircase, one
+        # tile past it along the steps. The stairs mode makes one per climb and rebases odom to it afterwards ('used').
+        self.stair_refs: List[dict] = []
+        # the mission's initial tile: closed (never a target, never routed through, walled off for Nav2) once the robot
+        # has left it. Carried over to a new map (same tile numbering).
+        self.initial_tile: Optional[tuple] = None
+        self.initial_left = False
+        # tile edges that are no curtain: (tile, side) the curtain mode gave up on (timed out / blocked walking through).
+        # Curtain spots on them, or on any edge of the initial tile, are ignored (not_curtain_mask).
+        self.not_curtains: List[tuple] = []
         # roller tiles (roller mode): a roller lying across the middle of a tile, which the lidar maps as a wall (the tile
         # looks like half a tile). Status 'roller' (never a Nav2 target, never unexplored) until the roller mode has
         # crossed it in the h-step gait: then it is marked explored (on the trail) and stays out of Nav2 routes.
@@ -82,6 +127,24 @@ class TileTracker:
         self.version = 0                               # bumped on every re-classification (for publishers)
 
     # ------------------------------------------------------------------ setup
+    # settings the mission manager sets from mission.yaml after construction: they survive reset()
+    _CONFIG = ('align_on_entry', 'align_radius_m', 'align_max_shift_m', 'align_max_rot_deg', 'align_min_quality',
+               'on_aligned', 'skip_scene', 'wall_release_fraction', 'wall_band_m', 'scene_wall_fraction',
+               'stair_min_points', 'stair_floor_min_known',
+               'stair_floor_min_free', 'stair_shift_max_m', 'roller_min_points', 'roller_min_lidar',
+               'roller_depth_only_points', 'roller_edge_margin_m')
+
+    def reset(self):
+        """Forget the grid, the map and everything learned on it (tiles, trail, failures, staircases, rollers, curtains,
+        splits ...): a NEW map is starting (stairs mode, new_map). The configured settings stay. The next establish()
+        places a new grid; version moves on so publishers redraw."""
+        keep = {k: getattr(self, k) for k in self._CONFIG}
+        version = self.version
+        self.__init__(*self._init_args)
+        for k, v in keep.items():
+            setattr(self, k, v)
+        self.version = version + 1
+
     @property
     def ready(self) -> bool:
         return self.grid is not None
@@ -97,7 +160,12 @@ class TileTracker:
     def establish(self, pose, how: str = 'wall-snapped'):
         """Anchor the tile grid at the robot (snapped to nearby walls when the map allows) and visit the start tile."""
         cand = None
-        if self._map is not None:
+        carry, self.carry = self.carry, None
+        if carry is not None:
+            cand = {'id': 'inherited', 'kind': 'grid of the previous map (same tile numbering)', 'sides': {},
+                    'grid': carry['grid']}
+            how = 'inherited from the previous map'
+        elif self._map is not None:
             cands = T.initial_candidates(self._map[0], self._map[1], pose, size=self.size_m)
             cand = cands[0] if cands else None
         if cand is None:
@@ -107,6 +175,11 @@ class TileTracker:
             how = 'no map'
         self.grid = cand['grid']
         self.terrain = {}
+        yaw0 = pose[2] if len(pose) > 2 else 0.0
+        if carry is not None and carry.get('forward'):
+            self.forward = tuple(carry['forward'])
+        else:
+            self.forward = forward_axis(yaw0 - self.grid.yaw)
         self.init_info = {'placement': cand['id'], 'kind': cand['kind'], 'how': how,
                           'grid': self.grid.as_dict(), 'map_sides': cand.get('sides', {})}
         start = self.grid.tile_of(pose[0], pose[1])
@@ -117,14 +190,22 @@ class TileTracker:
         back = max(normals, key=lambda sd: math.cos(self.grid.yaw + normals[sd] - (yaw + math.pi)))
         self.start_wall = self.grid.edge(start, back)
         self.start_wall_side = back
+        self.start_tile = tuple(start)
+        if carry is not None:
+            self.initial_tile, self.initial_left = carry.get('initial_tile'), bool(carry.get('initial_left'))
+        else:
+            self.initial_tile, self.initial_left = tuple(start), False
         self.trail, self.trail_log = [], []
         self._wall_keys = set()
         self.described = set()
         self.traversable = set()
         self.splits = []
+        self._split_seen = set()
         self.curtain_edges = {}
         self.deferred_curtains = {}
-        self.stairs, self.stairs_crossed = {}, set()
+        self.not_curtains = [tuple(e) for e in carry.get('not_curtains', ())] if carry else []
+        self.stairs, self.stairs_crossed = {}, set(carry['stairs_crossed'] if carry else ())
+        self.stair_refs = []
         self.rollers, self.rollers_crossed, self.roller_crossings = {}, set(), {}
         self._visit(start, pose, 'start')
         self.set_stair_points(self.stair_points)       # stairs seen before the grid existed
@@ -143,10 +224,14 @@ class TileTracker:
         self.version += 1
         grid, info = self._map
         self.tiles = T.classify_tiles(grid, info, self.grid, list(self.trail) + sorted(self.described), min_known=self.min_known,
-                                      scene_min_known=self.scene_min_known, scene_max_free=self.scene_max_free)
+                                      scene_min_known=self.scene_min_known, scene_max_free=self.scene_max_free,
+                                      scene_margin_m=self.scene_margin_m)
         for tile, t in self.tiles.items():
             if t['status'] != 'unknown':
-                t['sides'] = T.tile_sides(grid, info, self.grid, tile)
+                shares = T.side_shares(grid, info, self.grid, tile)
+                t['sides'] = T.sides_from_shares(shares)
+                t['wall_share'] = {s: occ for s, (occ, _) in shares.items()}
+                t['free_share'] = {s: free for s, (_, free) in shares.items()}
             if t['status'] == 'to_visit' and T.tile_label(tile) in self.unreachable:
                 t['status'] = 'unreachable'
         for tile in self.traversable:
@@ -155,6 +240,8 @@ class TileTracker:
                 t['scene'] = False
                 if t['status'] == 'blocked':                   # the AI looked: it can be walked on
                     t['status'] = 'to_visit'
+        if len(self.stair_points) and self._assign_stairs():   # the map grew: the staircase may only now be found
+            self.version += 1
         for tile in set(self.stairs) | self.stairs_crossed:
             t = self.tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False,
                                              'scene': False})
@@ -163,12 +250,44 @@ class TileTracker:
             t = self.tiles.setdefault(tile, {'free': 0.0, 'occupied': 0.0, 'known': 0.0, 'unmapped_edge': False,
                                              'scene': False})
             t['status'], t['scene'] = 'roller', False
+        for tile, t in self.tiles.items():
+            if self.is_closed(tile):
+                t['status'], t['scene'] = 'closed', False      # beyond the staircase (before the climb) / behind it (after), the initial tile once left
+        self._mark_enclosed()
         self._flag_last_split()
         return True
 
+    def _enclosed_tiles(self) -> set:
+        """Tiles whose four edges are all virtual walls from the map (_wall_keys, as last computed by virtual_walls).
+        Curtain edges do not count (the robot walks through them). Tiles the robot stands on or has walked on are never
+        enclosed (it got in, so a side is open), nor staircase / roller tiles (their own modes cross them)."""
+        if self.grid is None or not self._wall_keys:
+            return set()
+        walls = self._wall_keys - set(self.curtain_edges)
+        on_trail = set(self.trail)
+        out = set()
+        for tile in self.tiles:
+            if (tile in on_trail or tile == self.current or tile in self.stairs or tile in self.stairs_crossed
+                    or tile in self.rollers):
+                continue
+            if all(T.edge_key(self.grid, tile, side) in walls for side in T.SIDES):
+                out.add(tile)
+        return out
+
+    def _mark_enclosed(self):
+        """A tile walled in on all four sides is not traversable: status 'blocked' (never a target, not unexplored)
+        and flagged 'enclosed'. A scene tile already looked at keeps 'visited' (it is explored) but is flagged too."""
+        self.enclosed = self._enclosed_tiles()
+        for tile in self.enclosed:
+            t = self.tiles[tile]
+            t['enclosed'] = True
+            if t['status'] in ('to_visit', 'unreachable', 'unknown'):
+                t['status'] = 'blocked'
+
     def virtual_walls(self, min_fraction: float = 0.5, start_wall: bool = True):
         """World segments to block in the planner: the wall behind the start pose, every tile edge more than
-        min_fraction covered by mapped wall, and all four edges of every staircase the robot has climbed over. With
+        min_fraction covered by mapped wall, all four edges of every staircase the robot has climbed over and the
+        staircase column's edge towards the closed side (beyond it before the climb, behind it after: is_closed). With
         open_curtains (backtracking) edges with a curtain are left out."""
         segs = []
         skip = set(self.curtain_edges) if self.open_curtains else set()
@@ -177,17 +296,24 @@ class TileTracker:
         if self.grid is not None:
             for tile in sorted(self.stairs_crossed):
                 segs += [self.grid.edge(tile, side) for side in 'NESW']
+            segs += self._closed_wall()                 # the closed side of the staircase (is_closed)
+            if self._initial_closed() and self.current != self.initial_tile:
+                segs += [self.grid.edge(self.initial_tile, side) for side in 'NESW']
         if self.grid is not None and self._map is not None:
             # Hysteresis: an edge becomes a wall above min_fraction but is only released below wall_release_fraction. Next
             # to a wall the SLAM map thins it (the robot is close, grazing rays), so the share hovers around min_fraction
             # and the wall would flicker or vanish while it is still there.
             keys = set()
-            for key, seg, share in T.edge_coverage(self._map[0], self._map[1], self.grid, self.tiles):
+            for key, seg, share in T.edge_coverage(self._map[0], self._map[1], self.grid, self.tiles,
+                                                   band_m=self.wall_band_m):
                 if share > min_fraction or (key in self._wall_keys and share >= self.wall_release_fraction):
                     keys.add(key)
                     if key not in skip:
                         segs.append(seg)
-            self._wall_keys = keys
+            if keys != self._wall_keys:
+                self._wall_keys = keys
+                if self._enclosed_tiles() != self.enclosed:
+                    self.invalidate()                   # re-classify: a tile became / stopped being enclosed
         return segs
 
     def begin_terrain_look(self, label: str):
@@ -255,11 +381,64 @@ class TileTracker:
             return self._visit(tuple(tile), pose, 'goal reached')
         return None
 
+    def relocate(self, assumed, pose, source: str = 'relocated') -> Optional[tuple]:
+        """The robot was put on tile `assumed` (e.g. after an AI-mode climb, from dead reckoning) but a scan has since
+        placed it by SLAM: the tile its pose is really in. A different tile: `assumed` is taken off the trail (when the
+        robot never stood on it before) and the real one visited instead. Returns the real tile."""
+        if self.grid is None or pose is None:
+            return None
+        assumed = tuple(assumed)
+        actual = tuple(self.grid.tile_of(pose[0], pose[1]))
+        if actual == assumed:
+            return actual
+        if self.trail.count(assumed) == 1:                   # the robot never stood on it otherwise
+            i = self.trail.index(assumed)
+            del self.trail[i], self.trail_log[i]
+        self._visit(actual, pose, source)
+        self.invalidate()
+        return actual
+
+    def align_grid(self, tile, pose) -> Optional[dict]:
+        """Nudge the grid so the edges of `tile` (the robot's) lie on the detected walls (tiles.align_to_walls). Everything
+        keyed on world edges (virtual walls, curtain edges, the start wall) is re-derived. Returns the correction or None."""
+        if not self.align_on_entry or self.grid is None or self._map is None or pose is None:
+            return None
+        res = T.align_to_walls(self._map[0], self._map[1], self.grid, tuple(tile), pose[:2], radius_m=self.align_radius_m,
+                               max_shift_m=self.align_max_shift_m, max_rot_deg=self.align_max_rot_deg,
+                               min_quality=self.align_min_quality)
+        if res is None:
+            return None
+        old, new = self.grid, res['grid']
+        curtains = list(self.curtain_edges.values())
+        self.grid.origin_x, self.grid.origin_y, self.grid.yaw = new.origin_x, new.origin_y, new.yaw   # in place: others hold it
+        self.curtain_edges = {}
+        for a, b in curtains:
+            self.add_curtain_edge(a, b)
+        st = getattr(self, 'start_tile', None)
+        if st is not None and getattr(self, 'start_wall_side', None):
+            self.start_wall = self.grid.edge(st, self.start_wall_side)
+        self._wall_keys = set()
+        if self.init_info is not None:
+            self.init_info['grid'] = self.grid.as_dict()
+        self.invalidate()
+        self.version += 1
+        res = dict(res, tile=list(tile))
+        res.pop('grid')
+        if self.on_aligned is not None:
+            self.on_aligned(res)
+        return res
+
     def _visit(self, tile, pose, source):
         if self.trail and self.trail[-1] == tile:
             return None
+        if self.reach_hold and source in ('centre reached', 'goal reached'):
+            return None
+        if source in ('centre reached', 'goal reached'):
+            self.align_grid(tile, pose)
         new = tile not in set(self.trail)
         self.trail.append(tile)
+        if self.initial_tile is not None and tuple(tile) != self.initial_tile:
+            self.initial_left = True                    # the initial tile is closed from now on (is_closed)
         self.trail_log.append({'tile': list(tile), 'time': dt.datetime.now().isoformat(timespec='seconds'),
                                'pose': list(pose) if pose else None, 'source': source})
         self.invalidate()
@@ -337,14 +516,24 @@ class TileTracker:
         return tile in self.described or self._scene_flag(tile)
 
     def _open_between(self, a, b) -> bool:
-        """Tiles a and b share a side the robot can look across: not a wall panel. Stricter than the tile sides
-        (wall_fraction 0.4): clutter standing against the edge of a scene tile does not make the side a wall, only an
-        edge that is (almost) entirely occupied does."""
+        """Tiles a and b share a side the robot can look across: no wall between them. The edge counts as a wall when at
+        least scene_wall_fraction of it has mapped wall within wall_band_m across it (either side, as for the virtual
+        walls): the grid is often a few cm off the maze walls in tiles the robot has not entered, and a wall 12 cm off the
+        edge reads ~0.1 on the edge line itself, so a scene behind it was looked at through the wall. Stricter than the
+        virtual walls (> 0.5): clutter standing against the edge of a scene tile (half the edge: ~0.6) is no wall."""
         side = T.side_towards(tuple(a), tuple(b))
         if side is None or self.grid is None or self._map is None:
             return False
         grid, info = self._map
-        return T.tile_sides(grid, info, self.grid, tuple(a), wall_fraction=0.9).get(side) != 'wall'
+        key = T.edge_key(self.grid, tuple(a), side)
+        for k, _, share in T.edge_coverage(grid, info, self.grid, {tuple(a): {'status': 'edge'}}, band_m=self.wall_band_m):
+            if k == key:
+                return share < self.scene_wall_fraction
+        return True
+
+    def wall_between(self, a, b) -> bool:
+        """Neighbouring tiles a and b are separated by a wall (see _open_between). Not neighbours: False."""
+        return T.side_towards(tuple(a), tuple(b)) is not None and not self._open_between(a, b)
 
     def scene_neighbours(self, tile) -> List[tuple]:
         """Scene tiles not looked at yet that share an open side with `tile` (call with the current tile): the only
@@ -371,6 +560,8 @@ class TileTracker:
         tile = tuple(int(v) for v in label.split(','))
         if tile in self.stairs or tile in self.stairs_crossed:
             return False                                # Nav2 never drives onto stairs: the stairs mode climbs them
+        if self.is_closed(tile):
+            return False                                # the closed side of the staircase
         if tile in self.rollers:
             return False                                # nor to a roller tile: the roller mode crosses it (h-step gait)
         return not (self.skip_scene and self.is_scene(tile))
@@ -391,22 +582,34 @@ class TileTracker:
             raw = [t for t in raw if t['tile'] not in self.unreachable]
         return [t for t in raw if self._drivable(t['tile'])]
 
-    def recovery_targets(self, robot_xy, *, statuses=('visited', 'to_visit'), limit: int = 5,
-                         min_distance_m: float = 0.25, min_clearance_m: float = 0.25,
-                         exclude: Sequence[str] = (), adjacent_only: bool = False) -> List[dict]:
+    def recovery_targets(self, robot_xy, *, limit: int = 5, min_distance_m: float = 0.25,
+                         min_clearance_m: float = 0.25, exclude: Sequence[str] = (),
+                         adjacent_only: bool = False) -> List[dict]:
+        """Recovery setpoints: centres of previously explored tiles (ones the robot has stood on), nearest first.
+
+        Never a tile that was only seen (to_visit) or only described from a neighbour: the robot is stuck, so it only
+        goes back to ground it has already walked. adjacent_only prefers the robot's own tile and the tiles sharing a
+        side with it; when none of those is an explored, clear tile, the nearest explored tiles anywhere are offered
+        so recovery always has a setpoint."""
         if self.grid is None or self._map is None:
             return []
         grid, info = self._map
-        excl = [tuple(int(v) for v in lab.split(',')) for lab in exclude]
+        explored = set(self.trail)
         roller_tiles = set(self.rollers) | set(self.rollers_crossed)
-        out = T.nearest_tile_centres(grid, info, self.grid, self.tiles, robot_xy, statuses=statuses,
-                                     limit=limit + len(roller_tiles),
-                                     min_distance_m=min_distance_m, min_clearance_m=min_clearance_m,
-                                     exclude=excl,
-                                     adjacent_to=self.grid.tile_of(robot_xy[0], robot_xy[1]) if adjacent_only else None)
+        excl = {tuple(int(v) for v in lab.split(',')) for lab in exclude}
         # never recover onto a roller tile (crossed or not): the lidar maps it as a wall, only the roller mode crosses it
-        return [t for t in out if self._drivable(t['tile'])
-                and tuple(int(v) for v in t['tile'].split(',')) not in roller_tiles][:limit]
+        excl |= roller_tiles | {t for t in self.tiles if t not in explored}
+        here = self.grid.tile_of(robot_xy[0], robot_xy[1])
+
+        def find(adjacent_to):
+            out = T.nearest_tile_centres(grid, info, self.grid, self.tiles, robot_xy, statuses=('visited',),
+                                         limit=limit + len(excl), min_distance_m=min_distance_m,
+                                         min_clearance_m=min_clearance_m, exclude=sorted(excl),
+                                         adjacent_to=adjacent_to)
+            return [t for t in out if self._drivable(t['tile'])][:limit]
+
+        found = find(here) if adjacent_only else []
+        return found or find(None)
 
     def tile_of(self, x, y):
         return self.grid.tile_of(x, y) if self.grid is not None else None
@@ -437,42 +640,172 @@ class TileTracker:
         self.deferred_curtains[tuple(neighbour)] = {'tile': tuple(tile), 'side': side}
         self.version += 1
 
+    def reject_curtain(self, tile, side: str) -> None:
+        """The curtain on `side` of `tile` was no curtain (the curtain mode timed out / was blocked walking through it):
+        never a curtain again, and no longer a deferred one."""
+        tile = tuple(tile)
+        if (tile, side) not in self.not_curtains:
+            self.not_curtains.append((tile, side))
+        di, dj = {'E': (1, 0), 'W': (-1, 0), 'N': (0, 1), 'S': (0, -1)}[side]
+        self.deferred_curtains.pop((tile[0] + di, tile[1] + dj), None)
+        self.version += 1
+
+    def not_curtain_edges(self) -> List[tuple]:
+        """(tile, side) of every edge that cannot hold a curtain: the rejected ones and the four edges of the initial
+        tile."""
+        out = list(self.not_curtains)
+        if self.initial_tile is not None:
+            out += [(tuple(self.initial_tile), side) for side in 'NESW']
+        return out
+
+    def is_not_curtain(self, tile, side: str) -> bool:
+        """True when this edge (from either tile) cannot hold a curtain (not_curtain_edges)."""
+        if self.grid is None:
+            return False
+        key = T.edge_key(self.grid, tuple(tile), side)
+        return any(T.edge_key(self.grid, t, sd) == key for t, sd in self.not_curtain_edges())
+
+    def not_curtain_mask(self, points, tol_m: float = 0.15) -> np.ndarray:
+        """Rows of `points` (x, y, ...) that may be curtain spots: False within tol_m of an edge that cannot hold a
+        curtain (not_curtain_edges)."""
+        pts = np.asarray(points, float)
+        keep = np.ones(len(pts), bool)
+        if self.grid is None or not len(pts):
+            return keep
+        xy = pts[:, :2]
+        for tile, side in self.not_curtain_edges():
+            (x0, y0), (x1, y1) = self.grid.edge(tile, side)
+            a, d = np.array([x0, y0]), np.array([x1 - x0, y1 - y0])
+            t = np.clip(((xy - a) @ d) / max(float(d @ d), 1e-9), 0.0, 1.0)
+            keep &= np.hypot(*(xy - (a + t[:, None] * d)).T) > tol_m
+        return keep
+
     def curtains_left(self) -> List[str]:
         """Tiles behind a deferred curtain that have not been visited yet (still to explore)."""
         visited = set(self.trail)
-        return [T.tile_label(t) for t in sorted(self.deferred_curtains) if t not in visited]
+        return [T.tile_label(t) for t in sorted(self.deferred_curtains)
+                if t not in visited and not self.is_closed(t) and not self.is_closed(self.deferred_curtains[t]['tile'])]
 
     def deferred_curtain(self, label: str) -> Optional[dict]:
         """The deferred curtain in front of tile `label` (not visited yet), or None."""
         tile = tuple(int(v) for v in label.split(','))
-        return self.deferred_curtains.get(tile) if tile not in set(self.trail) else None
+        if tile in set(self.trail) or self.is_closed(tile):
+            return None
+        info = self.deferred_curtains.get(tile)
+        return None if info is None or self.is_closed(info['tile']) else info
 
     # ------------------------------------------------------------- staircases
     def set_stair_points(self, points) -> bool:
-        """Confirmed stair cells (Nx4 x, y, ux, uy, from the stair detector) -> staircase tiles. A tile the robot has
+        """Confirmed stair cells (Nx4 x, y, ux, uy, from the stair detector) -> the staircase tile. The maze has ONE
+        staircase: the first tile found is locked as it for the rest of the run (see _assign_stairs). A tile the robot has
         already stood on is floor, never a staircase (stair cells can spill over the edge of the tile in front of the
-        steps); a staircase tile stays one. True if the set of staircase tiles changed."""
+        steps). True if the staircase tile changed (i.e. it was just found)."""
         self.stair_points = np.asarray(points, float).reshape(-1, 4)
         if self.grid is None:
             return False
-        found = SC.stair_tiles(self.grid, self.stair_points, self.stair_min_points)
-        floor = set(self.trail) - set(self.stairs) - self.stairs_crossed
-        stairs = {t: d for t, d in found.items() if t not in floor}
-        for t, d in self.stairs.items():
-            stairs.setdefault(t, d)                     # once a staircase, always a staircase
-        changed = set(stairs) != set(self.stairs)
-        self.stairs = stairs
+        changed = self._assign_stairs()
         if changed:
             self.invalidate()
             self.version += 1
         return changed
 
+    def _assign_stairs(self) -> bool:
+        """self.stairs from the stair cells. There is only one staircase in the maze: once a tile is a staircase it stays
+        THE staircase for the rest of the run (more stair cells, a scan that later looks like open floor or cells spilling
+        into other tiles change nothing), and once it has been climbed (stairs_crossed, carried over to a new map) no
+        other tile becomes one. The first time, the tile with the most stair cells wins. True if it was just found."""
+        if self.stairs_crossed:
+            return False                                # climbed already: the one staircase is known and walled off
+        if self.stairs:
+            tile = next(iter(self.stairs))              # locked: only its stair data is refreshed
+            found = SC.stair_tiles(self.grid, self.stair_points, self.stair_min_points)
+            if tile in found:
+                self.stairs[tile] = found[tile]
+            return False
+        scanned_open = self.scanned_open_tiles()
+        floor = set(self.trail) | self.traversable | scanned_open
+        found = {t: d for t, d in SC.stair_tiles(self.grid, self.stair_points, self.stair_min_points, traversable=floor,
+                                                 shift_max_m=self.stair_shift_max_m).items() if t not in floor}
+        if not found:
+            return False
+        tile = max(sorted(found), key=lambda t: found[t]['points'])
+        self.stairs = {tile: found[tile]}
+        return True
+
+    def stairs_ready(self) -> bool:
+        """The staircase may be taken only once everything on this side is done: no tile left to visit, no scene tile
+        left to look at, no tile behind a curtain left for later (given-up tiles do not count). stairs_forced: the
+        exploring mode found nothing reachable left on this side, so the rest no longer holds the stairs back."""
+        if self.staircase_tile is None or self.stairs_crossed:
+            return False
+        if self.stairs_forced:
+            return True
+        return (not self.unexplored() and not (self.skip_scene and self.pending_scenes())
+                and not self.curtains_left())
+
+    def scanned_open_tiles(self) -> set:
+        """Tiles the lidar has scanned as open floor (stair_floor_min_known / stair_floor_min_free): no staircase there."""
+        return {tile for tile, t in self.tiles.items()
+                if t.get('known', 0.0) >= self.stair_floor_min_known
+                and t.get('scene_free', 0.0) >= self.stair_floor_min_free}
+
     def mark_stairs_crossed(self, tiles):
-        """The robot climbed over these staircase tiles: wall them off (virtual walls on all four edges)."""
+        """The robot climbed over these staircase tiles: wall them off (virtual walls on all four edges), and close every
+        tile behind it along the robot's original heading (is_closed)."""
         self.stairs_crossed |= set(map(tuple, tiles))
         self.invalidate()
         self.update()
         self.version += 1
+
+    @property
+    def staircase_tile(self) -> Optional[tuple]:
+        """THE staircase (one per maze): the climbed one, else the locked detected one, else None."""
+        if self.stairs_crossed:
+            return min(self.stairs_crossed)
+        return next(iter(self.stairs)) if self.stairs else None
+
+    def is_closed(self, tile) -> bool:
+        """Tiles the robot may not traverse because of the staircase, along the grid axis (i or j) of the robot's
+        original heading in the start tile (forward):
+          before the climb (staircase found, not crossed): every tile BEYOND it (further along forward than it);
+          after the climb: every tile BEHIND it (on the start side) -- no way back over or around the stairs.
+        Tiles level with the staircase (same i, or same j when heading along j) stay open. Nothing is closed before a
+        staircase is found.
+        The initial tile is closed too once the robot has left it (_initial_closed)."""
+        if self._initial_closed() and tuple(tile) == self.initial_tile:
+            return True
+        stair, fwd = self.staircase_tile, self.forward
+        if stair is None or not fwd:
+            return False
+        tile = tuple(tile)
+        if tile == stair:
+            return False                                # the staircase keeps its own status
+        axis, s = fwd
+        d = s * (tile[axis] - stair[axis])
+        return d < 0 if self.stairs_crossed else d > 0
+
+    def _initial_closed(self) -> bool:
+        """The robot has left the initial tile: it is not traversable any more."""
+        return self.initial_tile is not None and self.initial_left
+
+    def _closed_wall(self):
+        """The virtual wall (list of tile-edge segments) between the staircase's row/column (across forward) and the
+        closed side: its edge on the beyond side before the climb, on the behind side after it, across every known tile
+        (+2 either side)."""
+        stair, fwd = self.staircase_tile, self.forward
+        if stair is None or not fwd or self.grid is None:
+            return []
+        axis, s = fwd
+        ahead = ('E' if s > 0 else 'W') if axis == 0 else ('N' if s > 0 else 'S')
+        side = {'E': 'W', 'W': 'E', 'N': 'S', 'S': 'N'}[ahead] if self.stairs_crossed else ahead
+        other = 1 - axis
+        ks = [t[other] for t in self.tiles] + [stair[other]]
+        out = []
+        for k in range(min(ks) - 2, max(ks) + 3):
+            tile = [0, 0]
+            tile[axis], tile[other] = stair[axis], k
+            out.append(self.grid.edge(tuple(tile), side))
+        return out
 
     # ------------------------------------------------------------- rollers
     def set_roller_points(self, points) -> bool:
@@ -526,9 +859,13 @@ class TileTracker:
         for a, b in zip(self.trail, self.trail[1:]):
             if a in self.stairs_crossed or b in self.stairs_crossed or a in self.rollers or b in self.rollers:
                 continue
+            if self.is_closed(a) or self.is_closed(b):
+                continue                                # never through the closed side of the staircase
             links.setdefault(a, set()).add(b)
             links.setdefault(b, set()).add(a)
         for a, b in self.roller_crossings:
+            if self.is_closed(a) or self.is_closed(b):
+                continue
             links.setdefault(a, set()).add(b)
             links.setdefault(b, set()).add(a)
         prev = {start: None}
@@ -560,6 +897,39 @@ class TileTracker:
         self.version += 1
         return old is None or old['options'] != options
 
+    def note_discovered_splits(self) -> List[dict]:
+        """Tiles that became to_visit since the last call and share a side (no wall on it) with a tile the robot visited
+        before (not the current one): that earlier tile becomes a split again, its options all of its untravelled
+        neighbours across an open side, so backtracking can come back for the new tile. Most recently visited last
+        (so the latest of them is the last split). Returns [{'tile', 'options', 'new'}] for the splits that changed."""
+        fresh = {t for t, d in self.tiles.items() if d.get('status') == 'to_visit'} - self._split_seen
+        self._split_seen |= fresh
+        visited = set(self.trail)
+        found: Dict[tuple, List[str]] = {}
+        for tile in sorted(fresh):
+            if not self._drivable(T.tile_label(tile)):
+                continue
+            for side in T.SIDES:
+                prev = T._step(tile, side)
+                if prev in visited and prev != self.current and T._joined(self.tiles, tile, side) \
+                        and not self.is_closed(prev):
+                    found.setdefault(prev, []).append(T.tile_label(tile))
+        last_seen = {t: i for i, t in enumerate(self.trail)}
+        out = []
+        for prev in sorted(found, key=lambda t: last_seen[t]):
+            options = set(found[prev])
+            for side in T.SIDES:
+                b = T._step(prev, side)
+                if self.tiles.get(b, {}).get('status') in ('to_visit', 'unreachable') and T._joined(self.tiles, prev, side) \
+                        and self._drivable(T.tile_label(b)):
+                    options.add(T.tile_label(b))
+            old = next((s for s in self.splits if s['tile'] == prev), None)
+            if old is not None:
+                options |= set(self.split_remaining(old, include_unreachable=True))
+            if self.mark_split(prev, sorted(options)):
+                out.append({'tile': T.tile_label(prev), 'options': sorted(options), 'new': sorted(found[prev])})
+        return out
+
     def split_remaining(self, split: dict, include_unreachable: bool = False) -> List[str]:
         """Options of a split the robot has not travelled to yet (still to_visit, drivable; with include_unreachable
         also the ones given up on)."""
@@ -570,6 +940,8 @@ class TileTracker:
             behind = self.deferred_curtain(label)
             if behind is not None and behind['tile'] == split['tile']:
                 out.append(label)                   # behind a curtain left for later (often unmapped: lidar sees a wall)
+            elif self.stairs_forced and tile in self.stairs and tile not in self.stairs_crossed:
+                out.append(label)                   # the staircase to climb (the stairs mode starts at the split tile)
             elif self.tiles.get(tile, {}).get('status') in ok and self._drivable(label):
                 out.append(label)
         return out
@@ -577,7 +949,8 @@ class TileTracker:
     def last_split(self, exclude=None, include_unreachable: bool = True) -> Optional[dict]:
         """The most recent split tile that still has an untravelled option (exhausted splits are forgotten). Options
         given up on (unreachable) count unless include_unreachable is False."""
-        self.splits = [s for s in self.splits if self.split_remaining(s, include_unreachable=True)]
+        self.splits = [s for s in self.splits
+                       if not self.is_closed(s['tile']) and self.split_remaining(s, include_unreachable=True)]
         for s in reversed(self.splits):
             if not self.split_remaining(s, include_unreachable):
                 continue
@@ -608,6 +981,11 @@ class TileTracker:
                 'staircases': {T.tile_label(t): {'points': d['points'], 'ascent': [round(v, 2) for v in d['ascent']],
                                                  'crossed': t in self.stairs_crossed}
                                for t, d in sorted(self.stairs.items())},
+                'stair_refs': [{'stairs': [T.tile_label(t) for t in r['stairs']],
+                                'centre_xy': [round(v, 3) for v in r['centre_xy']],
+                                'yaw_deg': round(math.degrees(r['yaw']), 1), 'size_m': r['size'],
+                                'grid_tile': T.tile_label(r['grid_tile']), 'used': bool(r.get('used'))}
+                               for r in self.stair_refs],
                 'rollers': {T.tile_label(t): {'points': d['points'], 'lidar': d.get('lidar', 0),
                                               'normal': [round(v, 2) for v in d['normal']],
                                               'crossed': t in self.rollers_crossed}
@@ -616,6 +994,15 @@ class TileTracker:
                                 'remaining': self.split_remaining(top)} if top else None),
                 'tiles': {T.tile_label(k): (dict(v, terrain=self.terrain[T.tile_label(k)])
                                        if T.tile_label(k) in self.terrain else v) for k, v in sorted(self.tiles.items())}}
+
+
+def forward_axis(heading: float) -> Tuple[int, int]:
+    """(axis, sign) of a heading in the grid frame (rad, 0 = +i, pi/2 = +j): the grid axis it is closest to (0 = i,
+    1 = j) and the direction along it (+1 / -1). Exactly diagonal goes to i."""
+    c, s = math.cos(heading), math.sin(heading)
+    if abs(c) >= abs(s):
+        return 0, (1 if c >= 0.0 else -1)
+    return 1, (1 if s >= 0.0 else -1)
 
 
 def distance(a, b) -> float:

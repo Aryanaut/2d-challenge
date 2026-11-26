@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'stair_climber_node = stair_climber.stair_climber_node:main',
             'vlm_stair_checker = stair_climber.vlm_stair_checker:main',
+            'robot_state_bridge = stair_climber.robot_state_bridge:main',
         ],
     },
 )

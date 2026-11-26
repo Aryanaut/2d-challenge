@@ -66,7 +66,9 @@ class LlmClient(Node):
             wall_band_m=float(p('min_wall_clearance_m', 0.35).value),
             min_clearance_m=float(p('target_min_clearance_m', 0.30).value),
             max_upload_w=int(self.max_image_width), max_upload_h=int(self.max_image_height),
-            lidar_context=bool(p('lidar_context', True).value))
+            lidar_context=bool(p('lidar_context', True).value),
+            scene_references_dir=str(p('scene_references_dir', '').value),
+            scene_min_confidence=float(p('scene_min_confidence', 0.0).value))
         overrides = {task: p(f'{task}_prompt_file', '').value for task in P.PROMPT_FILES}
         overrides['describe_view'] = overrides['describe_view'] or p('prompt_file', '').value
         client = PerceptionClient(
@@ -75,6 +77,9 @@ class LlmClient(Node):
             connect_retries=int(p('connect_retries', 3).value), connect_backoff_s=float(p('connect_backoff_s', 2.0).value))
         self.group_set = bool(group_id) and group_id != 'CHANGE_ME'
         self.tools = LlmTools(client, settings, overrides, get_map=self._map_snapshot, get_scan_text=self._scan_text)
+        if self.tools.scene_refs:
+            self.get_logger().info(f'Scene references: {len(self.tools.scene_refs)} photos in {settings.scene_references_dir}; '
+                                   f'describe_scene answers only {", ".join(self.tools.scene_types)} (or traversable)')
 
         self.map = None
         self.scan = None

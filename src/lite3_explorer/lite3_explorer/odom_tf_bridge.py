@@ -12,6 +12,13 @@ held pose (an offset applied to the raw odometry). The mission manager then publ
 be at (the centre of the tile beyond the staircase, in the map frame) on /odom_rebase; the bridge converts it with the
 latest map->odom and moves the odom pose there. slam_toolbox only has to scan-match the small remainder.
 
+hold_until_rebase_s: after AI mode ends the pose stays HELD until that rebase arrives (at most this long, 0 = off). Bag
+fullrun_25_11_183742: released at AI off, the robot (beyond the stairs) shifted a few cm while AI mode wound down, slam_toolbox
+matched those scans at the PRE-climb pose and turned map->odom by up to 14 deg in the 2 s before the rebase, which was
+then converted with that broken map->odom. Held, slam_toolbox sees no motion and integrates nothing until the rebase.
+The rebase also publishes the old pose 1 ms before the new one, so no scan stamped in between gets a pose interpolated
+half-way across the jump.
+
 stamp_mode:
   auto     (default) use the message stamp while it is within max_stamp_offset_s of
            this computer's clock, otherwise stamp with the receive time (and say so)
@@ -74,6 +81,10 @@ class OdomTfBridge(Node):
         # mode ends, a moment AFTER /ai_mode goes false): absorbed into the offset so the published pose stays continuous
         self.max_jump_m = p('max_jump_m', 0.5).value
         self.max_jump_rad = p('max_jump_rad', 1.0).value
+        self.hold_until_rebase_s = p('hold_until_rebase_s', 10.0).value
+        self.ai_on = False
+        self.release_at = None            # AI mode over, still held: waiting for /odom_rebase until this time (s)
+        self.rebased_in_ai = False        # a rebase already came while AI mode was on: no need to wait for another
         self.last_out = None
         # odom pose published = offset * raw leg odometry; frozen: publish `held` instead of tracking the raw pose
         self.offset = (0.0, 0.0, 0.0)
@@ -100,19 +111,39 @@ class OdomTfBridge(Node):
             return self.held
         return se2_mul(self.offset, self.raw) if self.raw is not None else None
 
+    def _now_s(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _release(self, why):
+        """Stop holding: carry on from the held pose (offset * raw_now == held)."""
+        if self.raw is not None and self.held is not None:
+            self.offset = se2_mul(self.held, se2_inv(self.raw))
+        self.frozen, self.held, self.release_at, self.rebased_in_ai = False, None, None, False
+        self.get_logger().info(f'{why}: odom->base_link continues from the held pose.')
+
     def _on_ai_mode(self, msg):
         on = bool(msg.data) and self.hold_in_ai_mode
+        self.ai_on = on
         if on and not self.frozen:
             self.held = self._output_pose()
             self.frozen = self.held is not None
+            self.release_at, self.rebased_in_ai = None, False
             if self.frozen:
                 self.get_logger().info('AI mode on: holding odom->base_link at the last pose until it ends.')
-        elif not on and self.frozen:
-            # carry on from the held pose: offset * raw_now == held
-            if self.raw is not None:
-                self.offset = se2_mul(self.held, se2_inv(self.raw))
-            self.frozen, self.held = False, None
-            self.get_logger().info('AI mode off: odom->base_link continues from the held pose.')
+        elif on and self.release_at is not None:
+            self.release_at = None                     # AI mode on again before the rebase: keep holding
+        elif not on and self.frozen and self.release_at is None:
+            if self.hold_until_rebase_s > 0.0 and not self.rebased_in_ai:
+                self.release_at = self._now_s() + self.hold_until_rebase_s
+                self.get_logger().info(f'AI mode off: still holding odom->base_link until /odom_rebase (at most '
+                                       f'{self.hold_until_rebase_s:.0f} s).')
+            else:
+                self._release('AI mode off')
+
+    def _check_release(self):
+        if self.release_at is not None and self.frozen and self._now_s() >= self.release_at:
+            self.get_logger().warn('No /odom_rebase after AI mode: releasing the held pose anyway.')
+            self._release('Hold timed out')
 
     def _on_rebase(self, msg: PoseStamped):
         """Move the robot to the pose in msg (map frame, or odom frame when msg.header.frame_id == odom_frame)."""
@@ -126,17 +157,27 @@ class OdomTfBridge(Node):
                 return
             t = mo.transform
             want = se2_mul(se2_inv((t.translation.x, t.translation.y, yaw_of(t.rotation))), want)
-        if self.frozen:
+        before = self.last_out
+        if self.frozen and self.ai_on:
             self.held = want                                  # applied when AI mode ends
+            self.rebased_in_ai = True
         elif self.raw is not None:
             self.offset = se2_mul(want, se2_inv(self.raw))
+            if self.frozen:                                   # held after AI mode, waiting for exactly this
+                self.frozen, self.held, self.release_at, self.rebased_in_ai = False, None, None, False
         else:
             self.get_logger().error('Rebase ignored: no leg odometry yet.')
             return
         self.get_logger().info(f'Rebased {self.odom_frame}->{self.base_frame} to ({want[0]:.2f}, {want[1]:.2f}, '
                                f'{math.degrees(want[2]):.0f} deg).')
         if self.last_msg is not None and not self.frozen:
-            self._publish(self.last_msg)
+            stamp = self._stamp_for(self.last_msg)
+            if before is not None:
+                # the old pose again 1 ms earlier: TF interpolates between samples, and the scans arrive ~1 s late, so a
+                # scan stamped between the last old sample and the jump would get a pose half-way across it
+                ns = stamp.sec * 1_000_000_000 + stamp.nanosec - 1_000_000
+                self._publish(self.last_msg, pose=before, stamp=Time(nanoseconds=ns).to_msg())
+            self._publish(self.last_msg, stamp=stamp)
 
     def _decide(self):
         self.detect_timer.cancel()
@@ -186,12 +227,15 @@ class OdomTfBridge(Node):
                                        'message: absorbed (not motion).')
         self.raw = new
         self.last_msg = msg
+        self._check_release()
         self._publish(msg)
 
-    def _publish(self, msg: Odometry):
-        stamp = self._stamp_for(msg)
-        x, y, yaw = self._output_pose()
-        self.last_out = (x, y, yaw)
+    def _publish(self, msg: Odometry, pose=None, stamp=None):
+        """pose / stamp: publish this pose / stamp instead of the current output (the rebase's 'old pose' sample)."""
+        stamp = stamp if stamp is not None else self._stamp_for(msg)
+        x, y, yaw = pose if pose is not None else self._output_pose()
+        if pose is None:
+            self.last_out = (x, y, yaw)
         q = Quaternion(z=math.sin(0.5 * yaw), w=math.cos(0.5 * yaw))
         # roll / pitch of the raw odometry are dropped when the pose is corrected or held (SE(2) only)
         corrected = self.frozen or self.offset != (0.0, 0.0, 0.0)

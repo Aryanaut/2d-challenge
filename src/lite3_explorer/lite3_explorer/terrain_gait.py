@@ -61,6 +61,7 @@ class TerrainGaitSwitcher:
         self.last_sent_at: Optional[float] = None
         self.armed = False                       # a switch is allowed (see the module docstring)
         self.override: Optional[str] = None      # gait that wins over the terrain (None = the terrain decides)
+        self.frozen = False                      # keep the gait the robot has, whatever happens (recovery mode)
 
     def set_override(self, gait: Optional[str]) -> bool:
         """Force `gait` (None = back to the terrain gait). True when it changed."""
@@ -69,6 +70,15 @@ class TerrainGaitSwitcher:
         if gait == self.override:
             return False
         self.override, self.armed = gait, True
+        return True
+
+    def freeze(self, on: bool) -> bool:
+        """Keep the gait the robot already has (on) / let the terrain, target and override rules switch again (off).
+        Terrain / override changes while frozen are still recorded, but nothing is armed by them: after the freeze the gait
+        changes only at the next new tile or new terrain, never the moment the freeze ends. True when it changed."""
+        if bool(on) == self.frozen:
+            return False
+        self.frozen, self.armed = bool(on), False
         return True
 
     def arm(self):
@@ -103,6 +113,9 @@ class TerrainGaitSwitcher:
 
     def pending_command(self, now: float) -> Optional[GaitCommand]:
         """The command to send now, or None. Call mark_sent() after publishing it."""
+        if self.frozen:
+            self.armed = False                   # whatever armed it meanwhile is dropped (see freeze)
+            return None
         if not self.armed:
             return None
         gait = self.desired_gait(now)

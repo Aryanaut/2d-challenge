@@ -16,7 +16,7 @@
 #
 # Usage:
 #   ./record_backtracking_bag.sh                     record to <repo>/bags/sim/backtracking_<time>
-#   DEPTH=1 ./record_backtracking_bag.sh             also the depth image (curtain detector input; large)
+#   DEPTH=1 ./record_backtracking_bag.sh             also the depth + colour images and camera_info (curtain detector input; large)
 #   CLOUD=1 ./record_backtracking_bag.sh             also the raw lidar point cloud (large)
 #
 # Settings (environment variables):
@@ -46,6 +46,8 @@ DEPTH="${DEPTH:-0}"
 CLOUD="${CLOUD:-0}"
 DEPTH_TOPIC="${DEPTH_TOPIC:-/camera/depth/image_raw}"
 CLOUD_TOPIC="${CLOUD_TOPIC:-/livox/points}"
+COLOUR_TOPIC="${COLOUR_TOPIC:-/camera/color/image_raw/compressed}"
+COLOUR_INFO_TOPIC="${COLOUR_INFO_TOPIC:-/camera/color/camera_info}"
 
 set +u
 # shellcheck disable=SC1090
@@ -71,12 +73,13 @@ TOPICS=(
     /plan /local_plan /received_global_plan
     # Nav2 actions: goal status and feedback (why a goal was aborted shows up in /rosout)
     /navigate_to_pose/_action/status /navigate_to_pose/_action/feedback
+    /navigate_through_poses/_action/status /navigate_through_poses/_action/feedback
     /follow_waypoints/_action/status /follow_waypoints/_action/feedback
     /compute_path_to_pose/_action/status /spin/_action/status
     # robot
     /scan /odom /terrain_kind /terrain_classifier/details /animation_active
 )
-[[ "$DEPTH" == 1 ]] && TOPICS+=("$DEPTH_TOPIC" "${DEPTH_TOPIC%/*}/camera_info")
+[[ "$DEPTH" == 1 ]] && TOPICS+=("$DEPTH_TOPIC" "${DEPTH_TOPIC%/*}/camera_info" "$COLOUR_TOPIC" "$COLOUR_INFO_TOPIC")
 [[ "$CLOUD" == 1 ]] && TOPICS+=("$CLOUD_TOPIC")
 
 # Latched topics: record them transient_local so a bag started after the publisher still gets the last message.

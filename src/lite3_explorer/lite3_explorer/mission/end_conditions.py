@@ -32,6 +32,10 @@ class MissionSnapshot:
     elapsed_s: float = 0.0                       # since the mission started (left idle the first time)
     tiles_ready: bool = True
     map: Optional[tuple] = None                  # (grid, GridInfo) of the SLAM map, for map-based conditions
+    tiles: Optional[dict] = None                 # tile -> classification (status, sides), for tile-layout conditions
+    trail: List[tuple] = field(default_factory=list)        # tiles the robot walked, in order
+    pose: Optional[list] = None                  # [x, y, yaw] of the robot
+    grid: Optional[object] = None                # tiles.TileGrid
 
 
 class EndCondition:
@@ -43,6 +47,13 @@ class EndCondition:
 
     def evaluate(self, snap: MissionSnapshot) -> Tuple[bool, str]:
         raise NotImplementedError
+
+    def goal(self) -> Optional[dict]:
+        """A place the robot must go to before this condition can be met: {'tile', 'mode', 'reason'} or None."""
+        return None
+
+    def reset(self):
+        """A new map (and tile grid) starts."""
 
 
 @register('all_tiles_explored')
@@ -102,6 +113,64 @@ class NoFrontiersLeft(EndCondition):
         return not usable, f'{len(usable)} frontier cluster(s) left'
 
 
+@register('ending_tile')
+class EndingTile(EndCondition):
+    """next_tile trigger (default): the scan from the current tile shows the tile next to it with no walls (the outside
+    of the maze): the CURRENT tile is the ending tile, the robot centres itself there and never leaves the maze.
+    open_tile trigger (safety net): the robot entered a tile with no walls on its edges (triggers: open_tile; optionally hallway: a hallway longer
+    than 3 tiles, min_hallway_tiles): the tile preceding it on the robot's route with exactly 2 walls on its edges is the
+    ENDING tile (tiles.find_ending_tile; preceding: false -> the entered tile itself). "No walls" = no edge with mapped
+    wall along solid_wall_share or more of it (0.4: any edge read as a wall rules the tile out; 0 = every side reads open).
+    The initial tile is never the ending tile. entered_only (default): only tiles
+    the robot stood in count, never ones seen from a distance (the 1.7 m lidar cannot see a far tile's edges).
+    Met once the robot stands at the ending tile's centre (within reach_radius_m). Until then goal() names the tile and
+    the mode (`mode`, default 'ending') that drives there. Once found the ending tile is kept (lock) until a new map."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.found: Optional[dict] = None
+
+    @property
+    def mode(self) -> str:
+        return self.cfg.get('mode', 'ending')
+
+    def reset(self):
+        self.found = None
+
+    def _solid(self):
+        v = float(self.cfg.get('solid_wall_share', 0.4))
+        return v if v > 0 else None
+
+    def evaluate(self, snap):
+        if not snap.tiles_ready or snap.tiles is None or snap.grid is None:
+            return False, 'no tile grid yet'
+        if self.found is None or not self.cfg.get('lock', True):
+            from lite3_explorer import tiles as T
+            self.found = T.find_ending_tile(snap.tiles, snap.trail, min_hallway_tiles=int(self.cfg.get('min_hallway_tiles', 4)),
+                                            triggers=[t for t in self.cfg.get('triggers', ['hallway', 'open_tile']) if t],
+                                            walls=int(self.cfg.get('walls', 2)),
+                                            entered_only=bool(self.cfg.get('entered_only', True)),
+                                            preceding=bool(self.cfg.get('preceding', True)),
+                                            solid_wall_share=self._solid(),
+                                            min_seen_share=float(self.cfg.get('min_seen_share', 0.5)))
+        if self.found is None:
+            return False, 'no hallway / open tile found yet'
+        label = '%d,%d' % self.found['tile']
+        if snap.pose is None:
+            return False, f'ending tile {label} ({self.found["trigger"]}): no pose'
+        cx, cy = snap.grid.center(self.found['tile'])
+        d = ((snap.pose[0] - cx) ** 2 + (snap.pose[1] - cy) ** 2) ** 0.5
+        if d <= float(self.cfg.get('reach_radius_m', 0.30)):
+            return True, f'centre of ending tile {label} reached ({self.found["trigger"]}; {d:.2f} m off centre)'
+        return False, f'ending tile {label} ({self.found["trigger"]}): {d:.2f} m from its centre'
+
+    def goal(self):
+        if self.found is None:
+            return None
+        return {'tile': self.found['tile'], 'mode': self.mode, 'condition': self.name,
+                'reason': f'ending tile {"%d,%d" % self.found["tile"]} found ({self.found["trigger"]}): centring on it'}
+
+
 class CompositeEndCondition:
     def __init__(self, conditions: List[EndCondition], combine: str = 'any'):
         if combine not in ('any', 'all'):
@@ -124,6 +193,19 @@ class CompositeEndCondition:
         if self.combine == 'all' and len(met) == len(self.conditions):
             return '; '.join(f'{n}: {w}' for n, w in met)
         return None
+
+    def goal(self) -> Optional[dict]:
+        """The first condition's place to go to before it can be met (see EndCondition.goal), or None."""
+        for cond in self.conditions:
+            g = cond.goal()
+            if g is not None:
+                return g
+        return None
+
+    def reset(self):
+        for cond in self.conditions:
+            cond.reset()
+        self.last = {}
 
     def describe(self) -> Dict[str, str]:
         return {name: ('MET ' if ok else '') + why for name, (ok, why) in self.last.items()}

@@ -4,6 +4,9 @@
   sub  /camera/depth/camera_info    intrinsics (else depth_hfov_deg is used)
   sub  /ai_mode                     std_msgs/Bool   true while the robot climbs in AI mode: detection pauses (the body
                                                     pitches on the stairs, and the treads would spoil the floor height)
+  sub  /stairs/enable               std_msgs/Bool   (latched) detection on / off; start_enabled until the first message.
+                                                    The mission manager turns it on for the opening scan (and for the
+                                                    whole mission with use_stairs:=true)
   pub  /stairs/points   std_msgs/String   JSON {"points": [[x, y, ux, uy], ...]} in the map frame (latched): confirmed
                                           stair cells and the unit direction the steps go up
   pub  /stairs/markers  MarkerArray       the remembered stair cells and their ascent, for RViz
@@ -24,7 +27,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Empty, String
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -62,6 +65,7 @@ class StairDetector(Node):
         self.tf_listener = TransformListener(self.tf, self)
         self.intrinsics = None
         self.paused = False
+        self.enabled = bool(p('start_enabled', True).value)
         self.last = 0.0
         self.frame = 0
         self.version, self.sent_version = 0, -1
@@ -69,10 +73,13 @@ class StairDetector(Node):
         self.create_subscription(CameraInfo, self.info_topic, self._on_info, 1)
         self.create_subscription(Image, self.depth_topic, self._on_depth, qos_profile_sensor_data)
         self.create_subscription(Bool, p('pause_topic', '/ai_mode').value, self._on_pause, latched)
+        self.create_subscription(Bool, p('enable_topic', '/stairs/enable').value, self._on_enable, latched)
         self.points_pub = self.create_publisher(String, '/stairs/points', latched)
+        self.create_subscription(Empty, '/map_reset', self._on_map_reset, 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/stairs/markers', latched)
         self.create_timer(1.0, self._publish)
-        self.get_logger().info(f'stair detector on {self.depth_topic} at {self.rate_hz:g} Hz')
+        self.get_logger().info(f'stair detector on {self.depth_topic} at {self.rate_hz:g} Hz'
+                               + ('' if self.enabled else ' (disabled until /stairs/enable)'))
 
     def _on_info(self, msg):
         if msg.k[0] > 0:
@@ -83,9 +90,20 @@ class StairDetector(Node):
             self.paused = bool(msg.data)
             self.get_logger().info('AI mode on: detection paused.' if self.paused else 'AI mode off: detecting again.')
 
+    def _on_map_reset(self, _msg):
+        """A new map (new map frame) starts: the staircases seen so far are in the old one."""
+        self.stairs = sc.StairMap(cell_m=self.stairs.cell_m, confirm_hits=self.stairs.confirm_hits)
+        self.version += 1
+        self.get_logger().info('new map: staircases forgotten.')
+
+    def _on_enable(self, msg):
+        if bool(msg.data) != self.enabled:
+            self.enabled = bool(msg.data)
+            self.get_logger().info('detection enabled.' if self.enabled else 'detection disabled.')
+
     def _on_depth(self, msg):
         now = self.get_clock().now().nanoseconds * 1e-9
-        if self.paused or now - self.last < 1.0 / self.rate_hz:
+        if self.paused or not self.enabled or now - self.last < 1.0 / self.rate_hz:
             return
         self.last = now
         if msg.encoding == '16UC1':

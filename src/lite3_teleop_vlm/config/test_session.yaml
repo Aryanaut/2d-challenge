@@ -1,0 +1,25 @@
+vlm_broker:
+  ros__parameters:
+    # group, client_script, client_python and camera topics are set by launch arguments.
+    server: http://192.168.10.141:8000
+    min_interval_s: 2.0          # spacing between gateway calls
+    timeout_s: 20.0
+    frame_max_age_s: 2.0         # refuse to send a stale camera frame
+    max_width: 1024              # gateway limit 1024x768
+    max_height: 768
+    log_dir: /home/user/vlm_tests   # every query saved here: image + prompt + answer
+
+teleop_console:
+  ros__parameters:
+    cmd_vel_topic: /cmd_vel
+    simple_cmd_topic: /simple_cmd
+    linear_speed: 0.3            # start speed (lab guidance ~0.3 m/s)
+    angular_speed: 0.6
+    max_linear: 0.5
+    max_angular: 1.2
+    hold_s: 0.6                  # dead-man: stop 0.6 s after the last movement key
+    latch: false
+    publish_hz: 10.0
+    front_prompts: [scene, room, hazard, survivor]
+    down_prompt: surface
+    manual_on_exit: true

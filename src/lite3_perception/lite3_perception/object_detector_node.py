@@ -6,7 +6,8 @@ Pipeline (runs at `detect_hz`, always on the *latest* frame, never queues frames
   camera frame -> YOLO / YOLO-World detection -> multi-frame confirmation
   -> depth + TF localisation -> de-duplication -> publish ONE event per new object
 
-Also decodes QR codes locally (deterministic, no LLM needed).
+QR codes: with qr_source=scanner they come from the qr_scanner node (/qr/visible, /qr/detections);
+with qr_source=builtin they are decoded here with cv2 (deterministic, no LLM needed).
 
 Publishes
   /perception/event       std_msgs/String           JSON, one per confirmed NEW object / QR  <- LLM package subscribes here
@@ -146,6 +147,12 @@ class ObjectDetectorNode(Node):
         p("qr_report", False)                                  # False: QR codes are only identified (for M03/M05),
                                                                #        never sent as events / M04 reports
         p("qr_text_topic", "/perception/qr_text")
+        p("qr_source", "builtin")                              # scanner = use the qr_scanner node's topics
+                                                               # builtin = decode here with cv2 (check_qr)
+                                                               # both    = both feed the same QR state
+        p("qr_visible_topic", "/qr/visible")                   # qr_scanner: codes in view, every scan
+        p("qr_detections_topic", "/qr/detections")             # qr_scanner: once per newly confirmed code
+        p("qr_camera", "front")                                # only this qr_scanner camera counts as "in view"
         # --- mission reporter hand-off (lite3_mission_reporter)
         p("publish_observations", True)                        # set false if llm_event_bridge publishes them instead
         p("observation_topic", "/mission_reporter/observation")
@@ -235,6 +242,14 @@ class ObjectDetectorNode(Node):
         self.qr_report = bool(g("qr_report"))
         self.last_qr_seen = -1e9                               # any QR in view (decoded or not)
         self.last_qr_text = ""
+        self.qr_source = str(g("qr_source")).strip().lower()
+        if self.qr_source not in ("scanner", "builtin", "both"):
+            self.get_logger().warn(f"qr_source '{self.qr_source}' unknown, using 'builtin'")
+            self.qr_source = "builtin"
+        self.qr_camera = str(g("qr_camera"))
+        self.last_scanner_msg = None                           # time of the last /qr/visible (watchdog)
+        self.started = time.time()
+        self.last_frame = None                                 # (bgr, header) of the last processed frame
         self.hz_min_area = int(g("hazard_min_area"))
         self.hz_min_score = float(g("hazard_min_score"))
         self.hz_min_margin = float(g("hazard_min_margin"))
@@ -267,9 +282,15 @@ class ObjectDetectorNode(Node):
         self.pub_obs = self.create_publisher(String, self.get_parameter("observation_topic").value, 10)
         self.pub_key = self.create_publisher(CompressedImage, "/perception/keyframe", 10)
         self.pub_dets = self.create_publisher(String, "/perception/detections", 10)
+        if self.qr_source in ("scanner", "both"):
+            self.create_subscription(String, g("qr_visible_topic"), self.on_qr_visible, 10)
+            self.create_subscription(String, g("qr_detections_topic"), self.on_qr_detection, 10)
+            self.create_timer(5.0, lambda: self.check_scanner_alive(time.time()))
 
         self.create_timer(1.0 / float(g("detect_hz")), self.tick)
-        self.get_logger().info(f"listening on {topic}")
+        self.get_logger().info(f"listening on {topic}; QR from {self.qr_source}"
+                               + (f" ({g('qr_visible_topic')}, {g('qr_detections_topic')}, "
+                                  f"camera '{self.qr_camera}')" if self.qr_source != "builtin" else ""))
 
     # ------------------------------------------------------------------ callbacks
     def on_compressed(self, msg):
@@ -304,7 +325,9 @@ class ObjectDetectorNode(Node):
         hazards = self.detect_hazards(img)
         self.pub_dets.publish(String(data=json.dumps({"stamp": now, "detections": dets, "hazards": hazards})))
 
-        self.check_qr(img, header, dets)
+        self.last_frame = (img, header)
+        if self.qr_source in ("builtin", "both"):
+            self.check_qr(img, header, dets)
         if self.scene_enable:
             self.update_scene(dets, now)
 
@@ -509,6 +532,61 @@ class ObjectDetectorNode(Node):
                  "bbox_xyxy": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]}
             loc = self.localise(d, img.shape, header)
             self.emit("qr", img, header, dets, d, loc, extra={"qr_text": text})
+
+    # ------------------------------------------------------------------ QR from the qr_scanner node
+    def on_qr_visible(self, msg):
+        """/qr/visible (every scan): a code from qr_camera in view, read or not, = 'a QR is in view'."""
+        self.last_scanner_msg = time.time()
+        try:
+            codes = json.loads(msg.data).get("codes") or []
+        except (json.JSONDecodeError, AttributeError):
+            return
+        mine = [c for c in codes if isinstance(c, dict) and c.get("camera") == self.qr_camera]
+        if not mine:
+            return
+        self.last_qr_seen = time.time()
+        texts = [c["text"] for c in mine if c.get("text")]
+        if texts:
+            self.last_qr_text = texts[-1]
+
+    def on_qr_detection(self, msg):
+        """/qr/detections (once per new code): forward the exact raw text, like check_qr does."""
+        try:
+            det = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(det, dict):
+            return
+        text = str(det.get("text") or "")                      # raw text; NOT 'decoded' (key_map/caesar)
+        if not text or text in self.reported_qr:
+            return
+        if det.get("camera", self.qr_camera) == self.qr_camera:
+            self.last_qr_seen = time.time()
+            self.last_qr_text = text
+        self.reported_qr.add(text)
+        self.pub_qr_text.publish(String(data=text))
+        if not self.qr_report or self.last_frame is None:
+            return
+        img, header = self.last_frame
+        loc = {}
+        if det.get("bearing_deg") is not None:
+            loc["bearing_deg"] = det["bearing_deg"]
+        if det.get("distance_m") is not None:
+            loc["range_m"] = det["distance_m"]
+        mp = det.get("map_point")
+        if mp and det.get("frame") == self.map_frame:
+            loc["xy"] = [round(mp[0], 2), round(mp[1], 2)]
+            loc["position_map"] = {"x": loc["xy"][0], "y": loc["xy"][1], "z": round(mp[2], 2),
+                                   "frame": self.map_frame}
+        d = {"label": "qr code", "confidence": 1.0, "bbox_xyxy": [0, 0, 0, 0]}
+        self.emit("qr", img, header, [], d, loc, extra={"qr_text": text, "qr_camera": det.get("camera")})
+
+    def check_scanner_alive(self, now):
+        """Warn if qr_scanner is silent: M03/M04 would quietly never trigger."""
+        last = self.last_scanner_msg if self.last_scanner_msg is not None else self.started
+        if now - last > 10.0:
+            self.get_logger().warn("no /qr/visible for >10 s: is qr_scanner running? (M03/M04 need it)",
+                                   throttle_duration_sec=30.0)
 
     def localise(self, d, shape, header):
         """Bearing always; 3-D map position if depth + intrinsics + TF are available."""

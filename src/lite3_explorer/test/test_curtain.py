@@ -48,6 +48,31 @@ def test_edge_curtain_finds_the_edge_it_lies_along():
     assert n is None                                                   # too few spots
 
 
+def test_camera_spots_beat_more_lidar_only_spots():
+    # bag curtaintest_25_11_140529: 15 lidar-only spots on the W wall, 12 colour-camera spots on the curtain (N)
+    north = np.hstack([spots(0.1, 1.0, 1.0, 0, 1, n=12)[:, :4], np.ones((12, 1))])
+    north[:, 0] = np.linspace(0.05, 0.6, 12)
+    west = np.hstack([spots(-0.05, 0.15, 0.65, ux=-1.0, n=15), np.zeros((15, 1))])
+    e = cc.edge_curtain(GRID, (0, 0), np.vstack([north, west]))
+    assert e['side'] == 'N' and e['camera_spots'] == 12 and e['spots'] == 12
+    w = cc.edge_curtain(GRID, (0, 0), np.vstack([north, west])[:, :4])     # no source column: the most spots win
+    assert w['side'] == 'W'
+    assert cc.edge_curtain(GRID, (0, 0), west)['side'] == 'W'              # lidar only still counts when alone
+    assert cc.edge_curtain(GRID, (0, 0), west, lidar_only=False) is None
+
+
+def test_camera_seen_curtain_never_falls_back_to_a_lidar_wall():
+    # the camera saw the curtain on N, but N's neighbour is explored (or skipped): the lidar-only W wall must not be walked into
+    north = np.hstack([spots(0.1, 1.0, 1.0, 0, 1, n=12)[:, :4], np.ones((12, 1))])
+    north[:, 0] = np.linspace(0.05, 0.6, 12)
+    west = np.hstack([spots(-0.05, 0.15, 0.65, ux=-1.0, n=15), np.zeros((15, 1))])
+    both = np.vstack([north, west])
+    assert cc.edge_curtain(GRID, (0, 0), both, skip=[(0, 1)]) is None
+    assert cc.edge_curtain(GRID, (0, 0), both, min_camera_spots=20) is None      # too few camera spots to confirm any edge
+    e = cc.edge_curtain(GRID, (0, 0), both)
+    assert e['side'] == 'N' and e['confirmed_by'] == 'camera'
+
+
 def test_edge_curtain_ignores_other_places():
     assert cc.edge_curtain(GRID, (0, 0), spots(0.5, 0.1, 0.9)) is None                # middle of the tile
     assert cc.edge_curtain(GRID, (0, 0), spots(1.05, 0.1, 0.9), visited=[(1, 0)]) is None   # behind it is explored
@@ -88,11 +113,22 @@ class Drive:
         self.path.append((p[0], p[1]))
 
 
-def build(pose_yaw, flat=None):
+def build(pose_yaw, flat=None, initial_curtain=True):
+    """Robot on tile 0,0 of a 4 m corridor, a curtain on its E edge. The initial tile never holds a curtain: these
+    tests open that rule (initial_curtain=True) to keep the curtain right beside the start; test_no_curtain_on_the_
+    initial_tile keeps it."""
     ctx, m = make({'modes.exploring.curtains': True, 'modes.exploring.scan_after_reach': False,
                    'modes.curtain.speed_mps': 0.25, **(flat or {})}, length_m=4.0)
     ctx.pose_[:] = [0.5, 0.5, pose_yaw]
     d = Drive(ctx, spots(1.05, 0.1, 0.9))
+    if initial_curtain:
+        establish = ctx.tiles.establish
+
+        def est(*a, **k):
+            out = establish(*a, **k)
+            ctx.tiles.initial_tile = None
+            return out
+        ctx.tiles.establish = est
     return ctx, m, d
 
 
@@ -113,6 +149,37 @@ def test_curtain_on_the_edge_is_aligned_with_and_walked_through():
     assert turns and walks                                        # turned in place first, then walked with vx
     assert all(abs(w[1]) <= 0.3 for w in walks) and d.cmds[-1] == 'stop' or 'stop' in d.cmds
     assert (1, 0) in m.curtains_tried
+
+
+def test_curtain_is_crossed_only_in_the_hstep_gait():
+    ctx, m, d = build(pose_yaw=0.0)
+    hstep = []                                                    # calls to ctx.hstep, in order
+    ctx.hstep = lambda on: hstep.append(on)
+    seen = []                                                     # (cross-phase forward walk, h-step held) per drive
+    real = d.drive
+
+    def drive(vx, wz, vy=0.0):
+        if m.current.name == 'curtain' and m.current.phase == 'cross':
+            seen.append(bool(hstep and hstep[-1]))
+        real(vx, wz, vy)
+    ctx.drive = drive
+    assert run_until(ctx, m, lambda: 'curtain' in modes_seen(m) and m.current.name != 'curtain', n=200)
+    assert seen and all(seen)                                     # every step through the curtain in h-step
+    assert hstep == [True, False]                                 # switched on once, released after
+    assert ctx.pose_[0] >= 1.5 - 1e-6
+    phases = [ph for md, ph in ctx.phases if md == 'curtain']
+    assert phases.index('gait_on') < phases.index('cross') < phases.index('gait_off')
+
+
+def test_curtain_hstep_is_released_when_the_mode_is_left_mid_crossing():
+    ctx, m, d = build(pose_yaw=0.0)
+    hstep = []
+    ctx.hstep = lambda on: hstep.append(on)
+    assert run_until(ctx, m, lambda: m.current.name == 'curtain' and m.current.phase == 'cross', n=200)
+    m.request('exploring', 'operator')
+    ctx.t += 1.0
+    m.tick()
+    assert hstep == [True, False]
 
 
 def run_until(ctx, m, stop, n=120):
@@ -142,7 +209,7 @@ def test_curtain_mode_goes_to_the_tile_centre_before_walking_through():
 
 
 def test_blocked_curtain_is_given_up_at_once_it_is_a_wall():
-    ctx, m, d = build(pose_yaw=0.0)
+    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.low_move_s': 0})      # the stall check, not the low-movement timeout
     d.wall_x = 0.8
     assert run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=300)
     failed = next(dd for k, dd in ctx.events if k == 'curtain_failed')
@@ -150,8 +217,88 @@ def test_blocked_curtain_is_given_up_at_once_it_is_a_wall():
     assert not [1 for k, _ in ctx.events if k == 'curtain_retry']
 
 
+def test_no_curtain_on_the_initial_tile():
+    ctx, m, d = build(pose_yaw=0.0, initial_curtain=False)
+    run_until(ctx, m, lambda: 'curtain' in modes_seen(m), n=60)
+    assert 'curtain' not in modes_seen(m)
+    assert not ctx.tiles.not_curtain_mask(d.pts).any()                  # every spot is on the initial tile's E edge
+
+
+def test_curtain_timeout_unmarks_the_edge_and_detection_goes_on_elsewhere():
+    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.low_move_s': 0, 'modes.curtain.stall_s': 99.0,
+                                          'modes.curtain.cross_timeout_s': 5.0})
+    d.wall_x = 0.8                                               # never gets through: the cross times out
+    assert run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=300)
+    failed = next(dd for k, dd in ctx.events if k == 'curtain_failed')
+    assert 'timed out' in failed['why'] and 'unmarked' in failed['why'] and failed['attempts'] == 0
+    assert not [1 for k, _ in ctx.events if k == 'curtain_retry']          # given up at once
+    rejected = next(dd for k, dd in ctx.events if k == 'curtain_rejected')
+    assert rejected['tile'] == '0,0' and rejected['side'] == 'E'
+    assert ctx.tiles.is_not_curtain((0, 0), 'E') and ctx.tiles.is_not_curtain((1, 0), 'W')   # from either side
+    assert not ctx.tiles.not_curtain_mask(d.pts).any()                  # its spots no longer count ...
+    other = spots(2.05, 0.1, 0.9)
+    assert ctx.tiles.not_curtain_mask(other).all()                      # ... spots on another edge still do
+
+
+def test_curtain_timeout_with_retries_unmarks_the_edge_when_given_up():
+    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.low_move_s': 0, 'modes.curtain.stall_s': 99.0,
+                                          'modes.curtain.cross_timeout_s': 5.0, 'modes.curtain.timeout_gives_up': False})
+    d.wall_x = 0.8
+    assert run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=400)
+    assert sum(1 for k, _ in ctx.events if k == 'curtain_retry') == 2
+    assert sum(1 for k, _ in ctx.events if k == 'curtain_rejected') == 1     # only when given up, not per try
+    assert ctx.tiles.not_curtains == [((0, 0), 'E')]
+
+
+def test_rejected_curtain_is_no_longer_deferred():
+    from test_mission import corridor
+    from lite3_explorer.tile_tracker import TileTracker
+    tr = TileTracker()
+    tr.align_on_entry = False
+    tr.set_map(*corridor(4.0))
+    tr.establish([0.5, 0.5, 0.0])
+    tr.defer_curtain((1, 0), (2, 0), 'E')
+    assert tr.curtains_left() == ['2,0']
+    tr.reject_curtain((1, 0), 'E')
+    assert tr.curtains_left() == [] and tr.is_not_curtain((2, 0), 'W')
+
+
+def test_curtain_wall_pick_skips_rejected_and_initial_tile_edges():
+    from lite3_explorer.curtain_core import curtain_wall
+    from test_mission import corridor
+    from lite3_explorer.tile_tracker import TileTracker
+    tr = TileTracker()
+    tr.align_on_entry = False
+    tr.set_map(*corridor(4.0))
+    tr.establish([0.5, 0.5, 0.0])
+    on = lambda x, n: [[x + dx, y, 1.0] for y in np.linspace(0.2, 0.8, n) for dx in (-0.03, 0.03)]   # noqa: E731
+    seen = np.array(on(1.0, 6) + on(2.0, 4) + on(3.0, 2))                 # most on x=1 (the initial tile's E edge)
+    w = curtain_wall(tr.grid, seen[tr.not_curtain_mask(seen)])
+    assert tr.grid.edge(w['tile'], w['side']) == tr.grid.edge((2, 0), 'W')
+    tr.reject_curtain((1, 0), 'E')                                       # x=2 timed out: the next one
+    w = curtain_wall(tr.grid, seen[tr.not_curtain_mask(seen)])
+    assert tr.grid.edge(w['tile'], w['side']) == tr.grid.edge((3, 0), 'W')
+
+
+def test_slow_start_of_the_cross_is_not_called_a_wall():
+    # 25 Nov bag: standing in front of the curtain, the robot took ~1.5 s to start walking and the 2 s stall check
+    # called the curtain a wall before the first step. The stall window opens start_grace_s after the cross starts.
+    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.stall_s': 2.0, 'modes.curtain.start_grace_s': 2.0})
+    standing = {'left': 3, 'started': False}
+
+    def blocked():                                               # the first 3 s (ticks) of the cross: no motion yet
+        if m.current.name == 'curtain' and m.current.phase == 'cross' and standing['left'] > 0:
+            standing['left'] -= 1
+            return True
+        return False
+    d.blocked = blocked
+    assert run_until(ctx, m, lambda: ctx.pose_[0] >= 1.5 or any(k == 'curtain_failed' for k, _ in ctx.events), n=200)
+    assert not [dd for k, dd in ctx.events if k == 'curtain_failed'], ctx.events
+    assert standing['left'] == 0 and ctx.pose_[0] >= 1.5 - 1e-6
+
+
 def test_blocked_curtain_is_retried_then_hands_back_to_the_mode_before_it():
-    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.blocked_gives_up': False})
+    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.blocked_gives_up': False, 'modes.curtain.low_move_s': 0})
     d.wall_x = 0.8                                               # a wall in front of the curtain: never gets through
     assert run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=300)
     retries = [dd for k, dd in ctx.events if k == 'curtain_retry']
@@ -322,6 +469,7 @@ def test_curtain_edges_are_left_out_of_the_virtual_walls_only_while_open():
     from test_mission import corridor
     from lite3_explorer.tile_tracker import TileTracker
     tr = TileTracker()
+    tr.align_on_entry = False
     tr.set_map(*corridor(4.0))
     tr.establish([0.5, 0.5, 0.0])
     tr.start_wall = None
@@ -339,7 +487,7 @@ def test_curtain_edges_are_left_out_of_the_virtual_walls_only_while_open():
 
 def test_backtracking_carries_on_when_the_curtain_cannot_be_walked_through():
     from test_mission import T, tee_world
-    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25,
+    ctx, m = make({'explorations.tiles.neighbours_fallback': False, 'modes.curtain.speed_mps': 0.25, 'modes.curtain.low_move_s': 0,
                    'modes.curtain.blocked_gives_up': False},
                   world=tee_world())
     d = Drive(ctx, np.zeros((0, 4)))
@@ -430,3 +578,95 @@ def test_lidar_curtain_is_floor_level_only_with_a_tall_wall_behind():
         f.add(_wall_cloud(1.0, 0.0, 1.0, floor_hem), robot)
     assert len(f.confirmed()) == 0
     assert cc.edge_curtain(GRID, (0, 0), pts) is not None
+
+
+def test_a_small_patch_of_camera_spots_does_not_confirm_an_edge_lidar_cannot_widen_it():
+    # bag stairs_25_11_153409: 3 camera spots in a 9 cm patch + lidar-only spots along the wall started a crossing
+    cam = np.array([[1.0, y, 1.0, 0.0, 1.0] for y in (0.53, 0.58, 0.62)])
+    lid = np.array([[1.0, y, 1.0, 0.0, 0.0] for y in np.linspace(0.8, 1.1, 14)])
+    assert cc.edge_curtain(GRID, (0, 0), np.vstack([cam, lid])) is None
+    wide = np.array([[1.0, y, 1.0, 0.0, 1.0] for y in np.linspace(0.3, 0.8, 8)])
+    assert cc.edge_curtain(GRID, (0, 0), wide)['side'] == 'E'
+    far = np.array([[1.25, y, 1.0, 0.0, 1.0] for y in np.linspace(0.3, 0.8, 8)])     # 0.25 m off the line: not close enough
+    assert cc.edge_curtain(GRID, (0, 0), far) is None
+
+
+def test_curtain_map_needs_two_viewpoints_and_one_hit_per_frame():
+    pts = np.array([[1.0, 0.5], [1.0, 0.5], [1.01, 0.51]])          # the same cell three times in one frame = one hit
+    m = cc.CurtainMap(confirm_hits=3, min_view_sep_m=0.15)
+    for _ in range(2):
+        assert not m.add(pts, (0.0, 0.5))
+    assert len(m) == 0
+    for _ in range(10):                                              # standing still: never confirmed
+        m.add(pts, (0.0, 0.5))
+    assert len(m) == 0
+    assert m.add(pts, (0.0, 0.8)) and len(m) >= 1                    # a second viewpoint 0.3 m away confirms it
+    off = cc.CurtainMap(confirm_hits=3, min_view_sep_m=0.0)
+    for _ in range(3):
+        off.add(pts, (0.0, 0.5))
+    assert len(off) >= 1
+
+
+def test_low_movement_in_the_cross_goes_to_recovery_after_low_move_s():
+    ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.low_move_s': 2.0})
+    d.wall_x = 0.8                                               # bumped: the robot keeps commanding but does not move
+    assert run_until(ctx, m, lambda: m.current.name == 'recovery' or any(k == 'curtain_failed' for k, _ in ctx.events), n=300)
+    failed = next(dd for k, dd in ctx.events if k == 'curtain_failed')
+    assert failed['back_to'] == 'recovery' and 'barely moved for 2 s' in failed['why'], failed
+    assert 'recovery' in modes_seen(m) or m.current.name == 'recovery'
+    assert d.cmds[-1] == 'stop' or 'stop' in d.cmds
+
+
+def test_low_movement_timeout_is_configurable_and_can_be_switched_off():
+    def seconds_to_fail(low):
+        ctx, m, d = build(pose_yaw=0.0, flat={'modes.curtain.low_move_s': low, 'modes.curtain.stall_s': 99.0,
+                                              'modes.curtain.cross_timeout_s': 99.0})
+        d.wall_x = 0.8
+        t0 = ctx.t
+        hit = run_until(ctx, m, lambda: any(k == 'curtain_failed' for k, _ in ctx.events), n=60)
+        return (ctx.t - t0) if hit else None
+    short, long_ = seconds_to_fail(2.0), seconds_to_fail(5.0)
+    assert short is not None and long_ is not None and long_ - short >= 2.5     # 3 s more timeout, about 3 s later
+    assert seconds_to_fail(0) is None                                            # off: nothing else fails within 60 s
+
+
+def test_a_turn_in_place_is_not_low_movement():
+    ctx, m, d = build(pose_yaw=2.5, flat={'modes.curtain.low_move_s': 2.0, 'modes.curtain.min_turn_rad_s': 0.2,
+                                          'modes.curtain.max_turn_rad_s': 0.25})   # a slow turn: ~14 deg per step
+    assert run_until(ctx, m, lambda: ctx.pose_[0] >= 1.5 or any(k == 'curtain_failed' for k, _ in ctx.events), n=200)
+    assert not [dd for k, dd in ctx.events if k == 'curtain_failed'], ctx.events
+
+
+# ------------------------------------------------------------------- the one curtain wall (mission manager, RViz yellow)
+def test_curtain_wall_is_the_tile_edge_with_the_most_camera_spots():
+    from lite3_explorer.curtain_core import curtain_wall
+    from lite3_explorer.tiles import TileGrid
+    g = TileGrid(0.0, 0.0, 0.0, 1.0)
+    curtain = [[2.0 + dx, y, 1.0] for y in (0.2, 0.4, 0.6, 0.8) for dx in (-0.03, 0.04)]   # on x = 2, tile row 0
+    lidar_wall = [[x, 1.0, 0.0] for x in np.linspace(0.1, 0.9, 12)]                       # lidar only, on y = 1
+    stray = [[0.5, 0.5, 1.0]]                                                             # mid-tile: on no edge
+    w = curtain_wall(g, np.array(curtain + lidar_wall + stray))
+    assert w['tile'] == (2, 0) and w['side'] == 'W' and w['camera_spots'] == 8
+    assert w['segment'] == g.edge((2, 0), 'W')
+    assert curtain_wall(g, np.array(lidar_wall)) is None                                  # lidar alone: never a curtain
+    assert curtain_wall(g, np.array([[2.0, 0.5, 1.0], [2.0, 0.55, 1.0], [2.0, 0.6, 1.0]])) is None   # too short
+
+
+def test_curtain_wall_moves_to_an_edge_with_clearly_more_camera_spots():
+    # bag fullrun_25_11_215528: a grey wall seen close up gave 6 colour spots at 65 s and was locked as the curtain
+    # wall; the real curtain past the stairs reached 16 spots at 224 s and was never shown. The pick is redone and
+    # moves at switch_ratio x the current edge's camera spots, not for a similar count (no flicker).
+    from lite3_explorer.curtain_core import pick_curtain_wall
+    from lite3_explorer.tiles import TileGrid
+    g = TileGrid(0.0, 0.0, 0.0, 1.0)
+    on_x = lambda x, n: [[x, y, 1.0] for y in np.linspace(0.15, 0.85, n)]   # noqa: E731  camera spots along x = const
+    wall = on_x(2.0, 6)
+    first = pick_curtain_wall(g, np.array(wall))
+    assert (first['tile'], first['side']) == ((2, 0), 'W') and first['camera_spots'] == 6
+    cur = (first['tile'], first['side'])
+    assert pick_curtain_wall(g, np.array(wall + on_x(4.0, 9)), current=cur) is None             # 9 < 2 x 6: keep
+    moved = pick_curtain_wall(g, np.array(wall + on_x(4.0, 16)), current=cur)
+    assert (moved['tile'], moved['side']) == ((4, 0), 'W') and moved['camera_spots'] == 16
+    assert pick_curtain_wall(g, np.array(wall + on_x(4.0, 16)), current=((1, 0), 'E')) is not None   # same edge, other name
+    assert pick_curtain_wall(g, np.array(wall), current=((1, 0), 'E')) is None                  # already shown: keep
+    assert pick_curtain_wall(g, np.array(on_x(4.0, 3)), current=cur) is not None                # current lost all spots

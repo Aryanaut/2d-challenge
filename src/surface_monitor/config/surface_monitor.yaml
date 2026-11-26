@@ -1,0 +1,45 @@
+surface_monitor:
+  ros__parameters:
+    # group, client_script, client_python, mode, image_topic and prompt_file are set
+    # by launch arguments (see launch/surface_monitor.launch.py), not here.
+
+    # --- input ---
+    compressed: false            # true if image_topic is a .../compressed topic
+    local_rate_hz: 10.0          # local classifier rate
+    publish_rate_hz: 5.0
+
+    # --- VLM gateway (Lab 6) ---
+    vlm_backend: direct          # direct | broker (use broker when vlm_broker runs, e.g. with the teleop console)
+    server: http://192.168.10.141:8000
+    vlm_timeout_s: 20.0
+
+    # --- fusion / decision timing ---
+    local_window_s: 1.0
+    local_majority: 0.6
+    vlm_max_age_s: 15.0
+    vlm_override_conf: 0.85
+    vlm_min_interval_s: 3.0      # respect the gateway: one request at a time, spaced out
+    vlm_heartbeat_s: 8.0
+    min_course_time_s: 3.0       # ignore "other" until the robot has been on wood/metal this long
+    exit_hold_s: 2.0
+    vlm_exit_conf: 0.6
+    vlm_confirm_timeout_s: 15.0
+    camera_timeout_s: 1.0
+
+    # --- trained classifier (optional, see README "Train a classifier") ---
+    classifier: threshold        # threshold | model
+    model_path: /home/user/surface_model.joblib
+    model_min_conf: 0.6
+
+    # --- local classifier thresholds (re-tune with surface_tune on the real webcam) ---
+    th_roi_frac: 0.6
+    th_dark_l_max: 35.0
+    th_other_lstd_max: 10.0
+    th_other_grad_max: 25.0
+    th_metal_chroma_max: 9.0
+    th_metal_grad_strong: 60.0
+    th_metal_grad_min: 45.0
+    th_metal_lstd_min: 18.0
+    th_metal_bright_min: 0.01
+    th_wood_b_min: 2.0
+    th_wood_a_min: -1.0

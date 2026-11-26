@@ -20,6 +20,12 @@ DEFAULTS: Dict[str, Any] = {
     'global_costmap_topic': '/global_costmap/costmap',
     'local_costmap_topic': '/local_costmap/costmap',
     'tick_period_s': 0.2,
+    # SLAM jump guard: map->odom moving more than this between two checks (0.2 s) is a loop closure / relocalisation,
+    # not motion (odom->base_link carries the motion). Logged as a 'slam_jump' event; no tile counts as reached from the
+    # pose for slam_jump_hold_s afterwards. 0 = off. fullrun_25_11_215528: a false loop closure moved it 2.1 m.
+    'slam_jump_m': 0.5,
+    'slam_jump_deg': 15.0,
+    'slam_jump_hold_s': 5.0,
     'output_dir': '~/lite3_survey_runs',
     'reports_dir': '~/2d/reports',
     'scene_images_dir': '~/2d/images/runs',   # the images sent to the AI for scene tiles: <dir>/<run>/scene_<tile>_q<n>.jpg (+ .json answer)
@@ -43,7 +49,16 @@ DEFAULTS: Dict[str, Any] = {
         'min_known': 0.5,                 # share of a tile that must be scanned before it becomes a tile
         'scene_min_known': 0.85,          # scene tile: scanned at least this much ...
         'scene_max_free': 0.80,           # ... and less than this share of the SCANNED part traversable (drawn blue hatched in RViz)
+        'align_on_entry': True,           # on every tile entry: nudge the grid so that tile's edges lie on the walls around it
+        'align_max_shift_m': 0.15,        # ... an edge further than this from its wall is not that wall's: left alone
+        'align_max_rot_deg': 6.0,         # ... turn at most this much towards the wall angle
+        'align_radius_m': 2.0,            # ... walls looked at within this of the robot
+        'align_min_quality': 1.5,         # ... wall-angle quality (estimate_wall_angle) needed
+        'scene_margin_m': 0.10,           # ... measured this far inside the tile edges (walls on a slightly-off grid are no scene)
         'stair_min_points': 4,            # confirmed stair cells (10 cm, /stairs/points) that make a tile a staircase tile
+        'stair_floor_min_known': 0.90,    # a tile scanned this much ...
+        'stair_floor_min_free': 0.95,     # ... with this share of its interior free is open floor: never a staircase
+        'stair_shift_max_m': 0.35,        # stair cells this close inside a traversable tile's edge go to the tile beyond it
         'roller_min_points': 4,           # confirmed roller spots (10 cm, /roller/points) that make a tile a roller tile ...
         'roller_min_lidar': 2,            # ... of which this many are confirmed by the 3D lidar (0 = depth camera alone)
         'roller_depth_only_points': 12,   # ... or a tile with this many spots needs no lidar (0 = lidar always required)
@@ -54,7 +69,7 @@ DEFAULTS: Dict[str, Any] = {
         # Mode instances to build. Each name is configured under modes.<name>; modes.<name>.type picks the class
         # (defaults to the name). Add your own, e.g. 'exploring_stairs' with type: exploring.
         'modes': ['idle', 'scanning', 'exploring', 'quickscan', 'curtain', 'stairs', 'roller', 'scene', 'mppi',
-                  'backtracking', 'recovery', 'complete'],
+                  'backtracking', 'recovery', 'ending', 'complete'],
         'initial_mode': 'idle',
         'start_mode': 'scanning',         # where set_active(true) / auto start goes
         'recovery_mode': 'recovery',      # where the stuck supervisor sends the robot
@@ -83,6 +98,12 @@ DEFAULTS: Dict[str, Any] = {
         'time_limit': {'seconds': 0.0},   # 0 = off
         'max_tiles_visited': {'count': 0},
         'no_frontiers_left': {'min_cluster_cells': 8, 'goal_clearance_m': 0.35, 'min_clearance_m': 0.30},
+        # the robot entered a tile with no walls on its edges (triggers; 'hallway' = >= min_hallway_tiles in a row): the
+        # tile before it on the robot's route with exactly `walls` walls is the ending tile. Met at its centre; `mode` drives there.
+        # "no walls": no edge read as a wall (mapped wall along >= solid_wall_share of it); never the initial tile
+        'ending_tile': {'triggers': ['next_tile', 'open_tile'], 'min_seen_share': 0.5, 'min_hallway_tiles': 4, 'walls': 2, 'entered_only': True,
+                        'solid_wall_share': 0.4,
+                        'preceding': True, 'reach_radius_m': 0.30, 'lock': True, 'mode': 'ending'},
     },
 
     'explorations': {
@@ -122,7 +143,8 @@ DEFAULTS: Dict[str, Any] = {
 
     'traversals': {
         # Named traversal profiles. type = a registered traversal class (see mission/traversal.py).
-        'route': {'type': 'nav2_route',   # FollowWaypoints: N waypoints along the Nav2 path, then the tile centre
+        'route': {'type': 'nav2_route',   # NavigateThroughPoses: N waypoints, then the tile centre, without stopping in between
+                  'backend': 'through_poses',   # through_poses | follow_waypoints (FollowWaypoints: stops at every waypoint)
                   'route_mode': 'straight',   # straight: waypoints on the line current tile centre -> next tile centre; path: along the Nav2 path
                   'waypoints': 3,         # intermediate waypoints, evenly spaced along the path
                   'skip_start_m': 0.0,    # 0 = equal gaps start->wp->goal; >0 skips this much of the path first (first gap longer)
@@ -133,7 +155,8 @@ DEFAULTS: Dict[str, Any] = {
         'recovery_mppi': {'type': 'nav2_pose', 'behavior_tree': 'recovery_mppi.xml'},
         # recovery fallback without Nav2: straight linear x / y velocity to the goal, heading held (mission/traversal.py)
         'omni': {'type': 'omni', 'speed_mps': 0.20, 'min_speed_mps': 0.06, 'gain': 0.8, 'tolerance_m': 0.10,
-                 'heading_kp': 1.5, 'wz_max': 0.3, 'block_cost': 100, 'lookahead_m': 0.30, 'timeout_s': 30.0,
+                 'heading_kp': 1.5, 'wz_max': 0.3, 'block_cost': 100, 'lookahead_m': 0.30, 'body_length_m': 0.61, 'body_width_m': 0.37,
+                 'body_pad_m': 0.03, 'timeout_s': 30.0,
                  'stall_s': 6.0, 'min_progress_m': 0.05},
     },
 
@@ -147,7 +170,7 @@ DEFAULTS: Dict[str, Any] = {
             'type': 'scanning',
             'turn': True,                 # false = no turning, just refresh the tiles
             'turn_deg': 360.0,
-            'opening_setpoints_deg': [0.0, 80.0, -160.0, -80.0],   # opening spin: yaw setpoints relative to the start heading, then back to 0
+            'opening_setpoints_deg': [0.0, 80.0, -80.0],   # opening spin: yaw setpoints relative to the start heading (front sweep, never through the back), then back to 0
             'opening_retries': 5,           # the opening scan must finish before exploring
             'opening_min_turn_deg': 160.0,    # the opening spin may stop early (map not sparse) only after turning this far
             'return_tolerance_deg': 3.0,  # after the opening sweep turn back to the starting heading
@@ -157,6 +180,12 @@ DEFAULTS: Dict[str, Any] = {
             'check_room': True,           # skip the turn where the body would hit the local costmap
             'map_wait_s': 30.0,           # max wait for the map around the start before placing the tile grid
             'next_mode': 'exploring',
+            'opening_stairs': False,      # stair detector on for the opening scan; a staircase beside the start tile -> stairs_mode
+            'opening_stairs_wait_s': 2.0, # stand still this long after the opening scan so the detector confirms what it sees
+            'stairs_mode': 'stairs',
+            'stair_min_facing': 0.5,      # as modes.exploring.stair_min_facing
+            'relocate_wait_s': 3.0,       # after the stairs: stand still this long before the tile is checked against SLAM (the
+                                          # scan reaches slam_toolbox ~1.1 s late; the check must see a scan matched after the rebase)
         },
         'exploring': {
             'type': 'exploring',
@@ -173,17 +202,27 @@ DEFAULTS: Dict[str, Any] = {
             'curtain_mode': 'curtain',
             'curtain_edge_tol_m': 0.30,   # curtain spots within this of the tile edge line count as on the edge
             'curtain_min_span_m': 0.40,   # ... spread over at least this much of it
+            'curtain_camera_tol_m': 0.15,  # the camera spots confirming an edge: within this of its line ...
+            'curtain_camera_min_span_m': 0.30,   # ... and spread over this much of it by themselves
+            'curtain_wall_switch_ratio': 2.0,   # the yellow curtain wall moves to another edge with this many times its camera spots
             'curtain_last': True,         # another reachable tile beside the curtain's tile: go there first, the tile is the
                                           # last split, backtracking walks through the curtain later (needs backtracking)
             'stairs': False,              # use_stairs:=true: a staircase tile shares a side with the current tile -> stairs
             'stairs_mode': 'stairs',      # mode (AI mode on, climb over it into the tile beyond, AI mode off, wall it off)
             'stair_min_facing': 0.5,      # climb only from a side the steps go up from (cos of ascent vs the way across)
+            'stairs_when_stuck': True,    # nothing reachable left on this side (after retries / recovery): give up on the
+                                          # rest and climb the staircase instead of retrying forever
+            'stairs_after_retries': 1,    # ... after this many retry rounds without a new tile
+            'stairs_backtrack_attempts': 3,   # forced stairs: backtrack to the tile in front of the staircase (instead of
+                                          # recovery) at most this many times, then the usual handling (0 = no limit)
             'rollers': False,             # use_rollers:=true: a roller tile shares a side with the current tile (or the robot
             'roller_mode': 'roller',      # stands in front of its roller) -> roller mode (square up, h-step gait, cross it)
             'roller_min_facing': 0.8,     # cross only when the roller lies across the way (|cos| of its normal vs the side)
             'backtracking': True,         # two or more tiles to travel to -> the tile is the last split; no exploration
                                           # target left but tiles unexplored -> backtracking mode (else retry_wait)
             'backtracking_mode': 'backtracking',
+            'split_on_discovery': True,   # a new tile found beside a tile visited earlier (sharing a side that is no wall)
+                                          # makes that tile a split again, so backtracking can come back for it
             'classify_target': True,      # ask the terrain classifier about the target tile once the robot points at it;
                                           # floor not visible -> choose another tile
             'classify_max_angle_deg': 20.0,   # "pointing at it": heading within this angle of the tile
@@ -229,6 +268,7 @@ DEFAULTS: Dict[str, Any] = {
             'start_timeout_s': 3.0,       # animation_player did not start it: one picture from where it stands
             'timeout_s': 30.0,            # give up on (and cancel) the animation after this long
             'llm_attempts': 2,            # AI description tries; after the last the tile is marked explored anyway
+            'background': False,          # true: once the pictures are taken, go on exploring; the answer is recorded when it comes
         },
         'mppi': {
             'type': 'mppi',
@@ -248,6 +288,8 @@ DEFAULTS: Dict[str, Any] = {
             'type': 'curtain',
             'next_mode': 'exploring',
             'speed_mps': 0.25,            # forward speed (vx) through the curtain
+            'hstep': True,                # cross in the h-step gait only (rug_hstep, held via /step_up) ...
+            'gait_settle_s': 2.0,         # ... standing this long after switching it on and after releasing it
             'align_tol_deg': 5.0,         # square to the edge within this before walking
             'align_timeout_s': 15.0,
             'min_turn_rad_s': 0.2,
@@ -256,6 +298,11 @@ DEFAULTS: Dict[str, Any] = {
             'heading_gain': 1.0,          # wz that holds the heading while walking
             'extra_m': 0.0,               # stop this much beyond the next tile's centre
             'cross_timeout_s': 20.0,
+            'low_move_s': 2.0,            # barely moving (position AND heading) this long while driving / turning: low_move_mode (0 = off)
+            'low_move_m': 0.05,           # ... "barely" = less than this far ...
+            'low_move_deg': 3.0,          # ... and less than this much turned
+            'low_move_grace_s': 2.0,      # ... judged only this long after each phase starts (standing robot takes ~1.5 s to get going)
+            'low_move_mode': 'recovery',
         },
         'stairs': {
             'type': 'stairs',
@@ -263,7 +310,12 @@ DEFAULTS: Dict[str, Any] = {
             'fail_mode': 'recovery',      # gave up after AI mode was on (somewhere on / near the stairs): recovery
             'ai_on_code': 0x21010528,     # /simple_cmd MotionSimpleCMD {cmd_code, type: 0}: enter AI mode
             'ai_off_code': 0x2101052B,    # ... and leave it
-            'ai_settle_s': 2.0,           # stand still this long after each AI mode command
+            'ai_settle_s': 2.0,           # stand still this long after each AI mode command (no /robot_state)
+            'ai_verify': True,            # /robot_state: wait until the robot reports AI on (16,0,1) / off (basic 6)
+            'ai_retry_s': 3.0,            # ... and send the AI command again if it is not there this long after the last
+            'ai_max_attempts': 0,         # 0 = keep trying; N = give up after N sends
+            'ai_confirm_s': 0.3,          # the reported state must hold this long
+            'ai_policy_state': 0,         # robot_policy_state for AI on: 0 = AI basic gait (-1 = any)
             'center_tol_m': 0.06,         # first drive (vx / vy) to within this of the centre of the tile in front of it
             'center_speed_mps': 0.15,
             'center_min_speed_mps': 0.05,
@@ -283,13 +335,27 @@ DEFAULTS: Dict[str, Any] = {
             'stall_m': 0.05,              # climbing: less progress than this ...
             'stall_s': 10.0,              # ... in this long = stuck on the stairs
             'pose_lost_s': 3.0,           # no pose (SLAM lost on the stairs): keep walking straight this long, then stop
-            'ai_before_climber': False,   # true: centre + square up in the flat gait (live pose), then AI mode on BEFORE the climber
-                                          # (its lidar alignment and walk run in AI mode; it sends no Enter AI / Move Mode)
-            'rebase_odom': True,          # after the climb: tell odom_tf_bridge the robot is at the centre of the tile beyond (AI gait odometry is off)
-            'climber': False,             # true: hand the climb to the stair_climber package (/stair_climber/enable, /state)
-            'climber_search_timeout_s': 15.0,   # stair_climber still searching: its lidar sees no stairs, give up (no climb)
-            'climber_timeout_s': 180.0,   # whole stair_climber run
-            'climber_lost_s': 5.0,        # no /stair_climber/state this long: not running, give up
+            'imu_lost_s': 3.0,            # IMU crossing: no fresh /imu/data this long -> stop (beyond the stairs already: counts as over them)
+            # IMU crossing, level or going down: the wall beyond the staircase from the raw /scan (base_link; the map pose and
+            # costmap are frozen in AI mode). Gap = nose to the nearest return in the body corridor, minus what was walked
+            # since the scan was taken (~1.1 s lag). Slow from wall_slow_m, stop (= over the stairs) at wall_stop_m when level.
+            'wall_stop_m': 0.15,
+            'wall_slow_m': 0.60,
+            'wall_creep_mps': 0.10,       # slowest walk while the nose is still down (off the last step)
+            'wall_half_width_m': 0.20,    # corridor |y| (footprint half width 0.185)
+            'wall_nose_m': 0.305,         # nose ahead of base_link (footprint)
+            'wall_capture_level_deg': 8.0,  # stop only on a scan taken this level (nose down, the floor below is in the band)
+            'wall_touch_m': 0.08,         # a gap this small, then an empty corridor (closer than range_min: inf) = touching
+            'wall_touch_hold_s': 3.0,
+            'wall_scan_max_age_s': 2.5,   # older scan: no wall check
+            'scan_after': True,           # after the climb: scan_mode (a scan), then the tile the robot is on is corrected from SLAM
+            'scan_mode': 'scanning',
+            'new_map': False,             # after the climb: save the map under reports/, clear it, start a new map from the tile beyond
+            'new_map_dir': '',            # ... (virtual wall against the staircase); '' = reports_dir. Needs scan_mode.
+            'new_map_timeout_s': 60.0,    # save + slam_toolbox restart longer than this: give up, keep the old map
+            'rebase_odom': True,          # after the climb: tell odom_tf_bridge the robot is at the centre of the reference tile beyond the
+                                          # staircase (one tile past it along the steps, turned to them; AI gait odometry is off)
+            'rebase_yaw': 'heading',      # rebase pose: 'heading' (line walked + squared-up heading + IMU drift) or 'stairs' (snap to the reference tile)
         },
         'roller': {
             'type': 'roller',
@@ -333,7 +399,7 @@ DEFAULTS: Dict[str, Any] = {
         },
         'backtracking': {
             'type': 'backtracking',
-            'traversal': 'route',         # FollowWaypoints back to the split tile, then to its untravelled tile
+            'traversal': 'route',         # NavigateThroughPoses back to the split tile, then to its untravelled tile
             'waypoints_per_tile': 3,      # waypoints on the straight line between each pair of tile centres on the way
             'align_at_tiles': True,       # at each tile centre turn in place to face the next tile, then drive that hop
             'align_tol_deg': 5.0,
@@ -348,12 +414,14 @@ DEFAULTS: Dict[str, Any] = {
             'scan_after_reach': True,     # reached the untravelled tile: scan_mode (which hands over to exploring) ...
             'scan_mode': 'scanning',
             'next_mode': 'exploring',     # ... else straight back to exploring (also after a failure)
+            'stairs_mode': 'stairs',      # split tile in front of a forced staircase (exploring.stairs_backtrack): climb it
+            'stair_min_facing': 0.5,      # as modes.exploring.stair_min_facing
         },
         'recovery': {
             'type': 'recovery',
             'traversal': 'recovery_mppi',     # Nav2 + holonomic RecoveryMPPI controller (strafes with vx / vy)
             'fallback_traversal': 'omni',     # that failed: straight x / y velocity to the same centre ('' = none)
-            'tile_statuses': ['visited', 'to_visit'],   # which tiles' centres are recovery targets
+            'keep_gait': True,            # keep the gait the robot already has while recovering (/gait_freeze)
             'candidates': 3,
             'min_distance_m': 0.25,       # skip centres the robot is already on
             'adjacent_only': True,        # only the robot's own tile / tiles sharing a side with it (never through another tile)
@@ -363,6 +431,16 @@ DEFAULTS: Dict[str, Any] = {
             'clear_settle_s': 1.0,
             'give_up_after': 3,           # consecutive recoveries without reaching a new tile; 0 = never give up
             'next_mode': 'scanning',
+            'fail_mode': 'scanning',
+        },
+        'ending': {
+            'type': 'ending',
+            'traversal': 'direct',            # NavigateToPose to the ending tile's centre
+            'fallback_traversal': 'omni',     # failed / stopped off-centre: straight x / y velocity to the centre ('' = none)
+            'centre_tolerance_m': 0.10,       # Nav2 arrived further than this from the centre: finish with the fallback
+            'attempt_timeout_s': 60.0,
+            'clear_costmaps': False,
+            'give_up_after': 0,               # failed visits (each followed by a rescan) before completing anyway; 0 = never
             'fail_mode': 'scanning',
         },
         'complete': {'type': 'complete'},

@@ -36,7 +36,9 @@ setup(
             'stair_detector = lite3_explorer.stair_detector:main',
             'roller_detector = lite3_explorer.roller_detector:main',
             'tilt_gate = lite3_explorer.tilt_gate:main',
+            'scan_fill = lite3_explorer.scan_fill:main',
             'controller_monitor = lite3_explorer.controller_monitor:main',
+            'robot_state_bridge = lite3_explorer.robot_state_bridge:main',
         ],
     },
 )

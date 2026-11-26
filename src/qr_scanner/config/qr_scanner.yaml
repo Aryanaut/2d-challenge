@@ -1,0 +1,48 @@
+qr_scanner:
+  ros__parameters:
+    # Which cameras to use. Topics/devices come from launch arguments
+    # (front_image_topic, left_image_topic, left_device, ...). A camera with no topic and
+    # no device is skipped. Front only: the side cameras are not used.
+    # (To bring them back: cameras: [front, left, right])
+    cameras: [front]
+
+    base_frame: base_link
+    target_frame: map             # '' = report in the camera frame only
+    depth_scale: 0.001            # 16UC1 depth in millimetres
+    scan_rate_hz: 5.0             # per camera
+    capture_width: 1280           # for cameras read directly from /dev/video*
+    capture_height: 720
+    full_upscale_every_n: 0
+
+    qr_size_m: 0.09               # width of the printed black QR square - MEASURE it
+    confirm_frames: 2             # report a code after it is read in 2 frames (any camera) ...
+    confirm_window_s: 3.0         # ... within 3 s
+    same_code_dist_m: 1.5         # same text >1.5 m apart (with map positions) = a separate code
+
+    # "decrypting" the content (see payload.py)
+    decode_mode: raw              # raw | base64 | caesar | json | auto
+    caesar_shift: 0
+    key_map: [""]                 # e.g. ["I:storeroom", "J:kitchen"]
+
+    log_file: /home/user/qr_log.csv
+    debug_image_hz: 2.0           # per camera
+
+    # ---- per-camera mounting (used for bearings, and for map positions if publish_tf) ----
+    # hfov_deg is only used when the camera has no calibrated camera_info (typical USB webcams).
+    front_mount_yaw_deg: 0.0
+    front_mount_pitch_deg: 0.0
+    front_hfov_deg: 70.0
+    front_publish_tf: false       # the depth camera already has its own TF frames
+
+    left_mount_yaw_deg: 90.0      # facing the robot's left
+    left_mount_pitch_deg: 0.0
+    left_hfov_deg: 70.0           # check your webcam's spec (C270 ~60, C920 ~70-78)
+                                  # (with left_detections_topic the sender's --hfov is used instead)
+    left_publish_tf: true         # publish base_link -> left_qr_optical from the values below
+    left_mount_xyz: [0.0, 0.10, 0.10]    # MEASURE: metres from base_link (x fwd, y left, z up)
+
+    right_mount_yaw_deg: -90.0
+    right_mount_pitch_deg: 0.0
+    right_hfov_deg: 70.0
+    right_publish_tf: true
+    right_mount_xyz: [0.0, -0.10, 0.10]  # MEASURE
